@@ -11,7 +11,6 @@
 
 (in-package "SB-VM")
 
-#-sb-fluid
 (declaim (inline adjustable-array-p
                  array-displacement))
 
@@ -26,7 +25,6 @@
                 (defun (setf ,name) (value array)
                   (setf (,name array) value)))))
   (def %array-fill-pointer)
-  (def %array-fill-pointer-p)
   (def %array-available-elements)
   (def %array-data)
   (def %array-displacement)
@@ -441,6 +439,17 @@
         (setf (%array-displaced-from old-data)
               (purge (%array-displaced-from old-data)))))))
 
+(sb-c::unless-vop-existsp (:translate set-header-bits)
+  (declaim (inline set-header-bits unset-header-bits))
+  (defun set-header-bits (vector bits)
+    (set-header-data vector (logior (get-header-data vector) bits))
+    (values))
+  (defun unset-header-bits (vector bits)
+    (set-header-data vector (logand (get-header-data vector)
+                                    (ldb (byte (- sb-vm:n-word-bits sb-vm:n-widetag-bits) 0)
+                                         (lognot bits))))
+    (values)))
+
 ;;; Widetag is the widetag of the underlying vector,
 ;;; it'll be the same as the resulting array widetag only for simple vectors
 (defun %make-array (dimensions widetag n-bits
@@ -509,12 +518,13 @@
                                 (simple simple-array-widetag)
                                 (t complex-array-widetag))
                           array-rank)))
-             (if fill-pointer
-                 (setf (%array-fill-pointer-p array) t
-                       (%array-fill-pointer array)
-                       (if (eq fill-pointer t) dimension-0 fill-pointer))
-                 (setf (%array-fill-pointer-p array) nil
-                       (%array-fill-pointer array) total-size))
+             (cond (fill-pointer
+                    (set-header-bits array sb-vm:+array-fill-pointer-p+)
+                    (setf (%array-fill-pointer array)
+                          (if (eq fill-pointer t) dimension-0 fill-pointer)))
+                   (t
+                    (unset-header-bits array sb-vm:+array-fill-pointer-p+)
+                    (setf (%array-fill-pointer array) total-size)))
              (setf (%array-available-elements array) total-size)
              (setf (%array-data array) data)
              (setf (%array-displaced-from array) nil)
@@ -603,6 +613,17 @@ of specialized arrays is supported."
             (t
              vector)))))
 
+#+darwin-jit
+(defun make-static-code-vector (length initial-contents)
+  "Allocate vector of LENGTH elements in static space. Only allocation
+of specialized arrays is supported."
+  (let ((vector (allocate-static-code-vector sb-vm:simple-array-unsigned-byte-8-widetag
+                                             length
+                                             (* length n-word-bytes))))
+    (with-pinned-objects (initial-contents)
+      (jit-memcpy (vector-sap vector) (vector-sap initial-contents) length))
+    vector))
+
 ;;; DATA-VECTOR-FROM-INITS returns a simple vector that has the
 ;;; specified array characteristics. Dimensions is only used to pass
 ;;; to FILL-DATA-VECTOR for error checking on the structure of
@@ -648,6 +669,10 @@ of specialized arrays is supported."
 ;;; the type information is available. Finally, for each of these
 ;;; routines also provide a slow path, taken for arrays that are not
 ;;; vectors or not simple.
+;;; FIXME: how is this not redundant with DEFINE-ARRAY-DISPATCH?
+;;; Which is to say, why did DEFINE-ARRAY-DISPATCH decide to do
+;;; something different instead of figuring out how to unify the ways
+;;; that we call an element of an array accessed by widetag?
 (macrolet ((def (name table-name)
              `(progn
                 (define-load-time-global ,table-name
@@ -803,7 +828,6 @@ of specialized arrays is supported."
                 (setf ,symbol (make-array (1+ widetag-mask)
                                           :initial-element #'hairy-ref-error))
                 ,@(loop for widetag in '(complex-vector-widetag
-                                         complex-vector-nil-widetag
                                          complex-bit-vector-widetag
                                          #+sb-unicode complex-character-string-widetag
                                          complex-base-string-widetag
@@ -1029,9 +1053,7 @@ of specialized arrays is supported."
 
 (defun array-rank (array)
   "Return the number of dimensions of ARRAY."
-  (if (array-header-p array)
-      (%array-rank array)
-      1))
+  (%array-rank array))
 
 (defun array-dimension (array axis-number)
   "Return the length of dimension AXIS-NUMBER of ARRAY."
@@ -1089,11 +1111,11 @@ of specialized arrays is supported."
 
 ;;;; fill pointer frobbing stuff
 
-(declaim (inline array-has-fill-pointer-p))
+(setf (info :function :predicate-truth-constraint 'array-has-fill-pointer-p)
+      '(and vector (not simple-array)))
 (defun array-has-fill-pointer-p (array)
   "Return T if the given ARRAY has a fill pointer, or NIL otherwise."
-  (declare (array array))
-  (and (array-header-p array) (%array-fill-pointer-p array)))
+  (array-has-fill-pointer-p array))
 
 (defun fill-pointer-error (vector &optional arg)
   (declare (optimize allow-non-returning-tail-call))
@@ -1186,7 +1208,7 @@ of specialized arrays is supported."
   (let* ((old-length (length vector))
          (min-extension (or min-extension
                             (min old-length
-                                 (- sb-xc:array-dimension-limit old-length))))
+                                 (- array-dimension-limit old-length))))
          (new-length (the index (+ old-length
                                    (max 1 min-extension))))
          (fill-pointer (1+ old-length)))
@@ -1512,10 +1534,10 @@ of specialized arrays is supported."
     (setf (%array-available-elements array) length)
     (cond (fill-pointer
            (setf (%array-fill-pointer array) fill-pointer)
-           (setf (%array-fill-pointer-p array) t))
+           (set-header-bits array sb-vm:+array-fill-pointer-p+))
           (t
            (setf (%array-fill-pointer array) length)
-           (setf (%array-fill-pointer-p array) nil)))
+           (unset-header-bits array sb-vm:+array-fill-pointer-p+)))
     (setf (%array-displacement array) displacement)
     (if (listp dimensions)
         (dotimes (axis (array-rank array))
@@ -1653,9 +1675,9 @@ function to be removed without further warning."
     (loop for i below rank
           do (%set-array-dimension result i
                                    (%array-dimension array i)))
+    ;; fill-pointer-p defaults to 0
     (setf (%array-displaced-from result) nil
           (%array-displaced-p result) nil
-          (%array-fill-pointer-p result) nil
           (%array-fill-pointer result) size
           (%array-available-elements result) size)
     result))
@@ -1790,16 +1812,21 @@ function to be removed without further warning."
 ;;; Finally, the DISPATCH-FOO macro is defined which does the actual
 ;;; dispatching when called. It expects arguments that match PARAMS.
 ;;;
-(defmacro sb-impl::!define-array-dispatch (dispatch-name params &body body)
+(defmacro sb-impl::!define-array-dispatch (style dispatch-name params &body body)
+  #-(or x86 x86-64) (setq style :call)
   (let ((table-name (symbolicate "%%" dispatch-name "-FUNS%%"))
         (error-name (symbolicate "HAIRY-" dispatch-name "-ERROR")))
+    (declare (ignorable table-name))
     `(progn
-       (eval-when (:compile-toplevel :load-toplevel :execute)
-         (defun ,error-name (&rest args)
-           (error 'type-error
-                  :datum (first args)
-                  :expected-type '(simple-array * (*)))))
-       (!define-load-time-global ,table-name ,(make-array (1+ widetag-mask)))
+       (defun ,error-name (,(first params) &rest rest)
+         (declare (ignore rest))
+         (error 'type-error
+                :datum ,(first params)
+                :expected-type '(simple-array * (*))))
+
+       ,@(ecase style
+    (:call
+     `((!define-load-time-global ,table-name ,(sb-xc:make-array (1+ widetag-mask)))
 
        ;; This SUBSTITUTE call happens ** after ** all the SETFs below it.
        ;; DEFGLOBAL's initial value is dumped by genesis as a vector filled
@@ -1834,7 +1861,33 @@ function to be removed without further warning."
                    (setf ,tag (%other-pointer-widetag ,(first args))))
                  (svref (truly-the (simple-vector 256) (load-time-value ,',table-name t))
                         ,tag)))
-             ,@args))))))
+             ,@args)))))
+    (:jump-table
+     (multiple-value-bind (body decls) (parse-body body nil)
+       `((declaim (inline ,dispatch-name))
+         (defun ,dispatch-name ,params
+           ,@decls
+           (case (if (%other-pointer-p ,(first params))
+                     (ash (%other-pointer-widetag ,(first params)) -2)
+                     0)
+             ;; All widetags have to be listed so that the jump table logic doesn't
+             ;; give up due to deciding that it's a waste of space. It could probably
+             ;; be based on the SPACE compilation policy. However, I would imagine that
+             ;; it is almost always a win to use 4x or 5x table words as cases
+             ;; given the amount of code that has to be emitted if not a table.
+             ;; This table has only 2.5x as many words as relevant (non-error) cases.
+             (,(loop for i below 64
+                     unless (find i *specialized-array-element-type-properties*
+                                  :key (lambda (x) (ash (saetp-typecode x) -2)))
+                       collect i)
+              (,error-name ,@params))
+             ,@(loop
+                   for info across *specialized-array-element-type-properties*
+                   collect `(,(ash (saetp-typecode info) -2)
+                             (let ((,(first params)
+                                    (truly-the (simple-array ,(saetp-specifier info) (*))
+                                               ,(first params))))
+                               ,@body))))))))))))
 
 (defun sb-kernel::check-array-shape (array dimensions)
   (when (let ((dimensions dimensions))
@@ -1860,7 +1913,7 @@ function to be removed without further warning."
   (when (and element-p contents-p)
     (error "Can't specify both :INITIAL-ELEMENT and :INITIAL-CONTENTS"))
   ;; Explicitly compute a widetag with the weakness bit ORed in.
-  (let ((type (logior (ash vector-weak-subtype sb-vm:n-widetag-bits)
+  (let ((type (logior (ash vector-weak-flag sb-vm:n-widetag-bits)
                       sb-vm:simple-vector-widetag)))
     ;; These allocation calls are the transforms of MAKE-ARRAY for a vector with
     ;; the respective initializing keyword arg. This is badly OAOO-violating and
@@ -1880,4 +1933,4 @@ function to be removed without further warning."
 
 (defun weak-vector-p (x)
   (and (simple-vector-p x)
-       (eql (get-header-data x) vector-weak-subtype)))
+       (eql (get-header-data x) vector-weak-flag)))

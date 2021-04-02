@@ -100,8 +100,8 @@
 ;;; variable.
 (eval-when (:compile-toplevel :load-toplevel)
   (setf *c-functions-in-runtime*
-        #+netbsd '("stat" "lstat" "fstat" "readdir" "opendir")
-        #-netbsd '()))
+        (append #+netbsd '("stat" "lstat" "fstat" "readdir" "opendir")
+                #+(and (or arm64 riscv ppc ppc64) linux) '("stat" "lstat" "fstat"))))
 
 
 ;;; filesystem access
@@ -128,7 +128,7 @@
 (macrolet ((def (x)
                `(progn
                  (define-call-internally open-with-mode ,x int minusp
-                   (pathname filename) (flags int) (mode mode-t))
+                   (pathname filename) (flags int) &optional (mode mode-t))
                  (define-call-internally open-without-mode ,x int minusp
                    (pathname filename) (flags int))
                  (define-entry-point ,x
@@ -245,9 +245,10 @@
   (define-call-internally fcntl-without-arg "fcntl" int minusp
                           (fd file-descriptor) (cmd int))
   (define-call-internally fcntl-with-int-arg "fcntl" int minusp
-                          (fd file-descriptor) (cmd int) (arg int))
+                          (fd file-descriptor) (cmd int) &optional (arg int))
   (define-call-internally fcntl-with-pointer-arg "fcntl" int minusp
                           (fd file-descriptor) (cmd int)
+                          &optional
                           (arg alien-pointer-to-anything-or-nil))
   (define-protocol-class flock alien-flock ()
    ((type :initarg :type :accessor flock-type
@@ -340,24 +341,36 @@
     "Forks the current process, returning 0 in the new process and the PID of
 the child process in the parent. Forking while multiple threads are running is
 not supported."
-    (tagbody
-       (let ()
-         #+sb-thread
-         (sb-impl::finalizer-thread-stop)
-         (sb-thread::with-all-threads-lock
-           (when (let ((avltree sb-thread::*all-threads*))
-                   (or (sb-thread::avlnode-left avltree)
-                       (sb-thread::avlnode-right avltree)))
-             (go :error))
-           (let ((pid (posix-fork)))
-             #+darwin
-             (when (= pid 0)
-               (darwin-reinit))
-             #+sb-thread
-             (setf sb-impl::*finalizer-thread* t)
-             (return-from fork pid))))
-     :error
-       (error "Cannot fork with multiple threads running.")))
+    ;; It would be easy enough to to allow fork in multithreaded code - we'd need the new
+    ;; process to set *ALL-THREADS* to contain only one thread, and unmap other threads'
+    ;; stack to avoid a memory leak. The tricky part would be adhering the the POSIX caveats.
+    ;; Linux:
+    ;;   After a fork() in a multithreaded program, the child can safely call only async-signal-safe
+    ;;   functions (see signal-safety(7)) until such time as it calls execve(2).
+    ;; FreeBSD:
+    ;;   If the process has more than one thread, locks and other resources held by the other
+    ;;   threads are not released and therefore only async-signal-safe functions are guaranteed
+    ;;   to work in the child process until a call to execve(2) or a similar function.
+    ;; macOS:
+    ;;   To be totally safe you should restrict yourself to only executing async-signal safe
+    ;;   operations until such time as one of the exec functions is called.
+    #+sb-thread
+    (when (cdr (sb-int:with-system-mutex (sb-thread::*make-thread-lock*)
+                 (sb-impl::finalizer-thread-stop)
+                 ;; Dead threads aren't pruned from *ALL-THREADS* until the Pthread join.
+                 ;; Do that now so that the forked process has only the main thread
+                 ;; in *ALL-THREADS* and nothing in *JOINABLE-THREADS*.
+                 (sb-thread::join-pthread-joinables #'identity)
+                 ;; Threads are added to ALL-THREADS before they have an OS thread,
+                 ;; but newborn threads are not exposed in SB-THREAD:LIST-ALL-THREADS.
+                 ;; So we need to go lower-level to sense whether any exist.
+                 (sb-thread:avltree-list sb-thread::*all-threads*)))
+      (sb-impl::finalizer-thread-start)
+      (error "Cannot fork with multiple threads running."))
+    (let ((pid (posix-fork)))
+      #+darwin (when (= pid 0) (darwin-reinit))
+      #+sb-thread (sb-impl::finalizer-thread-start)
+      pid))
   (export 'fork :sb-posix)
 
   (define-call "getpgid" pid-t minusp (pid pid-t))
@@ -504,11 +517,9 @@ not supported."
 (define-call "mlockall" int minusp (flags int))
 (define-call "munlockall" int minusp)
 
-#-win32
-(define-call "getpagesize" int minusp)
-#+win32
-;;; KLUDGE: This could be taken from GetSystemInfo
-(export (defun getpagesize () 4096))
+(export 'getpagesize)
+(declaim (inline getpagesize))
+(defun getpagesize () (extern-alien "os_reported_page_size" (unsigned 32)))
 
 ;;; passwd database
 ;; The docstrings are copied from the descriptions in SUSv3,
@@ -801,7 +812,8 @@ not supported."
              (if (minusp value)
                  (syscall-error 'utimes)
                  value)))
-      (let ((fun (extern-alien "sb_utimes" (function int (c-string :not-null t)
+      (let ((fun (extern-alien #-netbsd "utimes" #+netbsd "sb_utimes"
+                               (function int (c-string :not-null t)
                                                   (* (array alien-timeval 2)))))
             (name (filename filename)))
         (if (not (and access-time modification-time))

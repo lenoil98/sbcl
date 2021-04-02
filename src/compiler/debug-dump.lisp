@@ -17,7 +17,7 @@
 (declaim (type byte-buffer *byte-buffer*))
 (defvar *contexts*)
 (declaim (type (vector t) *contexts*))
-
+(defvar *local-call-context*)
 
 ;;;; debug blocks
 
@@ -38,7 +38,7 @@
   ;; The VOP that emitted this location (for node, save-set, ir2-block, etc.)
   (vop nil :type vop))
 
-(def!struct (restart-location
+(defstruct (restart-location
             (:constructor make-restart-location (&optional label tn))
             (:copier nil))
   (label nil :type (or null label))
@@ -77,7 +77,7 @@
                          (- posn (segment-header-skew segment))))))
   (values))
 
-#-sb-fluid (declaim (inline ir2-block-physenv))
+(declaim (inline ir2-block-physenv))
 (defun ir2-block-physenv (2block)
   (declare (type ir2-block 2block))
   (block-physenv (ir2-block-block 2block)))
@@ -104,6 +104,37 @@
 (defun leaf-visible-to-debugger-p (leaf node)
   (gethash leaf (make-lexenv-var-cache (node-lexenv node))))
 
+(defun optional-leaf-p (leaf)
+  (let ((home (lambda-var-home leaf)))
+    (case (functional-kind home)
+      (:external
+       (let ((entry (lambda-entry-fun home)))
+         (when (optional-dispatch-p entry)
+           (let ((pos (position leaf (lambda-vars home))))
+             (and pos
+                  (>= (1- pos) (optional-dispatch-min-args entry))))))))))
+
+;;; Type checks of the arguments in an external function happen before
+;;; all the &optionals are initialized. PROPAGATE-TO-ARGS marks such
+;;; locations with the entry point, which allows to deduce if an
+;;; optional is alive at that point.
+(defun optional-processed (leaf)
+  (let ((home (lambda-var-home leaf)))
+    (case (functional-kind home)
+      (:external
+       (let ((entry (lambda-entry-fun home)))
+         (if (and (optional-dispatch-p entry)
+                  *local-call-context*)
+             (let ((pos (position leaf (lambda-vars home)))
+                   (entry-pos (position *local-call-context*
+                                        (optional-dispatch-entry-points entry)
+                                        :key #'force)))
+               (not (and pos
+                         entry-pos
+                         (>= (1- pos) (+ (optional-dispatch-min-args entry) entry-pos)))))
+             t)))
+      (t t))))
+
 ;;; Given a local conflicts vector and an IR2 block to represent the
 ;;; set of live TNs, and the VAR-LOCS hash-table representing the
 ;;; variables dumped, compute a bit-vector representing the set of
@@ -126,9 +157,11 @@
                                     '(:environment :debug-environment)))
                        (leaf-visible-to-debugger-p leaf node))
                    (or (null spilled)
-                       (not (member tn spilled))))
+                       (not (member tn spilled)))
+                   (optional-processed leaf))
           (let ((num (gethash leaf var-locs)))
             (when num
+
               (setf (sbit res num) 1))))))
     res))
 
@@ -173,6 +206,12 @@
   (let* ((byte-buffer *byte-buffer*)
          (stepping (and (combination-p node)
                         (combination-step-info node)))
+         (*local-call-context*
+           (if (local-call-context-p context)
+               (local-call-context-fun context)))
+         (context (if (local-call-context-p context)
+                      (local-call-context-var context)
+                      context))
          (live (and live
                     (compute-live-vars live node block var-locs vop)))
          (anything-alive (and live
@@ -182,7 +221,10 @@
 
          (path (node-source-path node))
          (loc (if (fixnump label) label (label-position label)))
-         (form-number (source-path-form-number path)))
+         (form-number (source-path-form-number path))
+         (context (if (opaque-box-p context)
+                      (opaque-box-value context)
+                      context)))
     (vector-push-extend
      (logior
       (if context
@@ -306,7 +348,6 @@
   (let ((file-info (get-toplevelish-file-info info)))
     (multiple-value-call
         (if function #'sb-c::make-core-debug-source #'make-debug-source)
-     :compiled (source-info-start-time info)
      :namestring (or *source-namestring*
                      (make-file-info-namestring
                       (let ((pathname
@@ -366,12 +407,12 @@
       (if (zerop length)
           #()
           (logically-readonlyize
-           (sb-xc:coerce seq
-                         `(simple-array
-                            ,(smallest-element-type (max max-positive
-                                                         (1- max-negative))
-                                                    (plusp max-negative))
-                            1)))))))
+           (coerce seq
+                   `(simple-array
+                     ,(smallest-element-type (max max-positive
+                                                  (1- max-negative))
+                                             (plusp max-negative))
+                     1)))))))
 
 (defun compact-vector (sequence)
   (cond ((and (= (length sequence) 1)
@@ -387,16 +428,6 @@
   (declare (type tn tn))
   (make-sc+offset (sc-number (tn-sc tn))
                   (tn-offset tn)))
-
-(defun lambda-ancestor-p (maybe-ancestor maybe-descendant)
-  (declare (type clambda maybe-ancestor)
-           (type (or clambda null) maybe-descendant))
-  (loop
-     (when (eq maybe-ancestor maybe-descendant)
-       (return t))
-     (setf maybe-descendant (lambda-parent maybe-descendant))
-     (when (null maybe-descendant)
-       (return nil))))
 
 ;;; Dump info to represent VAR's location being TN. ID is an integer
 ;;; that makes VAR's name unique in the function. BUFFER is the vector
@@ -418,6 +449,8 @@
                         (not (lambda-var-explicit-value-cell var))
                         (neq (lambda-physenv fun)
                              (lambda-physenv (lambda-var-home var)))))
+         ;; Keep this condition in sync with PARSE-COMPILED-DEBUG-VARS
+         (large-fixnums (>= (integer-length most-positive-fixnum) 62))
          more)
     (declare (type index flags))
     (when minimal
@@ -429,7 +462,9 @@
                         (null (basic-var-sets var))))
                (not (gethash tn (ir2-component-spilled-tns
                                  (component-info *component-being-compiled*))))
-               (lambda-ancestor-p (lambda-var-home var) fun))
+               (lexenv-contains-lambda fun
+                                       (lambda-lexenv (lambda-var-home var)))
+               (not (optional-leaf-p var))) ;; not always initialized
       (setq flags (logior flags compiled-debug-var-environment-live)))
     (when save-tn
       (setq flags (logior flags compiled-debug-var-save-loc-p)))
@@ -446,18 +481,17 @@
     (when (and same-name-p
                (not (or more minimal)))
       (setf flags (logior flags compiled-debug-var-same-name-p)))
-    #+64-bit ; FIXME: fails if SB-VM:N-FIXNUM-TAG-BITS is 3
-              ; which early-vm.lisp claims to work
-    (cond (indirect
-           (setf (ldb (byte 27 8) flags) (tn-sc+offset tn))
-           (when save-tn
-             (setf (ldb (byte 27 35) flags) (tn-sc+offset save-tn))))
-          (t
-           (if (and tn (tn-offset tn))
-               (setf (ldb (byte 27 8) flags) (tn-sc+offset tn))
-               (aver minimal))
-           (when save-tn
-             (setf (ldb (byte 27 35) flags) (tn-sc+offset save-tn)))))
+    (when large-fixnums
+      (cond (indirect
+             (setf (ldb (byte 27 8) flags) (tn-sc+offset tn))
+             (when save-tn
+               (setf (ldb (byte 27 35) flags) (tn-sc+offset save-tn))))
+            (t
+             (if (and tn (tn-offset tn))
+                 (setf (ldb (byte 27 8) flags) (tn-sc+offset tn))
+                 (aver minimal))
+             (when save-tn
+               (setf (ldb (byte 27 35) flags) (tn-sc+offset save-tn))))))
     (vector-push-extend flags buffer)
     (unless (or minimal
                 same-name-p
@@ -475,14 +509,12 @@
            ;; accessed through a saved frame pointer.
            ;; The first one/two sc-offsets are for the frame pointer,
            ;; the third is for the stack offset.
-           #-64-bit
-           (vector-push-extend (tn-sc+offset tn) buffer)
-           #-64-bit
-           (when save-tn
-             (vector-push-extend (tn-sc+offset save-tn) buffer))
+           (unless large-fixnums
+             (vector-push-extend (tn-sc+offset tn) buffer)
+             (when save-tn
+               (vector-push-extend (tn-sc+offset save-tn) buffer)))
            (vector-push-extend (tn-sc+offset (leaf-info var)) buffer))
-          #-64-bit
-          (t
+          ((not large-fixnums)
            (if (and tn (tn-offset tn))
                (vector-push-extend (tn-sc+offset tn) buffer)
                (aver minimal))
@@ -722,6 +754,18 @@
         do (setf (compiled-debug-fun-next fun) next))
   (car sorted))
 
+(defun empty-fun-p (fun)
+  (let* ((2block (block-info (lambda-block fun)))
+         (start (ir2-block-start-vop 2block))
+         (next (ir2-block-next 2block)))
+    (and
+     start
+     (eq start (ir2-block-last-vop 2block))
+     (eq (vop-name start) 'note-environment-start)
+     next
+     (neq (ir2-block-physenv 2block)
+          (ir2-block-physenv next)))))
+
 ;;; Return a DEBUG-INFO structure describing COMPONENT. This has to be
 ;;; called after assembly so that source map information is available.
 (defun debug-info-for-component (component)
@@ -737,13 +781,15 @@
                                 :adjustable t))
         component-tlf-num)
     (dolist (lambda (component-lambdas component))
-      (clrhash var-locs)
-      (let ((tlf-num (source-path-tlf-number
-                      (node-source-path (lambda-bind lambda)))))
-        (if component-tlf-num
-            (aver (= component-tlf-num tlf-num))
-            (setf component-tlf-num tlf-num))
-        (push (compute-1-debug-fun lambda var-locs) dfuns)))
+      (unless (empty-fun-p lambda)
+       (clrhash var-locs)
+       (let ((tlf-num (source-path-tlf-number
+                       (node-source-path (lambda-bind lambda)))))
+         (if component-tlf-num
+             (aver (or (block-compile *compilation*)
+                       (= component-tlf-num tlf-num)))
+             (setf component-tlf-num tlf-num))
+         (push (compute-1-debug-fun lambda var-locs) dfuns))))
     (let* ((sorted (sort dfuns #'< :key #'compiled-debug-fun-offset))
            (fun-map (compute-debug-fun-map sorted)))
       (make-compiled-debug-info

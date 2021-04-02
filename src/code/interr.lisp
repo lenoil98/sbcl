@@ -33,7 +33,7 @@
         (error "Update (DEFUN INTERNAL-ERROR) for ~D error arguments" max))))
   `(setf (svref **internal-error-handlers** ,(error-number-or-lose name))
          (named-lambda ,(string name) (,@args)
-           (declare (optimize (sb-c::verify-arg-count 0)))
+           (declare (optimize (sb-c:verify-arg-count 0)))
            ,@body)))
 
 ;;; Backtrace code may want to know the error that caused
@@ -131,10 +131,18 @@
 
 (deferr undefined-fun-error (fdefn-or-symbol)
   (let* ((name (etypecase fdefn-or-symbol
+                 #+untagged-fdefns
+                 ((unsigned-byte 61)
+                  (fdefn-name (make-lisp-obj (logior (get-lisp-obj-address fdefn-or-symbol)
+                                                     sb-vm:other-pointer-lowtag))))
                  (symbol fdefn-or-symbol)
                  (fdefn (fdefn-name fdefn-or-symbol))))
          (condition
-           (make-condition 'undefined-function
+           ;; Depending whether NAME is a special operator we signal a different
+           ;; condition class. Similar logic appears in SB-C::INSTALL-GUARD-FUNCTION.
+           (make-condition (if (and (symbolp name) (special-operator-p name))
+                               'special-form-function
+                               'undefined-function)
                            :name name
                            :not-yet-loaded
                            (cond ((and (boundp 'sb-c:*compilation*)
@@ -306,11 +314,21 @@
          :operation '/
          :operands (list this that)))
 
+(macrolet ((def (errname fun-name)
+             `(setf (svref **internal-error-handlers**
+                           ,(error-number-or-lose errname))
+                    (fdefinition ',fun-name))))
+  (def etypecase-failure-error etypecase-failure)
+  (def ecase-failure-error ecase-failure))
+
 (deferr object-not-type-error (object type)
   (if (invalid-array-p object)
       (invalid-array-error object)
       (error (if (and (%instancep object)
                       (layout-invalid (%instance-layout object)))
+                 ;; Signaling LAYOUT-INVALID is dubious, but I guess it provides slightly
+                 ;; more information in that it says that the object may have at some point
+                 ;; been TYPE. Anyway, it's not wrong - it's a subtype of TYPE-ERROR.
                  'layout-invalid
                  'type-error)
              :datum object
@@ -322,11 +340,6 @@
                               (t
                                type))
              :context (sb-di:error-context))))
-
-(deferr layout-invalid-error (object layout)
-  (error 'layout-invalid
-         :datum object
-         :expected-type (layout-classoid layout)))
 
 (deferr odd-key-args-error ()
   (%program-error "odd number of &KEY arguments"))
@@ -343,10 +356,10 @@
                                     context)))
         (error 'unknown-keyword-argument :name key-name))))
 
-;; TODO: make the arguments (ARRAY INDEX &optional BOUND)
-;; and don't need the bound for vectors. Just read it.
 (deferr invalid-array-index-error (array bound index)
   (invalid-array-index-error array index bound))
+(deferr invalid-vector-index-error (vector index)
+  (invalid-array-index-error vector index (length vector)))
 
 (deferr tls-exhausted-error ()
   ;; There is nothing we can do about it. A number of entries in the
@@ -357,8 +370,35 @@
   (%primitive print "Thread local storage exhausted.")
   (sb-impl::%halt))
 
+(deferr uninitialized-memory-error (address nbytes value)
+  (declare (type sb-vm:word address))
+  ;; Ignore sanitizer errors from reading the C stack.
+  ;; These occur because foreign code typically marks shadow words as valid/invalid
+  ;; as it consumes parts of the stack for each new frame; but Lisp does not mark words
+  ;; as valid when storing to the stack, so reading via sap-ref-n needs to disregard
+  ;; the sanitizer error.  This was especially noticeable in our 'callback.impure' test.
+  ;; Obviously it would be more efficient to annotate all the pertinent code with
+  ;; a safety 0 declaration to avoid a detour through the trap handler, but that was
+  ;; more intrusive than I'd have liked. At minimum, these functions need some help:
+  ;;   SB-DI::SUB-ACCESS-DEBUG-VAR-SLOT
+  ;;   SB-DI::X86-CALL-CONTEXT
+  ;;   SB-VM::BOXED-CONTEXT-REGISTER
+  (let ((stackp (and (>= address (get-lisp-obj-address sb-vm:*control-stack-start*))
+                     (< address (get-lisp-obj-address sb-vm:*control-stack-end*)))))
+    (unless stackp
+      (let ((pc (sap-int (sb-vm:context-pc *current-internal-error-context*))))
+        (cerror "Treat the value #x~*~x as valid."
+                'sanitizer-error
+                :value value
+                :address address
+                :size nbytes
+                :format-control "Read of uninitialized memory: ~D byte~:P at #x~x = #x~x (PC=#x~x)."
+                :format-arguments (list nbytes address value pc))))))
+
 (deferr failed-aver-error (form)
   (bug "~@<failed AVER: ~2I~_~S~:>" form))
+(deferr unreachable-error ()
+  (bug "Unreachable code reached"))
 
 ;;;; INTERNAL-ERROR signal handler
 
@@ -420,15 +460,18 @@
                               (svref **internal-error-handlers** error-number))))
                    (cond
                      ((functionp handler)
-                      ;; INTERNAL-ERROR-ARGS supplies the right amount of arguments
-                      (macrolet ((arg (n)
-                                   `(sb-di::sub-access-debug-var-slot
-                                     fp (nth ,n arguments) alien-context)))
-                        (ecase (length arguments)
-                          (0 (funcall handler))
-                          (1 (funcall handler (arg 0)))
-                          (2 (funcall handler (arg 0) (arg 1)))
-                          (3 (funcall handler (arg 0) (arg 1) (arg 2))))))
+                      (if (eq (car arguments) :raw) ; pass args as they are
+                          (apply handler (cdr arguments))
+                          ;; Otherwise decode the SC+OFFSETs
+                          ;; INTERNAL-ERROR-ARGS supplies the right amount of arguments
+                          (macrolet ((arg (n)
+                                       `(sb-di::sub-access-debug-var-slot
+                                         fp (nth ,n arguments) alien-context)))
+                            (ecase (length arguments)
+                              (0 (funcall handler))
+                              (1 (funcall handler (arg 0)))
+                              (2 (funcall handler (arg 0) (arg 1)))
+                              (3 (funcall handler (arg 0) (arg 1) (arg 2)))))))
                      ((eql handler 0) ; if (DEFERR x) was inadvertently omitted
                       (error 'simple-error
                              :format-control

@@ -63,13 +63,17 @@
       (t
        (inst mov dst src)))))
 
-(defmacro make-ea-for-object-slot (ptr slot lowtag)
+(defun 32bit-move (dst src)
+  (unless (location= dst src)
+    (inst mov :dword dst src)))
+
+(defmacro object-slot-ea (ptr slot lowtag)
   `(ea (- (* ,slot n-word-bytes) ,lowtag) ,ptr))
 (defmacro tls-index-of (sym)
   `(ea (+ 4 (- other-pointer-lowtag)) ,sym))
 
 (defmacro loadw (value ptr &optional (slot 0) (lowtag 0))
-  `(inst mov ,value (make-ea-for-object-slot ,ptr ,slot ,lowtag)))
+  `(inst mov ,value (object-slot-ea ,ptr ,slot ,lowtag)))
 
 (defun storew (value ptr &optional (slot 0) (lowtag 0))
   (let* ((size (if (tn-p value)
@@ -85,10 +89,10 @@
            (inst mov :qword ea value)))))
 
 (defmacro pushw (ptr &optional (slot 0) (lowtag 0))
-  `(inst push (make-ea-for-object-slot ,ptr ,slot ,lowtag)))
+  `(inst push (object-slot-ea ,ptr ,slot ,lowtag)))
 
 (defmacro popw (ptr &optional (slot 0) (lowtag 0))
-  `(inst pop (make-ea-for-object-slot ,ptr ,slot ,lowtag)))
+  `(inst pop (object-slot-ea ,ptr ,slot ,lowtag)))
 
 
 ;;;; macros to generate useful values
@@ -97,10 +101,11 @@
   `(inst mov ,reg (+ nil-value (static-symbol-offset ,symbol))))
 
 ;; Return the effective address of the value slot of static SYMBOL.
-(defun static-symbol-value-ea (symbol)
+(defun static-symbol-value-ea (symbol &optional (byte 0))
    (ea (+ nil-value
           (static-symbol-offset symbol)
           (ash symbol-value-slot word-shift)
+          byte
           (- other-pointer-lowtag))))
 
 (defun thread-tls-ea (index)
@@ -198,13 +203,17 @@
 
 #+sb-safepoint
 (defun emit-safepoint ()
-  (inst test :byte rax-tn (ea (- nil-value n-word-bytes other-pointer-lowtag
-                                 gc-safepoint-trap-offset))))
+  ;; FIXME: need to get the node and policy to decide not to emit this safepoint.
+  ;; Also, it would be good to emit only the last of consecutive safepoints in
+  ;; straight-line code, e.g. (LIST (LIST X Y) (LIST Z W)) should emit 1 safepoint
+  ;; not 3, even if we consider it 3 separate pointer bumps.
+  ;; (Ideally we'd only do 1 pointer bump, but that's a separate issue)
+  (inst test :byte rax-tn (ea (- static-space-start gc-safepoint-trap-offset))))
 
 (defmacro pseudo-atomic ((&key elide-if) &rest forms)
-  #+sb-safepoint-strictly
+  #+sb-safepoint
   `(progn ,@forms (unless ,elide-if (emit-safepoint)))
-  #-sb-safepoint-strictly
+  #-sb-safepoint
   (with-unique-names (label pa-bits-ea)
     `(let ((,label (gen-label))
            (,pa-bits-ea
@@ -219,13 +228,7 @@
          ;; if PAI was set, interrupts were disabled at the same time
          ;; using the process signal mask.
          (inst break pending-interrupt-trap)
-         (emit-label ,label)
-         #+sb-safepoint
-         ;; In this case, when allocation thinks a GC should be done, it
-         ;; does not mark PA as interrupted, but schedules a safepoint
-         ;; trap instead.  Let's take the opportunity to trigger that
-         ;; safepoint right now.
-         (emit-safepoint)))))
+         (emit-label ,label)))))
 
 ;;;; indexed references
 
@@ -258,14 +261,14 @@
        (:result-types ,el-type)
        (:generator 5
          (move rax old-value)
-         (inst cmpxchg
+         (inst cmpxchg :lock
                (ea (- (* (+ (if (sc-is index immediate) (tn-value index) 0) ,offset)
                          n-word-bytes)
                       ,lowtag)
                    object
                    (unless (sc-is index immediate) index)
                    (ash 1 (- word-shift n-fixnum-tag-bits)))
-               new-value :lock)
+               new-value)
          (move value rax)))))
 
 (defmacro define-full-reffer (name type offset lowtag scs el-type &optional translate)

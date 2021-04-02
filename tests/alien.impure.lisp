@@ -269,17 +269,12 @@
 ;;; void conflicted with derived type
 (declaim (inline bug-316075))
 ;; KLUDGE: This win32 reader conditional masks a bug, but allows the
-;; test to fail cleanly.  The linkage-table reader conditional
-;; accomodates the little fact that the function doesn't exist, and
-;; non-linkage-table systems resolve such things immediately and
-;; signal errors.
-#-(or win32 (not linkage-table))
+;; test to fail cleanly.
+#-win32
 (locally (declare (muffle-conditions style-warning))
   (sb-alien:define-alien-routine bug-316075 void (result char :out)))
-(with-test (:name :bug-316075 :fails-on :win32
-                  :broken-on (not :linkage-table))
+(with-test (:name :bug-316075 :fails-on :win32)
   #+win32 (error "fail")
-  #-linkage-table (error "unable to set up test precondition")
   ;; The interpreter gives you a style-warning because the "undefined alien"
   ;; first occurs here during compilation of the test case. But if compiling
   ;; by default, then the warning already happened above at DEFINE-ALIEN-ROUTINE
@@ -377,8 +372,10 @@
     (test nil)
     (test t)))
 
+;;; Skip for MSAN. Instead of returning 0, the intercepted malloc is configured
+;;; to cause process termination by default on failure to allocate memory.
 (with-test (:name :malloc-failure
-                  :fails-on :alpha) ;; Alpha has address space to burn
+                  :skipped-on :msan)
   (assert (eq :enomem
               (handler-case
                   (loop repeat 128
@@ -527,11 +524,18 @@
                 (sb-alien::coerce-to-interpreted-function form2)))))
 
 (with-test (:name :undefined-alien-name
-            :skipped-on (not (and :linkage-table
-                                  (or :x86-64 :arm :arm64))))
+            :skipped-on (not (or :x86-64 :arm :arm64)))
   (handler-case (funcall (checked-compile `(lambda ()
                                              (alien-funcall (extern-alien "bar" (function (values)))))
                                           :allow-style-warnings t))
     (t (c)
       (assert (typep c 'sb-kernel::undefined-alien-function-error))
       (assert (equal (cell-error-name c) "bar")))))
+
+(defconstant fleem 3)
+;; We used to expand into
+;; (SYMBOL-MACROLET ((FLEEM (SB-ALIEN-INTERNALS:%ALIEN-VALUE
+;; which conflicted with the symbol as global variable.
+(with-test (:name :def-alien-rtn-use-gensym)
+  (checked-compile '(lambda () (define-alien-routine "fleem" int (x int)))
+                   :allow-style-warnings (or #-(or :x86-64 :arm :arm64) t)))

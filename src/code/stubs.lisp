@@ -59,8 +59,6 @@
   (def control-stack-pointer-sap ())
   (def sb-c:safe-fdefn-fun)
   (def fun-subtype)
-  (def simple-fun-p)
-  (def closurep)
   (def %closure-fun)
   (def %closure-index-ref (closure index))
   (def fdefn-name)
@@ -69,8 +67,8 @@
   (def sb-c::vector-length)
   (def make-array-header (type rank))
   (def code-instructions)
-  (def code-header-ref (code-obj index))
-  (def code-header-set (code-obj index new))
+  #-untagged-fdefns (def code-header-ref (code-obj index))
+  #-darwin-jit (def code-header-set (code-obj index new))
   (def %vector-raw-bits (object offset))
   (def %set-vector-raw-bits (object offset value))
   (def single-float-bits)
@@ -81,8 +79,8 @@
   (def value-cell-ref)
   (def %caller-frame ())
   (def %caller-pc ())
-  (def %code-debug-info)
-  #+(or x86 immobile-space) (def sb-vm::%code-fixups)
+  #+(or x86 x86-64) (def sb-vm::%code-fixups)
+  #+x86-64 (def pointerp)
 
   ;; instances
   (def %make-instance) ; Allocate a new instance with X data slots.
@@ -93,13 +91,14 @@
   (def %instance-set (instance index new-value))
   ;; funcallable instances
   (def %make-funcallable-instance)
-  (def %funcallable-instance-layout)
-  (def %set-funcallable-instance-layout (fin new-value))
+  (def %fun-layout)
+  (def %set-fun-layout (fin new-value))
   (def %funcallable-instance-fun)
   (def (setf %funcallable-instance-fun) (fin new-value))
   (def %funcallable-instance-info (fin i))
   (def %set-funcallable-instance-info (fin i new-value))
-  #+(and compact-instance-header x86-64) (def layout-of)
+  #+compact-instance-header (progn (def layout-of)
+                                   (def %instanceoid-layout))
   #+64-bit (def layout-depthoid)
   ;; lists
   (def %rplaca (x val))
@@ -133,8 +132,10 @@
   (def stack-ref (s n))
   (def %set-stack-ref (s n value))
   (def fun-code-header)
+  (def symbol-hash)
   (def sb-vm::symbol-extra)
-  #+sb-thread (def sb-kernel:symbol-tls-index)
+  #+sb-thread (def symbol-tls-index)
+  #.(if (fboundp 'symbol-info-vector) (values) '(def symbol-info-vector))
   #-(or x86 x86-64) (def lra-code-header)
   (def %make-lisp-obj)
   (def get-lisp-obj-address)
@@ -147,8 +148,36 @@
   "Hints the processor that the current thread is spin-looping."
   (spin-loop-hint))
 
+;;; The stub for sb-c::%structure-is-a should really use layout-id in the same way
+;;; that the vop does, however, because the all 64-bit architectures other than
+;;; x86-64 need to use with-pinned-objects to extract a layout-id, it is cheaper not to.
+;;; I shouid add a vop for uint32 access to raw slots.
+(defun sb-c::%structure-is-a (object-layout test-layout)
+  (or (eq object-layout test-layout)
+      (let ((depthoid (layout-depthoid test-layout))
+            (inherits (layout-inherits object-layout)))
+        (and (> (length inherits) depthoid)
+             (eq (svref inherits depthoid) test-layout)))))
 
 (defun %other-pointer-subtype-p (x choices)
   (and (%other-pointer-p x)
        (member (%other-pointer-widetag x) choices)
        t))
+
+#+x86-64
+(defun symbol-hash* (x satisfies)
+  (declare (explicit-check)) ; actually, not
+  (declare (ignore satisfies))
+  (symbol-hash* x nil))
+
+;;; TYPECASE could expand to contain a call to this function.
+;;; The interpreter can ignore it, it is just compiler magic.
+(defun sb-c::%type-constraint (var type)
+  (declare (ignore var type))
+  nil)
+(eval-when (:compile-toplevel)
+  ;; Defining %TYPE-CONSTRAINT issues a full warning because TYPE's type
+  ;; is (OR TYPE-SPECIFIER CTYPE), and TYPE-SPECIFIER is
+  ;; (OR LIST SYMBOL CLASSOID CLASS), and CLASS isn't known, and you can't
+  ;; define it because it's a standard symbol.
+  (setq sb-c::*undefined-warnings* nil))

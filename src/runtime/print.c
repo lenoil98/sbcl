@@ -25,6 +25,7 @@
 #include "runtime.h"
 #include "code.h"
 #include "gc-internal.h"
+#include "gc-private.h"
 #include <stdarg.h>
 #include "thread.h"              /* genesis/primitive-objects.h needs this */
 #include <errno.h>
@@ -152,16 +153,11 @@ vodxprint_fun(const char *fmt, va_list args)
 #endif
     int original_errno = errno;
 
-    QSHOW_BLOCK;
-
     char buf[1024];
     int n = 0;
 
 #ifdef LISP_FEATURE_SB_THREAD
-    struct thread *arch_os_get_current_thread(void);
-    struct thread *self = arch_os_get_current_thread();
-    void *pth = self ? (void *) self->os_thread : 0;
-    snprintf(buf, sizeof(buf), "[%p/%p] ", self, pth);
+    snprintf(buf, sizeof(buf), "["THREAD_ID_LABEL"] ", THREAD_ID_VALUE);
     n = strlen(buf);
 #endif
 
@@ -183,8 +179,6 @@ vodxprint_fun(const char *fmt, va_list args)
      * to.  Let's be safe: */
     fflush(stderr);
 #endif
-
-    QSHOW_UNBLOCK;
 
 #ifdef LISP_FEATURE_WIN32
     SetLastError(lastError);
@@ -215,9 +209,6 @@ fshow_fun(void __attribute__((__unused__)) *ignored,
 #include "os.h"
 #ifdef LISP_FEATURE_GENCGC
 #include "gencgc-alloc-region.h" /* genesis/thread.h needs this */
-#endif
-#if defined(LISP_FEATURE_WIN32)
-# include "win32-thread-private-events.h" /* genesis/thread.h needs this */
 #endif
 #include "genesis/static-symbols.h"
 #include "genesis/primitive-objects.h"
@@ -293,12 +284,7 @@ static void print_unknown(lispobj obj)
   printf("unknown object: %p", (void *)obj);
 }
 
-/* Except for Alpha, we define sword_t as intptr_t, and 32-bit Darwin
- * defines intptr_t as long, so the printf conversion is "ld", not "d".
- * Alpha (32-on-64) defines sword_t as s32, so we need just "d". */
-#ifdef LISP_FEATURE_ALPHA
-# define OBJ_FMTd "d"
-#elif defined(PRIdPTR)
+#ifdef PRIdPTR
 # define OBJ_FMTd PRIdPTR
 #else
 # error "Your inttypes.h is lame"
@@ -449,21 +435,38 @@ static void brief_struct(lispobj obj)
 }
 
 #include "genesis/layout.h"
+#include "genesis/defstruct-description.h"
+#include "genesis/defstruct-slot-description.h"
+#ifdef LISP_FEATURE_METASPACE
+#include "genesis/wrapper.h"
+#endif
 static boolean tagged_slot_p(struct layout *layout, int slot_index)
 {
-  lispobj bitmap = layout->bitmap;
-  sword_t fixnum = fixnum_value(bitmap); // optimistically
-  return fixnump(bitmap)
-         ? bitmap == make_fixnum(-1) ||
-            (slot_index < N_WORD_BITS && ((fixnum >> slot_index) & 1) != 0)
-         : positive_bignum_logbitp(slot_index,
-                                   (struct bignum*)native_pointer(bitmap));
+    // Since we're doing this scan, we could return the name
+    // and exact raw type.
+#ifdef LISP_FEATURE_METASPACE
+    struct wrapper *wrapper = (void*)(layout->friend-INSTANCE_POINTER_LOWTAG);
+    if (instancep(wrapper->_info)) {
+        struct defstruct_description* dd = (void*)(wrapper->_info-INSTANCE_POINTER_LOWTAG);
+#else
+    if (instancep(layout->_info)) {
+        struct defstruct_description* dd = (void*)(layout->_info-INSTANCE_POINTER_LOWTAG);
+#endif
+        lispobj slots = dd->slots;
+        for ( ; slots != NIL ; slots = CONS(slots)->cdr ) {
+            struct defstruct_slot_description* dsd =
+                (void*)(CONS(slots)->car-INSTANCE_POINTER_LOWTAG);
+            if ((fixnum_value(dsd->bits) >> DSD_INDEX_SHIFT) == slot_index)
+                return (fixnum_value(dsd->bits) & DSD_RAW_TYPE_MASK) == 0;
+        }
+    }
+    return 0;
 }
 
 static void print_struct(lispobj obj)
 {
     struct instance *instance = (struct instance *)native_pointer(obj);
-    unsigned int i;
+    short int i;
     char buffer[16];
     lispobj layout = instance_layout(native_pointer(obj));
     print_obj("type: ", layout);
@@ -511,7 +514,7 @@ void show_lstring(struct vector * string, int quotes, FILE *s)
   if (quotes) putc('"', s);
 }
 
-static void brief_otherptr(lispobj obj)
+static void brief_fun_or_otherptr(lispobj obj)
 {
     extern void safely_show_lstring(struct vector*, int, FILE*);
     lispobj *ptr, header;
@@ -569,7 +572,7 @@ static void print_slots(char **slots, int count, lispobj *ptr)
     }
 }
 
-static lispobj symbol_function(lispobj* symbol)
+lispobj symbol_function(lispobj* symbol)
 {
     lispobj info = ((struct symbol*)symbol)->info;
     if (listp(info))
@@ -589,15 +592,10 @@ static lispobj symbol_function(lispobj* symbol)
     return NIL;
 }
 
-static void print_otherptr(lispobj obj)
+static void print_fun_or_otherptr(lispobj obj)
 {
-#ifndef LISP_FEATURE_ALPHA
     lispobj *ptr;
     unsigned long header;
-#else
-    u32 *ptr;
-    u32 header;
-#endif
     int count, type, index;
     char buffer[16];
 
@@ -647,6 +645,14 @@ static void print_otherptr(lispobj obj)
         print_slots(symbol_slots, count & 0xFF, ptr);
         if (symbol_function(ptr-1) != NIL)
             print_obj("fun: ", symbol_function(ptr-1));
+#ifdef LISP_FEATURE_SB_THREAD
+        int tlsindex = tls_index_of((struct symbol*)(ptr-1));
+        struct thread*th = get_sb_vm_thread();
+        if (th != 0 && tlsindex != 0) {
+            lispobj v = *(lispobj*)(tlsindex + (char*)th);
+            print_obj("tlsval: ", v);
+        }
+#endif
         break;
 
 #if N_WORD_BITS == 32
@@ -727,7 +733,7 @@ static void print_otherptr(lispobj obj)
     // FIXME: This case looks unreachable. print_struct() does it
     case INSTANCE_WIDETAG:
         NEWLINE_OR_RETURN;
-        count &= SHORT_HEADER_MAX_WORDS;
+        count = instance_length(header);
         printf("length = %ld", (long) count);
         index = 0;
         while (count-- > 0) {
@@ -774,11 +780,7 @@ static void print_otherptr(lispobj obj)
 
     case SAP_WIDETAG:
         NEWLINE_OR_RETURN;
-#ifndef LISP_FEATURE_ALPHA
-        printf("0x%08lx", (unsigned long) *ptr);
-#else
-        printf("0x%016lx", *(lispobj*)(ptr+1));
-#endif
+        printf("%p", (void*)*ptr);
         break;
 
     case WEAK_POINTER_WIDETAG:
@@ -824,25 +826,7 @@ static void print_otherptr(lispobj obj)
 
 static void print_obj(char *prefix, lispobj obj)
 {
-#ifdef LISP_FEATURE_64_BIT
-    static void (*verbose_fns[])(lispobj obj)
-        = {print_fixnum, print_otherimm, print_fixnum, print_struct,
-           print_fixnum, print_otherimm, print_fixnum, print_list,
-           print_fixnum, print_otherimm, print_fixnum, print_otherptr,
-           print_fixnum, print_otherimm, print_fixnum, print_otherptr};
-    static void (*brief_fns[])(lispobj obj)
-        = {brief_fixnum, brief_otherimm, brief_fixnum, brief_struct,
-           brief_fixnum, brief_otherimm, brief_fixnum, brief_list,
-           brief_fixnum, brief_otherimm, brief_fixnum, brief_otherptr,
-           brief_fixnum, brief_otherimm, brief_fixnum, brief_otherptr};
-#else
-    static void (*verbose_fns[])(lispobj obj)
-        = {print_fixnum, print_struct, print_otherimm, print_list,
-           print_fixnum, print_otherptr, print_otherimm, print_otherptr};
-    static void (*brief_fns[])(lispobj obj)
-        = {brief_fixnum, brief_struct, brief_otherimm, brief_list,
-           brief_fixnum, brief_otherptr, brief_otherimm, brief_otherptr};
-#endif
+#include "genesis/print.inc"
     int type = lowtag_of(obj);
     struct var *var = lookup_by_obj(obj);
     char buffer[256];
@@ -872,7 +856,7 @@ static void print_obj(char *prefix, lispobj obj)
         printf("%s0x%08lx: ", prefix, (unsigned long) obj);
         if (cur_depth < brief_depth) {
             fputs(lowtag_names[type], stdout);
-            fns = verbose_fns;
+            fns = print_fns;
         }
         else
             fns = brief_fns;
@@ -939,10 +923,7 @@ struct vector * symbol_name(lispobj * sym)
     sym = native_pointer(forwarding_pointer_value(sym));
   if (lowtag_of(((struct symbol*)sym)->name) != OTHER_POINTER_LOWTAG)
       return NULL;
-  lispobj * name = native_pointer(((struct symbol*)sym)->name);
-  if (forwarding_pointer_p(name))
-      name = native_pointer(forwarding_pointer_value(name));
-  return (struct vector*)name;
+  return VECTOR(follow_maybe_fp(((struct symbol*)sym)->name));
 }
 struct vector * classoid_name(lispobj * classoid)
 {
@@ -954,9 +935,17 @@ struct vector * classoid_name(lispobj * classoid)
 }
 struct vector * layout_classoid_name(lispobj * layout)
 {
+#ifdef LISP_FEATURE_METASPACE
+  // layout can't be forwarded, but wrapper could be
+  lispobj* wrapper = native_pointer(((struct layout*)layout)->friend);
+  if (forwarding_pointer_p(wrapper))
+      wrapper = native_pointer(forwarding_pointer_value(wrapper));
+  lispobj classoid = ((struct wrapper*)wrapper)->classoid;
+#else
   if (forwarding_pointer_p(layout))
       layout = native_pointer(forwarding_pointer_value(layout));
   lispobj classoid = ((struct layout*)layout)->classoid;
+#endif
   return instancep(classoid) ? classoid_name(native_pointer(classoid)) : NULL;
 }
 struct vector * instance_classoid_name(lispobj * instance)

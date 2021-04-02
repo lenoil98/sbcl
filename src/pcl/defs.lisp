@@ -38,7 +38,7 @@
            has already been partially loaded. This may not work, you may~%~
            need to get a fresh lisp (reboot) and then load PCL."))
 
-#-sb-fluid (declaim (inline gdefinition))
+(declaim (inline gdefinition))
 (defun gdefinition (spec)
   ;; This is null layer right now, but once FDEFINITION stops bypasssing
   ;; fwrappers/encapsulations we can do that here.
@@ -177,7 +177,7 @@
 
 ;;;; built-in classes
 
-;;; Grovel over SB-KERNEL::+!BUILT-IN-CLASSES+ in order to set
+;;; Grovel over SB-KERNEL::*BUILTIN-CLASSOIDS* in order to set
 ;;; SB-PCL:*BUILT-IN-CLASSES*.
 (/show "about to set up SB-PCL::*BUILT-IN-CLASSES*")
 (define-load-time-global *built-in-classes*
@@ -195,8 +195,8 @@
                (let ((subs (classoid-subclasses class)))
                  (/noshow subs)
                  (when subs
-                   (dohash ((sub v) subs)
-                     (declare (ignore v))
+                   (dohash ((sub wrapper) subs)
+                     (declare (ignore wrapper))
                      (/noshow sub)
                      (when (member class (direct-supers sub) :test #'eq)
                        (res sub)))))
@@ -219,8 +219,9 @@
                                  ;; SYSTEM-CLASSes) from the
                                  ;; BUILT-IN-CLASS list
                                  '(t function stream sequence
-                                     file-stream string-stream)))
-                       sb-kernel::+!built-in-classes+))))
+                                   file-stream string-stream
+                                   slot-object)))
+                       sb-kernel::*builtin-classoids*))))
 (/noshow "done setting up SB-PCL::*BUILT-IN-CLASSES*")
 
 ;;;; the classes that define the kernel of the metabraid
@@ -330,6 +331,7 @@
    (lambda-list :initform () :initarg :lambda-list :reader method-lambda-list)
    (%function :initform nil :initarg :function :reader method-function)
    (%documentation :initform nil :initarg :documentation)
+   (%cache :initform nil :accessor method-em-cache)
    ;; True IFF method is known to have no CALL-NEXT-METHOD in it, or
    ;; just a plain (CALL-NEXT-METHOD).
    (simple-next-method-call
@@ -362,7 +364,7 @@
 
 (defun make-gf-hash-table ()
   (make-hash-table :test 'eq
-                   :hash-function #'sb-impl::fsc-instance-hash ; stable hash
+                   :hash-function #'fsc-instance-hash ; stable hash
                    :weakness :key
                    :synchronized t))
 
@@ -465,14 +467,17 @@
 (defstruct (slot-info
             (:copier nil)
             (:constructor make-slot-info
-                (&key slotd typecheck
+                (&key slotd typecheck allocation location
                  (reader (uninitialized-accessor-function :reader slotd))
                  (writer (uninitialized-accessor-function :writer slotd))
                  (boundp (uninitialized-accessor-function :boundp slotd)))))
   (typecheck nil :type (or null function))
+  (allocation nil)
+  (location nil)
   (reader (missing-arg) :type function)
   (writer (missing-arg) :type function)
   (boundp (missing-arg) :type function))
+(declaim (freeze-type slot-info))
 
 (defclass standard-direct-slot-definition (standard-slot-definition
                                            direct-slot-definition)
@@ -540,10 +545,16 @@
                            specializer-with-object)
   ((object :initarg :object :reader specializer-object
            :reader eql-specializer-object)
+   ;; created on demand (if and when needed), the CTYPE is the representation
+   ;; of this metaobject as an internalized type object understood by the
+   ;; kernel's type machinery. The CLOS object is really just a MEMBER-TYPE,
+   ;; but the type system doesn't know that.
+   (sb-kernel:ctype)
    ;; Because EQL specializers are interned, any two putative instances
    ;; of EQL-specializer referring to the same object are in fact EQ to
    ;; each other. Therefore a list of direct methods in the specializer can
    ;; reliably track all methods that are specialized on the identical object.
+   ;; FIXME: explain why this is a cons of two NILs.
    (direct-methods :initform (cons nil nil))))
 
 ;; Why is this weak-value, not weak-key: suppose the value is unreachable (dead)
@@ -559,14 +570,12 @@
 ;; gethash on a live key should get the identical specializer, but since
 ;; nothing referenced the old specializer, consing a new one is fine.
 (defglobal *eql-specializer-table*
-  (make-hash-table :test 'eql :weakness :value))
+  (sb-impl::make-system-hash-table :test 'eql :weakness :value :synchronized nil))
 
 (defun intern-eql-specializer (object)
   ;; Avoid style-warning about compiler-macro being unavailable.
   (declare (notinline make-instance))
-  ;; Need to lock, so that two threads don't get non-EQ specializers
-  ;; for an EQL object.
-  (with-locked-system-table (*eql-specializer-table*)
+  (with-system-mutex ((hash-table-lock *eql-specializer-table*))
     (ensure-gethash object *eql-specializer-table*
                     (make-instance 'eql-specializer :object object))))
 

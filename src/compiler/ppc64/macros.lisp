@@ -35,67 +35,51 @@
 (defmacro load-symbol (reg symbol)
   `(inst addi ,reg null-tn (static-symbol-offset ,symbol)))
 
-(macrolet
-    ((frob (slot)
-       (let ((loader (intern (concatenate 'simple-string
-                                          "LOAD-SYMBOL-"
-                                          (string slot))))
-             (storer (intern (concatenate 'simple-string
-                                          "STORE-SYMBOL-"
-                                          (string slot))))
-             (offset (intern (concatenate 'simple-string
-                                          "SYMBOL-"
-                                          (string slot)
-                                          "-SLOT")
-                             (find-package "SB-VM"))))
-         `(progn
-            (defmacro ,loader (reg symbol)
-              `(progn
-                 ;; Work around the usual lowtag subtraction problem.
-                 (inst li temp-reg-tn
-                       (+ (static-symbol-offset ',symbol)
-                          (ash ,',offset word-shift)
-                          (- other-pointer-lowtag)))
-                 (inst ldx ,reg null-tn temp-reg-tn)))
-            (defmacro ,storer (reg symbol)
-              `(progn
-                 (inst li temp-reg-tn
-                       (+ (static-symbol-offset ',symbol)
-                          (ash ,',offset word-shift)
-                          (- other-pointer-lowtag)))
-                 (inst stdx ,reg null-tn temp-reg-tn)))))))
-  (frob value)
-  (frob function)
+#+sb-thread
+(progn
+  (defun load-tls-index (reg symbol)
+    (inst lwz reg symbol (- #+little-endian 4 other-pointer-lowtag)))
+  (defun store-tls-index (reg symbol)
+    (inst stw reg symbol (- #+little-endian 4 other-pointer-lowtag))))
 
-  ;; FIXME: These are only good for static-symbols, so why not
-  ;; statically-allocate the static-symbol TLS slot indices at
-  ;; cross-compile time so we can just use a fixed offset within the
-  ;; TLS block instead of mucking about with the extra memory access
-  ;; (and temp register, for stores)?
-  #+sb-thread
-  (defmacro load-tl-symbol-value (reg symbol)
-    `(progn
-       (inst lwz ,reg null-tn
-             (+ (static-symbol-offset ',symbol)
-                (ash symbol-tls-index-slot word-shift)
-                (- other-pointer-lowtag)))
-       (inst lwzx ,reg thread-base-tn ,reg)))
-  #-sb-thread
-  (defmacro load-tl-symbol-value (reg symbol)
-    `(load-symbol-value ,reg ,symbol))
+(defmacro load-symbol-value (reg symbol)
+  ;; Work around the usual lowtag subtraction problem.
+  `(progn
+     (inst li temp-reg-tn (+ (static-symbol-offset ',symbol)
+                             (ash symbol-value-slot word-shift)
+                             (- other-pointer-lowtag)))
+     (inst ldx ,reg null-tn temp-reg-tn)))
+(defmacro store-symbol-value (reg symbol)
+  `(progn
+     (inst li temp-reg-tn (+ (static-symbol-offset ',symbol)
+                             (ash symbol-value-slot word-shift)
+                             (- other-pointer-lowtag)))
+     (inst stdx ,reg null-tn temp-reg-tn)))
 
-  #+sb-thread
-  (defmacro store-tl-symbol-value (reg symbol temp)
-    `(progn
-       (inst lwz ,temp null-tn
-             (+ (static-symbol-offset ',symbol)
-                (ash symbol-tls-index-slot word-shift)
-                (- other-pointer-lowtag)))
-       (inst stwx ,reg thread-base-tn ,temp)))
-  #-sb-thread
-  (defmacro store-tl-symbol-value (reg symbol temp)
-    (declare (ignore temp))
-    `(store-symbol-value ,reg ,symbol)))
+;; FIXME: These are only good for static-symbols, so why not
+;; statically-allocate the static-symbol TLS slot indices at
+;; cross-compile time so we can just use a fixed offset within the
+;; TLS block instead of mucking about with the extra memory access
+;; (and temp register, for stores)?
+#+sb-thread
+(progn
+(defmacro load-tl-symbol-value (reg symbol)
+  `(progn
+     (inst lwz ,reg null-tn (+ (static-symbol-offset ',symbol)
+                               (- #+little-endian 4 other-pointer-lowtag)))
+     (inst ldx ,reg thread-base-tn ,reg)))
+(defmacro store-tl-symbol-value (reg symbol temp)
+  `(progn
+     (inst lwz ,temp null-tn (+ (static-symbol-offset ',symbol)
+                                (- #+little-endian 4 other-pointer-lowtag)))
+     (inst stdx ,reg thread-base-tn ,temp))))
+#-sb-thread
+(progn
+(defmacro load-tl-symbol-value (reg symbol)
+  `(load-symbol-value ,reg ,symbol))
+(defmacro store-tl-symbol-value (reg symbol temp)
+  (declare (ignore temp))
+  `(store-symbol-value ,reg ,symbol)))
 
 (defmacro load-type (target source &optional (offset 0))
   "Loads the type bits of a pointer into target independent of
@@ -193,57 +177,37 @@
 ;;;
 ;;; Using trap instructions for not-very-exceptional situations, such as
 ;;; allocating, is clever but not very convenient when using gdb to debug.
-;;; So at the expense of speed and code size, we can use a call/return.
-;;; In such case, we never actually try to perform allocations inline.
+;;; Set the :sigill-traps feature to use SIGILL instead of SIGTRAP.
 ;;;
-(defun allocation (result-tn size lowtag &key stack-p node temp-tn flag-tn)
+(defun allocation (type size lowtag result-tn &key stack-p node temp-tn flag-tn)
   ;; We assume we're in a pseudo-atomic so the pseudo-atomic bit is
   ;; set.  If the lowtag also has a 1 bit in the same position, we're all
   ;; set.  Otherwise, we need to zap out the lowtag from alloc-tn, and
   ;; then or in the lowtag.
   ;; Normal allocation to the heap.
   (declare (ignore stack-p node))
+  (binding* ((imm-size (typep size '(unsigned-byte 15)))
+             ((region-base-tn field-offset)
+               #-sb-thread (values thread-base-tn ; will be STATIC-SPACE-START
+                                   ;; skip over the array header
+                                   (* 2 n-word-bytes))
+               #+sb-thread (values thread-base-tn
+                                   (* thread-alloc-region-slot n-word-bytes))))
 
-  #-alloc-use-sigtrap ; sigtrap is not working
-  (let ((lip (make-random-tn :kind :normal :sc (sc-or-lose 'unsigned-reg)
-                             :offset lip-offset)))
-    (inst lr lip (make-fixup 'alloc-tramp :assembly-routine))
-    (if (numberp size)
-        (inst lr temp-tn size)
-        (move temp-tn size))
-    (inst std temp-tn lip -8)
-    ;; the asm routine is not allowed to mess up the link register - it has to
-    ;; be truly "invisible", like the trap signal. Obviously it's impossible
-    ;; to avoid messing up LR, which means we need to save it now because we don't
-    ;; know whether we're inside a context that needs it saved.
-    (inst mflr temp-tn)
-    (inst std temp-tn lip -16)
-    (inst mtctr lip)
-    (inst bctrl)
-    ;; LIP once again points to the static spill area from which we can
-    ;; recover the LR
-    (inst ld temp-tn lip -16)
-    (inst mtlr temp-tn)
-    ;; asm routine returns its result in the count register.
-    (inst mfctr result-tn)
-    (inst ori result-tn result-tn lowtag)
-    (return-from allocation))
-
-  (let ((imm-size (typep size '(unsigned-byte 15)))
-        (region (+ #+sb-thread (* thread-alloc-region-slot n-word-bytes))))
+    ;; use a spare register because of the usual problem that lw & sw only allow
+    ;; displacements that are a multiple of 4. Otherwise NULL-TN would do.
+    ;; STATIC-SPACE-START can be put into the register using exactly 1 instruction
+    ;; without referencing a code constant, whereas computing the actual base
+    ;; address of the struct would use an LIS + ORI.
+    #-sb-thread (inst lr thread-base-tn static-space-start)
 
     (unless imm-size ; Make temp-tn be the size
       (if (numberp size)
           (inst lr temp-tn size)
           (move temp-tn size)))
 
-    ;; thread-base-tn will point directly to the C variable if no thread
-    #-sb-thread
-    (progn (inst lr thread-base-tn (make-fixup "gc_alloc_region" :foreign-dataref))
-           (inst ld thread-base-tn thread-base-tn 0)) ; because sb-dynamic-core
-
-    (inst ld result-tn thread-base-tn region)
-    (inst ld flag-tn thread-base-tn (+ region n-word-bytes)) ; region->end_addr
+    (inst ld result-tn region-base-tn field-offset)
+    (inst ld flag-tn region-base-tn (+ field-offset n-word-bytes)) ; region->end_addr
 
     (without-scheduling ()
          ;; CAUTION: The C code depends on the exact order of
@@ -263,11 +227,29 @@
          ;; the actual end of the region?  If so, we need a full alloc.
          ;; The C code depends on this exact form of instruction.  If
          ;; either changes, you have to change the other appropriately!
-         (inst tw :lgt result-tn flag-tn)
-
-         ;; The C code depends on this instruction sequence taking up
-         ;; one machine instruction.
-         (inst std result-tn thread-base-tn region))
+         ;;
+         ;; We use the EQ bit of the 5-bit TO field to indicate whether this
+         ;; allocation can go on large-object pages. The trap condition
+         ;; is :LGE in that case which "spuriously fails" in the edge case
+         ;; when it could have actually used the current open region,
+         ;; exactly touching the end pointer. But that's fine, the trap
+         ;; handler doesn't bother to see whether the failure was spurious,
+         ;; because lisp_alloc() just works.
+         (let ((ok (gen-label)))
+           (declare (ignorable ok))
+           #+sigill-traps
+           (progn (inst cmpld result-tn flag-tn)
+                  (inst ble ok)
+                  (inst mfmq temp-reg-tn) ; an illegal instructions
+                  ;; KLUDGE: emit another ADD so that the sigtrap handler
+                  ;; can behave just as if the trap happened at the TD.
+                  (if imm-size
+                      (inst addi result-tn result-tn size)
+                      (inst add result-tn result-tn temp-tn)))
+           (inst td (if (eq type 'list) :lgt :lge) result-tn flag-tn)
+           #+sigill-traps (emit-label ok))
+         ;; The C code depends on exactly 1 instruction here.
+         (inst std result-tn region-base-tn field-offset))
 
        ;; Should the allocation trap above have fired, the runtime
        ;; arranges for execution to resume here, just after where we
@@ -293,13 +275,13 @@
   initializes the object."
   (once-only ((result-tn result-tn) (temp-tn temp-tn) (flag-tn flag-tn)
               (type-code type-code) (size size) (lowtag lowtag))
-    `(pseudo-atomic (,flag-tn)
+    `(pseudo-atomic (,flag-tn :sync ,type-code)
        (if ,stack-allocate-p
            (progn
              (align-csp ,temp-tn)
              (inst ori ,result-tn csp-tn ,lowtag)
              (inst addi csp-tn csp-tn (pad-data-block ,size)))
-         (allocation ,result-tn (pad-data-block ,size) ,lowtag
+         (allocation nil (pad-data-block ,size) ,lowtag ,result-tn
                      :temp-tn ,temp-tn
                      :flag-tn ,flag-tn))
        (when ,type-code
@@ -313,7 +295,8 @@
     (inst andi. temp csp-tn lowtag-mask)
     (inst beq aligned)
     (inst addi csp-tn csp-tn n-word-bytes)
-    (storew zero-tn csp-tn -1)
+    (inst li temp 0)
+    (storew temp csp-tn -1)
     (emit-label aligned)))
 
 
@@ -346,32 +329,30 @@
 ;;; aligns ALLOC-TN again and (b) makes ALLOC-TN go negative. We then
 ;;; trap if ALLOC-TN's negative (handling the deferred interrupt) and
 ;;; using FLAG-TN - minus the large constant - to correct ALLOC-TN.
-(defmacro pseudo-atomic ((flag-tn) &body forms)
-  #+sb-safepoint-strictly
+(defmacro pseudo-atomic ((flag-tn &key (sync t)) &body forms)
+  (declare (ignorable sync))
+  #+sb-safepoint
   `(progn ,flag-tn ,@forms (emit-safepoint))
-  #-sb-safepoint-strictly
+  #-sb-safepoint
   `(progn
-     (without-scheduling ()
-       ;; Extra debugging stuff:
-       #+debug
-       (progn
-         (inst andi. ,flag-tn alloc-tn lowtag-mask)
-         (inst twi :ne ,flag-tn 0))
-       (inst ori alloc-tn alloc-tn pseudo-atomic-flag))
+     (inst ori alloc-tn alloc-tn pseudo-atomic-flag)
      ,@forms
-     (inst sync)
+     #+sb-thread
+     (when ,sync
+       (inst sync))
      (without-scheduling ()
        (inst subi alloc-tn alloc-tn pseudo-atomic-flag)
        ;; Now test to see if the pseudo-atomic interrupted bit is set.
        (inst andi. ,flag-tn alloc-tn pseudo-atomic-interrupted-flag)
-       (inst twi :ne ,flag-tn 0))
-     #+debug
-     (progn
-       (inst andi. ,flag-tn alloc-tn lowtag-mask)
-       (inst twi :ne ,flag-tn 0))
-     #+sb-safepoint
-     (emit-safepoint)))
+       #+sigill-traps
+       (let ((continue (gen-label)))
+         (inst beq continue)
+         (inst mfmq (make-random-tn :kind :normal :sc (sc-or-lose 'unsigned-reg) :offset 1))
+         (emit-label continue))
+       #-sigill-traps
+       (inst twi :ne ,flag-tn 0))))
 
 #+sb-safepoint
 (defun emit-safepoint ()
-  (inst lwz zero-tn null-tn (- (+ gc-safepoint-trap-offset n-word-bytes other-pointer-lowtag))))
+  (inst lwz temp-reg-tn null-tn
+        (- (+ gc-safepoint-trap-offset n-word-bytes other-pointer-lowtag))))

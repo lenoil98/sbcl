@@ -29,9 +29,9 @@
 
 (defun unblock-deferrable-signals ()
   (with-alien ((%unblock-deferrable-signals
-                (function void unsigned-long unsigned-long) :extern
+                (function void unsigned-long) :extern
                 "unblock_deferrable_signals"))
-    (alien-funcall %unblock-deferrable-signals 0 0)
+    (alien-funcall %unblock-deferrable-signals 0)
     nil))
 
 (defun with-deferrable-signals-unblocked (enable-interrupts function)
@@ -41,7 +41,7 @@
               (let (*unblock-deferrables-on-enabling-interrupts-p*)
                 (unblock-deferrable-signals)
                 (when (or *interrupt-pending*
-                          #+sb-thruption *thruption-pending*)
+                          #+sb-safepoint *thruption-pending*)
                   (receive-pending-interrupt))
                 (funcall function))
            (alien-funcall (extern-alien "block_deferrable_signals"
@@ -50,7 +50,7 @@
         (t
          (when (and enable-interrupts
                     (or *interrupt-pending*
-                        #+sb-thruption *thruption-pending*))
+                        #+sb-safepoint *thruption-pending*))
            (receive-pending-interrupt))
          (funcall function))))
 

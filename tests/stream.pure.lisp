@@ -136,6 +136,11 @@
 ;;; Ideas?
 #+nil (assert (eq (interactive-stream-p *terminal-io*) t))
 
+;;; FILE-POSITION should not accept NIL
+(with-test (:name :file-position-smoke-test)
+  (let ((s (make-broadcast-stream)))
+    (assert-error (file-position s (opaque-identity nil)) type-error)))
+
 ;;; MAKE-STRING-INPUT-STREAM
 ;;;
 ;;; * Observe FILE-POSITION :START and :END, and allow setting of
@@ -280,8 +285,7 @@
                   (let ((s (with-output-to-string
                                (s nil ,@(when element-type-form
                                           `(:element-type ,element-type-form))))))
-                    (assert (typep s '(simple-array ,(if element-type-form
-                                                         (eval element-type-form)
+                    (assert (typep s '(simple-array ,(or (eval element-type-form)
                                                          'character)
                                        (0)))))
                   (get-output-stream-string
@@ -290,19 +294,7 @@
                         `(:element-type ,element-type-form)))))))
     ;; If you pass NIL as element-type, note that there seems to be no requirement
     ;; to produce a stream that can *accept* only characters of that type.
-    ;; We produce a BASE-STRING-OUTPUT-STREAM if you do something so pointless,
-    ;; and accept base characters written to that stream.
-    ;; However, we'll always return a (simple-array nil (0)) from such stream.
-    ;; For comparison -
-    ;; CCL: (type-of (get-output-stream-string (make-string-output-stream :element-type nil)))
-    ;;      => (SIMPLE-BASE-STRING 0)
-    ;; ABCL:
-    ;;      (let ((s (make-string-output-stream :element-type nil)))
-    ;;        (write-string "Hi" s)
-    ;;        (get-output-stream-string s)) => ""
-    ;; CLISP is more pedantic, refusing to accept characters and returning a NIL vector:
-    ;; (type-of (get-output-stream-string (make-string-output-stream :element-type nil)))
-    ;;      => (VECTOR NIL 0)
+    ;; We produce a CHARACTER-STRING-OUTPUT-STREAM if you do something so pointless.
     (frob nil)
     (frob 'character)
     (frob 'base-char)
@@ -372,7 +364,7 @@
 ;;; immediately be completely filled for normal files, and that the
 ;;; buffer-fill routine is responsible for figuring out when we've
 ;;; reached EOF.
-(with-test (:name (stream :listen-vs-select) :fails-on :win32)
+(with-test (:name (stream :listen-vs-select))
   (let ((listen-testfile-name (scratch-file-name))
         ;; If non-NIL, size (in bytes) of the file that will exercise
         ;; the LISTEN problem.
@@ -472,7 +464,7 @@
 
 #+sb-unicode
 (with-test (:name (:default-char-stream-resets))
-  (let ((s (sb-impl::%make-default-string-ostream)))
+  (sb-impl::%with-output-to-string (s)
     (dotimes (i 2)
       (write-char (code-char 1000) s)
       (assert (equal (type-of (get-output-stream-string s))
@@ -481,3 +473,41 @@
       ;; result type reverts back to simple-base-string after get-output-stream-string
       (assert (equal (type-of (get-output-stream-string s))
                      '(simple-base-string 1))))))
+
+(with-test (:name :with-input-from-string-nowarn)
+  (checked-compile '(lambda ()
+                     (with-input-from-string (s "muffin")))))
+
+(with-test (:name :with-input-from-string-declarations)
+  (checked-compile-and-assert
+      ()
+      `(lambda (string)
+         (with-input-from-string (x string)
+           (declare (optimize safety))
+           (read-char x)))
+    (("a") #\a)))
+
+(defun input-from-dynamic-extent-stream ()
+  (handler-case (with-input-from-string (stream "#w") (read stream nil nil))
+    (error (condition)
+      (format nil "~A" condition))))
+(compile 'input-from-dynamic-extent-stream)
+(with-test (:name :with-input-from-string-signal-stream-error)
+  (assert (search "unavailable" (input-from-dynamic-extent-stream))))
+
+(with-test (:name :closeable-broadcast-stream)
+  (let ((b (make-broadcast-stream)))
+   (close b)
+   (assert (not (open-stream-p b)))
+   (assert-error (write-string "test" b))))
+
+(defvar *some-stream*)
+(with-test (:name :closeable-synonym-stream)
+  (let ((*some-stream* (make-string-input-stream "hola")))
+    (let ((syn (make-synonym-stream '*some-stream*)))
+      (assert (eql (read-char syn) #\h))
+      (close syn)
+      (assert (not (open-stream-p syn)))
+      (assert-error (read-char syn))
+      (close syn) ; no error
+      (assert (eql (read-char *some-stream*) #\o)))))

@@ -19,26 +19,92 @@
 (defvar *undefined-warnings*)
 (declaim (list *undefined-warnings*))
 
+;;; Delete any undefined warnings for NAME and KIND. This is for the
+;;; benefit of the compiler, but it's sometimes called from stuff like
+;;; type-defining code which isn't logically part of the compiler.
+(declaim (ftype (function ((or symbol cons) keyword) (values))
+                note-name-defined))
+(defun note-name-defined (name kind)
+  #-sb-xc-host (atomic-incf *type-cache-nonce*)
+  ;; We do this BOUNDP check because this function can be called when
+  ;; not in a compilation unit (as when loading top level forms).
+  (when (boundp '*undefined-warnings*)
+    (let ((name (uncross name)))
+      (setq *undefined-warnings*
+            (delete-if (lambda (x)
+                         (and (equal (undefined-warning-name x) name)
+                              (eq (undefined-warning-kind x) kind)))
+                       *undefined-warnings*))))
+  (values))
+
+;;; to be called when a variable is lexically bound
+(declaim (ftype (function (symbol) (values)) note-lexical-binding))
+(defun note-lexical-binding (symbol)
+    ;; This check is intended to protect us from getting silently
+    ;; burned when we define
+    ;;   foo.lisp:
+    ;;     (DEFVAR *FOO* -3)
+    ;;     (DEFUN FOO (X) (+ X *FOO*))
+    ;;   bar.lisp:
+    ;;     (DEFUN BAR (X)
+    ;;       (LET ((*FOO* X))
+    ;;         (FOO 14)))
+    ;; and then we happen to compile bar.lisp before foo.lisp.
+  (when (looks-like-name-of-special-var-p symbol)
+    ;; FIXME: should be COMPILER-STYLE-WARNING?
+    (style-warn 'asterisks-around-lexical-variable-name
+                :format-control
+                "using the lexical binding of the symbol ~
+                 ~/sb-ext:print-symbol-with-prefix/, not the~@
+                 dynamic binding"
+                :format-arguments (list symbol)))
+  (values))
+
+;;; In the target compiler, a lexenv can hold an alist of condition
+;;; types (CTYPE . ACTION) such that when signaling condition CTYPE,
+;;; we perform ACTION which is usually MUFFLE-CONDITION.
+;;; Each CTYPE is a (parsed) CONDITION subtype, which is slightly
+;;; more efficient than holding the mapping keys as s-expressions
+;;; (type specifier).  However, the parsed representation is worse
+;;; for in the cross-compiler, actually downright disastrous. Why?
+;;; Because to process an entry in the list, we invert the parsed type
+;;; back to a sexpr, and then inquire of the host via its CL:TYPEP
+;;; whether a condition instance is of that type. (We use host
+;;; condition objects). So why parse and unparse? Not only is that
+;;; dumb, it's broken. For example, to invert #<classoid CODE-DELETION-NOTE>,
+;;; you must already have seen a target definition of that type.
+;;; But you haven't necessarily! If you haven't, then there is no
+;;; CONDITION-CLASSOID for that, there is only an UNKNOWN-TYPE.
+;;; And then you have to signal a PARSE-UNKNOWN-TYPE, and then you must
+;;; ask how to handle _that_ condition (the PARSE-UNKNOWN-TYPE)
+;;; signaled while trying to signal some other condition. What a mess.
 (declaim (ftype (function (list list) list)
                 process-handle-conditions-decl))
 (defun process-handle-conditions-decl (spec list)
   (let ((new (copy-alist list)))
     (dolist (clause (cdr spec) new)
       (destructuring-bind (typespec restart-name) clause
-        (let ((type (compiler-specifier-type typespec))
-              (ospec (rassoc restart-name new :test #'eq)))
-          (cond ((not type))
-                (ospec
-                 (setf (car ospec) (type-union (car ospec) type)))
-                (t
-                 (push (cons type restart-name) new))))))))
+        (let ((ospec (rassoc restart-name new :test #'eq)))
+          #+sb-xc-host
+          (if ospec
+              (setf (car ospec) `(or ,typespec ,(car ospec)))
+              (push (cons typespec restart-name) new))
+          #-sb-xc-host
+          (let ((type (compiler-specifier-type typespec)))
+            (cond ((not type))
+                  (ospec
+                   (setf (car ospec) (type-union (car ospec) type)))
+                  (t
+                   (push (cons type restart-name) new)))))))))
 
 (declaim (ftype (function (list list) list)
                 process-muffle-conditions-decl))
-(defun process-muffle-conditions-decl (spec list)
-  (process-handle-conditions-decl
-   `(handle-conditions ((or ,@(cdr spec)) muffle-warning))
-   list))
+(defun process-muffle-conditions-decl (expr list)
+  (let ((spec (cond ((not expr) nil)
+                    ((singleton-p (cdr expr)) (cadr expr))
+                    (t `(or ,@(cdr expr))))))
+    (process-handle-conditions-decl `(handle-conditions (,spec muffle-warning))
+                                    list)))
 
 (declaim (ftype (function (list list) list)
                 process-unhandle-conditions-decl))
@@ -94,8 +160,16 @@
 
   (multiple-value-bind (allowed test)
       (ecase kind
-        (special (values '(:special :unknown) #'eq))
-        (global (values '(:global :unknown) #'eq))
+        (special
+         ;; KLUDGE: There is probably a better place to do this.
+         (when (boundp '*ir1-namespace*)
+           (remhash name (free-vars *ir1-namespace*)))
+         (values '(:special :unknown) #'eq))
+        (global
+         ;; KLUDGE: Ditto.
+         (when (boundp '*ir1-namespace*)
+           (remhash name (free-vars *ir1-namespace*)))
+         (values '(:global :unknown) #'eq))
         (always-bound (values '(:constant) #'neq)))
     (let ((old (info :variable :kind name)))
       (unless (member old allowed :test test)
@@ -173,8 +247,8 @@
   (setf (classoid-state class) :sealed)
   (let ((subclasses (classoid-subclasses class)))
     (when subclasses
-      (dohash ((subclass layout) subclasses :locked t)
-        (declare (ignore layout))
+      (dohash ((subclass wrapper) subclasses :locked t)
+        (declare (ignore wrapper))
         (setf (classoid-state subclass) :sealed)))))
 
 (defun process-freeze-type-declaration (type-specifier)
@@ -184,10 +258,20 @@
 
 (defun process-inline-declaration (name kind)
   (declare (type (and inlinep (not null)) kind))
-  ;; since implicitly it is a function, also scrubs *FREE-FUNS*
+  ;; since implicitly it is a function, also scrubs (FREE-FUNS *IR1-NAMESPACE*)
   (proclaim-as-fun-name name)
   (warn-if-inline-failed/proclaim name kind)
   (setf (info :function :inlinep name) kind))
+
+(defun process-block-compile-declaration (entries kind)
+  (ecase kind
+    (start-block
+     (finish-block-compilation)
+     (let ((compilation *compilation*))
+       (setf (block-compile compilation) t)
+       (setf (entry-points compilation) entries)))
+    (end-block
+     (finish-block-compilation))))
 
 (defun check-deprecation-declaration (state since form)
   (unless (typep state 'deprecation-state)
@@ -231,7 +315,7 @@
            form name))
   (with-single-package-locked-error
       (:symbol name "globally declaring ~A as a declaration proclamation"))
-  (setf (info :declaration :recognized name) t))
+  (setf (info :declaration :known name) t))
 
 ;;; ANSI defines the declaration (FOO X Y) to be equivalent to
 ;;; (TYPE FOO X Y) when FOO is a type specifier. This function
@@ -296,23 +380,40 @@
                                     (ftype #'proclaim-ftype))
                             ctype type :declared)))
              (push raw-form *queued-proclaims*)))
+        #-sb-fluid
         (freeze-type
          (map-args #'process-freeze-type-declaration))
+        ((start-block end-block)
+         (when (and *compile-time-eval* (boundp '*compilation*))
+           (if (eq *block-compile-argument* :specified)
+               (process-block-compile-declaration args kind)
+               (compiler-notify "ignoring ~S declaration since ~
+                                :BLOCK-COMPILE is not :SPECIFIED"
+                                kind))))
         (optimize
          (multiple-value-bind (new-policy specified-qualities)
              (process-optimize-decl form *policy*)
+           (when (and (boundp '*compilation*)
+                      ;; Should I also examine *COMPILE-TIME-EVAL* here? I don't think so.
+                      (listp (saved-optimize-decls *compilation*)))
+             (push form (saved-optimize-decls *compilation*)))
            (setq *policy* new-policy)
            (warn-repeated-optimize-qualities new-policy specified-qualities)))
         (muffle-conditions
          (setq *handled-conditions*
                (process-muffle-conditions-decl form *handled-conditions*)))
         (unmuffle-conditions
+         ;; When cross-compiling, we're won't perform type algebra on the sexpr
+         ;; representation. There is no need for this kind of ridiculous spec:
+         ;;   (and (or this that) (not that)).
+         #+sb-xc-host (bug "UNMUFFLE: not implemented")
+         #-sb-xc-host
          (setq *handled-conditions*
                (process-unmuffle-conditions-decl form *handled-conditions*)))
         ((disable-package-locks enable-package-locks)
          (setq *disabled-package-locks*
                (process-package-lock-decl form *disabled-package-locks*)))
-        ((inline notinline maybe-inline)
+        ((#-sb-fluid inline notinline #-sb-fluid maybe-inline)
          (map-args #'process-inline-declaration kind))
         (deprecated
          (destructuring-bind (state since &rest things) args
@@ -328,7 +429,7 @@
         (declaration
          (map-args #'process-declaration-declaration form))
         (t
-         (unless (info :declaration :recognized kind)
+         (unless (info :declaration :known kind)
            (compiler-warn "unrecognized declaration ~S" raw-form)))))))
 
 (defun sb-xc:proclaim (raw-form)

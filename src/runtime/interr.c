@@ -44,7 +44,10 @@ default_lossage_handler(void)
     static int backtrace_invoked = 0;
     if (!backtrace_invoked) {
         backtrace_invoked = 1;
-        lisp_backtrace(100);
+        // This may not be exactly the right condition for determining
+        // whether it might be possible to backtrace, but at least it prevents
+        // lose() from itself losing early in startup.
+        if (get_sb_vm_thread()) lisp_backtrace(100);
     }
     exit(1);
 }
@@ -96,10 +99,7 @@ void disable_lossage_handler(void)
 static
 void print_message(char *fmt, va_list ap)
 {
-    fprintf(stderr, " in SBCL pid %d",getpid());
-#if defined(LISP_FEATURE_SB_THREAD)
-    fprintf(stderr, "(tid %p)", (void*)thread_self());
-#endif
+    fprintf(stderr, " in SBCL pid %d" THREAD_ID_LABEL, getpid(), THREAD_ID_VALUE);
     if (fmt) {
         fprintf(stderr, ":\n");
         vfprintf(stderr, fmt, ap);
@@ -133,6 +133,32 @@ lose(char *fmt, ...)
     fflush(stderr);
     call_lossage_handler();
 }
+
+#if 0
+/// thread printf. This was used to produce the 2-column output
+/// at the bottom of "src/code/final". The main thread'd os_kernel_tid
+/// must be assigned a constant in main_thread_trampoline().
+void tprintf(char *fmt, ...)
+{
+    va_list ap;
+    char buf[200];
+    char *ptr;
+    const char spaces[] = "                                           ";
+    struct thread*th = get_sb_vm_thread();
+    buf[0] = ';'; buf[1] = ' ';
+    ptr = buf+2;
+    if (th->os_kernel_tid == 'A') {
+        strcpy(ptr, spaces);
+        ptr += (sizeof spaces)-1;
+    }
+    va_start(ap, fmt);
+    int n = vsprintf(ptr, fmt, ap);
+    va_end(ap);
+    ptr += n;
+    *ptr++ = '\n';
+    write(2, buf, ptr-buf);
+}
+#endif
 
 boolean lose_on_corruption_p = 0;
 
@@ -185,18 +211,35 @@ char internal_error_nargs[] = INTERNAL_ERROR_NARGS;
 void skip_internal_error (os_context_t *context) {
     unsigned char *ptr = (unsigned char *)*os_context_pc_addr(context);
 #ifdef LISP_FEATURE_ARM64
-    u32 trap_instruction = *(u32 *)ptr;
+    // This code is broken. The program counter as received in *context
+    // points one instruction beyond the BRK opcode.
+    // I wrote a test vop that emits a cerror break thusly:
+    //
+    // ; 62C:       40A122D4         BRK #5386                       ; Cerror trap
+    // ; 630:       30               BYTE #X30                       ; R2
+    //
+    // and added a printf to see the instruction pointer here:
+    //   skip_internal_error: pc=0x1002441630
+    //
+    // which got a trap code of 0. This is due to the fact that DESCRIPTOR-REG
+    // is the lowest SC number, so the encoded SC+OFFSET of R2 is a small
+    // value, and therefore shifting right by 13 bits extracts a 0.
+    // Internal error number 0 has 0 arguments, so we skip nothing in the varint
+    // decoder loop, which is the right thing for the wrong reason.
+    uint32_t trap_instruction = *(uint32_t *)ptr;
     unsigned char code = trap_instruction >> 13 & 0xFF;
     ptr += 4;
 #else
     unsigned char code = *ptr;
-    ptr++;
+    ptr++; // skip the byte indicating the kind of trap
 #endif
     if (code > sizeof(internal_error_nargs)) {
         printf("Unknown error code %d at %p\n", code, (void*)*os_context_pc_addr(context));
     }
-
-    ptr += internal_error_nargs[code];
+    int nargs = internal_error_nargs[code];
+    int nbytes = 0;
+    while (nargs--) read_var_integer(ptr, &nbytes);
+    ptr += nbytes;
     *((unsigned char **)os_context_pc_addr(context)) = ptr;
 }
 
@@ -215,7 +258,7 @@ describe_internal_error(os_context_t *context)
     unsigned char code;
 
 #ifdef LISP_FEATURE_ARM64
-    u32 trap_instruction = *(u32 *)ptr;
+    uint32_t trap_instruction = *(uint32_t *)ptr;
     code = trap_instruction >> 13 & 0xFF;
     ptr += 4;
 #else
@@ -298,27 +341,4 @@ describe_internal_error(os_context_t *context)
             break;
         }
     }
-}
-
-/* utility routines used by miscellaneous pieces of code */
-
-lispobj debug_print(lispobj string)
-{
-    /* This is a kludge.  It's not actually safe - in general - to use
-       %primitive print on the alpha, because it skips half of the
-       number stack setup that should usually be done on a function
-       call, so the called routine (i.e. this one) ends up being able
-       to overwrite local variables in the caller.  Rather than fix
-       this everywhere that %primitive print is used (it's only a
-       debugging aid anyway) we just guarantee our safety by putting
-       an unused buffer on the stack before doing anything else
-       here */
-    char untouched[32];
-    if (header_widetag(VECTOR(string)->header) != SIMPLE_BASE_STRING_WIDETAG)
-        fprintf(stderr, "debug_print: can't display string\n");
-    else
-        fprintf(stderr, "%s\n", (char *)(VECTOR(string)->data));
-    /* shut GCC up about not using this, because that's the point.. */
-    (void)untouched;
-    return NIL;
 }

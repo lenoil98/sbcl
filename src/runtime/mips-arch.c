@@ -383,7 +383,7 @@ arch_handle_after_breakpoint(os_context_t *context)
 void
 arch_handle_single_step_trap(os_context_t *context, int trap)
 {
-    unsigned int code = *((u32 *)(os_context_pc(context)));
+    unsigned int code = *((uint32_t *)(os_context_pc(context)));
     int register_offset = code >> 16 & 0x1f;
     handle_single_step_trap(context, trap, register_offset);
     arch_skip_instruction(context);
@@ -394,7 +394,7 @@ sigtrap_handler(int signal, siginfo_t *info, os_context_t *context)
 {
     unsigned int code = (os_context_insn(context) >> 6) & 0xff;
     if (code == trap_PendingInterrupt) {
-        /* KLUDGE: is this neccessary or will handle_trap do the same? */
+        /* KLUDGE: is this necessary or will handle_trap do the same? */
         arch_clear_pseudo_atomic_interrupted(context);
     }
     handle_trap(context, code);
@@ -425,44 +425,18 @@ arch_set_fp_control(unsigned int fp)
 void
 arch_install_interrupt_handlers(void)
 {
-    undoably_install_low_level_interrupt_handler(SIGTRAP,sigtrap_handler);
+    ll_install_handler(SIGTRAP,sigtrap_handler);
 }
 
-#ifdef LISP_FEATURE_LINKAGE_TABLE
-
-/* Linkage tables for MIPS
-
-   Linkage entry size is 16, because we need 4 instructions to implement
-   a jump. The entry size constant is defined in parms.lisp.
-
-   Define the register to use in the linkage jump table. For MIPS this
-   has to be the PIC call register $25 aka t9 aka reg_ALLOC. */
-#define LINKAGE_TEMP_REG        reg_ALLOC
-
-/* Insert the necessary jump instructions at the given address. */
+// Calls into C are mediated by the handwritten call_into_c routine
+// which spills registers, recomputes GP, etc.
+// So text and data entries are the same, because all we need
+// to represent a function is its address, no 'jr' instruction.
 void
-arch_write_linkage_table_entry(char *reloc_addr, void *target_addr, int datap)
+arch_write_linkage_table_entry(int index, void *target_addr, int datap)
 {
-  if (datap) {
+    // allocate successive entries downward
+    char *reloc_addr =
+        (char*)LINKAGE_TABLE_SPACE_END - (index + 1) * LINKAGE_TABLE_ENTRY_SIZE;
     *(unsigned int *)reloc_addr = (unsigned int)target_addr;
-    return;
-  }
-  /* Make JMP to function entry. The instruction sequence is:
-       lui    $25, 0, %hi(addr)
-       addiu  $25, $25, %lo(addr)
-       jr     $25
-        nop */
-  unsigned int *insn = (unsigned int *)reloc_addr;
-  unsigned int addr = (unsigned int)target_addr;
-  unsigned int hi = ((addr + 0x8000) >> 16) & 0xffff;
-  unsigned int lo = addr & 0xffff;
-
-  *insn++ = (15 << 26) | (LINKAGE_TEMP_REG << 16) | hi;
-  *insn++ = ((9 << 26) | (LINKAGE_TEMP_REG << 21)
-                 | (LINKAGE_TEMP_REG << 16) | lo);
-  *insn++ = (LINKAGE_TEMP_REG << 21) | 8;
-  *insn = 0;
-
-  os_flush_icache((os_vm_address_t)reloc_addr, LINKAGE_TABLE_ENTRY_SIZE);
 }
-#endif

@@ -13,12 +13,50 @@
 
 ;;;; structure frobbing primitives
 
+;;; This allocator is used by the expansion of MAKE-LOAD-FORM-SAVING-SLOTS
+;;; when given a STRUCTURE-OBJECT.
+(defun allocate-struct (type)
+  (let* ((layout (classoid-layout (the structure-classoid (find-classoid type))))
+         (structure (%make-instance (layout-length layout))))
+    (setf (%instance-layout structure) layout)
+    (dolist (dsd (dd-slots (layout-dd layout)) structure)
+      (when (eq (dsd-raw-type dsd) 't)
+        (setf (%instance-ref structure (dsd-index dsd)) (make-unbound-marker))))))
+
 ;;; Return the value from the INDEXth slot of INSTANCE. This is SETFable.
 ;;; This is used right away in warm compile by MAKE-LOAD-FORM-SAVING-SLOTS,
 ;;; so without it already defined, you can't define it, because you can't dump
 ;;; debug info structures. Were it not for that, this would go in 'stubs'.
 (defun %instance-ref (instance index)
   (%instance-ref instance index))
+
+(defun set-layout-inherits (layout inherits structurep this-id)
+  #-metaspace (setf (layout-inherits layout) inherits)
+  #+metaspace (setf (wrapper-inherits (layout-friend layout)) inherits)
+  ;;; If structurep, and *only* if, store all the inherited layout IDs.
+  ;;; It looks enticing to try to always store "something", but that goes wrong,
+  ;;; because only structure-object layouts are growable, and only structure-object
+  ;;; can store the self-ID in the proper index.
+  ;;; If the depthoid is -1, the self-ID has to go in index 0.
+  ;;; Standard-object layouts are not growable. The inherited layouts are known
+  ;;; only at class finalization time, at which point we've already made the layout.
+  ;;; Hence, the required indirection to the simple-vector of inherits.
+  (with-pinned-objects (layout)
+    ;; The layout-id vector is an array of int32_t starting at the ID-WORD0 slot.
+    ;; We could use (SETF %RAW-INSTANCE-REF/WORD) for 32-bit architectures,
+    ;; but on 64-bit we have to use SAP-REF, so may as well be consistent here
+    ;; and use a SAP either way.
+    (let ((sap (sap+ (int-sap (get-lisp-obj-address layout))
+                     (- (ash (+ sb-vm:instance-slots-offset (get-dsd-index layout id-word0))
+                             sb-vm:word-shift)
+                        sb-vm:instance-pointer-lowtag))))
+      (cond (structurep
+             (loop for i from 0 by 4
+                   for j from 2 below (length inherits) ; skip T and STRUCTURE-OBJECT
+                   do (setf (signed-sap-ref-32 sap i) (layout-id (svref inherits j)))
+                   finally (setf (signed-sap-ref-32 sap i) this-id)))
+            ((not (eql this-id 0))
+             (setf (signed-sap-ref-32 sap 0) this-id))))))
 
 ;;; Normally IR2 converted, definition needed for interpreted structure
 ;;; constructors only.
@@ -57,44 +95,54 @@
 
 ;;; the part of %DEFSTRUCT which makes sense only on the target SBCL
 ;;;
-(defun %target-defstruct (dd)
+(defmacro set-layout-equalp-impl (layout newval)
+  `(setf #-metaspace (%instance-ref ,layout
+                                    (get-dsd-index layout equalp-impl))
+         #+metaspace (%instance-ref (layout-friend ,layout)
+                                    (get-dsd-index wrapper equalp-impl))
+        ,newval))
+
+(defun assign-equalp-impl (type-name function)
+  (set-layout-equalp-impl (find-layout type-name) function))
+
+(defun %target-defstruct (dd equalp)
   (declare (type defstruct-description dd))
 
   (when (dd-doc dd)
     (setf (documentation (dd-name dd) 'structure)
           (dd-doc dd)))
 
-  (let* ((classoid (find-classoid (dd-name dd)))
-         (layout (classoid-layout classoid)))
-    ;; Make a vector of EQUALP slots comparators, indexed by (- word-index data-start).
-    ;; This has to be assigned to something regardless of whether there are
-    ;; raw slots just in case someone mutates a layout which had raw
-    ;; slots into one which does not - although that would probably crash
-    ;; unless no instances exist or all raw slots miraculously contained
-    ;; bits which were the equivalent of valid Lisp descriptors.
-    (setf (layout-equalp-tests layout)
-          (if (eql (layout-bitmap layout) +layout-all-tagged+)
-              #()
-              ;; The initial element of NIL means "do not compare".
-              ;; Ignored words (comparator = NIL) fall into two categories:
-              ;; - pseudo-ignored, which get compared by their
-              ;;   predecessor word, as for complex-double-float,
-              ;; - internal padding words which are truly ignored.
-              ;; Other words are compared as tagged if the comparator is 0,
-              ;; or as untagged if the comparator is a type-specific function.
-              (let ((comparators
+  (let ((classoid (find-classoid (dd-name dd))))
+    (let ((layout (classoid-layout classoid)))
+      (set-layout-equalp-impl
+          layout
+          (cond ((compiled-function-p equalp) equalp)
+                ((eql (layout-bitmap layout) +layout-all-tagged+)
+                 #'sb-impl::instance-equalp)
+                (t
+                  ;; Make a vector of EQUALP slots comparators, indexed by
+                  ;; (- word-index INSTANCE-DATA-START).
+                  ;; The initial element of NIL means "do not compare".
+                  ;; Ignored words (comparator = NIL) fall into two categories:
+                  ;; - pseudo-ignored, which get compared by their
+                  ;;   predecessor word, as for complex-double-float,
+                  ;; - internal padding words which are truly ignored.
+                  ;; Other words are compared as tagged if the comparator is 0,
+                  ;; or as untagged if the comparator is a type-specific function.
+                  (let ((comparators
                      ;; If data-start is 1, subtract 1 because we don't need
                      ;; a comparator for the LAYOUT slot.
                      (make-array (- (dd-length dd) sb-vm:instance-data-start)
                                  :initial-element nil)))
-                (dolist (slot (dd-slots dd) comparators)
-                  ;; -1 because LAYOUT (slot index 0) has no comparator stored.
-                  (setf (aref comparators
-                              (- (dsd-index slot) sb-vm:instance-data-start))
-                        (let ((rsd (dsd-raw-slot-data slot)))
-                          (if (not rsd)
-                              0 ; means recurse using EQUALP
-                              (raw-slot-data-comparator rsd))))))))
+                    (dolist (slot (dd-slots dd) comparators)
+                      (setf (aref comparators
+                                  (- (dsd-index slot) sb-vm:instance-data-start))
+                            (let ((rsd (dsd-raw-slot-data slot)))
+                              (if (not rsd)
+                                  0 ; means recurse using EQUALP
+                                  (raw-slot-data-comparator rsd)))))
+                    (lambda (a b)
+                      (sb-impl::instance-equalp* comparators a b)))))))
 
     (dolist (fun *defstruct-hooks*)
       (funcall fun classoid)))
@@ -140,6 +188,21 @@
                 (t ; bignum - use LOGBITP to avoid consing more bignums
                  (copy-loop (logbitp i bitmap))))))
       res)))
+;;; Like above, but copy all slots (including the LAYOUT) as though boxed.
+;;; If the structure might contain raw slots and the GC is precise,
+;;; this won't ever be called.
+(defun %copy-instance (to from)
+  (declare (structure-object to from) (optimize (safety 0)))
+  (setf (%instance-layout to) (%instance-layout from))
+  (dotimes (i (%instance-length to) to)
+    (setf (%instance-ref to i) (%instance-ref from i))))
+;;; Like %COPY-INSTANCE, but layout was already assigned.
+;;; Similarly, will not be called if raw slots and precise GC.
+(defun %copy-instance-slots (to from)
+  (declare (structure-object to from) (optimize (safety 0)))
+  (loop for i from sb-vm:instance-data-start below (%instance-length to)
+        do (setf (%instance-ref to i) (%instance-ref from i)))
+  to)
 
 ;;; default PRINT-OBJECT method
 
@@ -157,7 +220,7 @@
 
 (defun %default-structure-pretty-print (structure stream name dd)
   (pprint-logical-block (stream nil :prefix "#S(" :suffix ")")
-    (prin1 name stream)
+    (write name :stream stream) ; escaped or not, according to printer controls
     (let ((remaining-slots (dd-slots dd)))
       (when remaining-slots
         (write-char #\space stream)
@@ -178,10 +241,10 @@
 (defun %default-structure-ugly-print (structure stream name dd)
   (descend-into (stream)
     (write-string "#S(" stream)
-    (prin1 name stream)
+    (write name :stream stream)
     (do ((index 0 (1+ index))
          (limit (or (and (not *print-readably*) *print-length*)
-                    sb-xc:most-positive-fixnum))
+                    most-positive-fixnum))
          (remaining-slots (dd-slots dd) (cdr remaining-slots)))
         ((or (null remaining-slots) (>= index limit))
          (write-string (if remaining-slots " ...)" ")") stream))
@@ -205,12 +268,16 @@
                ;; of change f02bee325920166b69070e4735a8a3f295f8edfd which
                ;; stopped the badness is a stronger way. It should be the case
                ;; that absence of a DD can't happen unless the classoid is absent.
-               ;; KLUDGE: during PCL build debugging, we can sometimes
-               ;; attempt to print out a PCL object (with null LAYOUT-INFO).
+               ;; KLUDGE: during warm build, we may see a CONDITION or STANDARD-OBJECT
+               ;; here, and we need a way to get a handle on it (for SB-VM:HEXDUMP at least).
+               ;; I'm not sure why a  condition-report function isn't called in the former
+               ;; case. Using the default structure printer won't solve anything, because
+               ;; the layout of a condition does not describe any slot of interest.
                (pprint-logical-block (stream nil :prefix "#<" :suffix ">")
-               (prin1 name stream)
-               (write-char #\space stream)
-               (write-string "(no LAYOUT-INFO)" stream)))
+                 (prin1 name stream)
+                 (write-char #\space stream)
+                 (write-string "(no LAYOUT-INFO) " stream)
+                 (write (get-lisp-obj-address structure) :base 16 :radix t :stream stream)))
               ((not (dd-slots dd))
                ;; the structure type doesn't count as a component for *PRINT-LEVEL*
                ;; processing. We can likewise elide the logical block processing,
@@ -229,7 +296,7 @@
 
 ;;; Used internally, but it would be nice to provide something
 ;;; like this for users as well.
-(defmacro define-structure-slot-addressor (name &key structure slot)
+(defmacro define-structure-slot-addressor (name &key structure slot (byte-offset 0))
   (let* ((dd (find-defstruct-description structure t))
          (slotd (or (and dd (find slot (dd-slots dd) :key #'dsd-name))
                     (error "Slot ~S not found in ~S." slot structure)))
@@ -241,6 +308,7 @@
          (truly-the
           word
           (+ (get-lisp-obj-address instance)
+             ,byte-offset
              ,(+ (- sb-vm:instance-pointer-lowtag)
                  (* (+ sb-vm:instance-slots-offset index)
                     sb-vm:n-word-bytes))))))))

@@ -87,9 +87,13 @@ distinct from the global value. Can also be SETF."
                    (char= (schar string 2) #\L)))))
       (return-from compute-symbol-hash (sxhash nil)))
   ;; And make a symbol's hash not the same as (sxhash name) in general.
-  (let ((sxhash (logand (lognot (%sxhash-simple-substring string 0 length))
-                        sb-xc:most-positive-fixnum)))
-    (if (zerop sxhash) #x55AA sxhash))) ; arbitrary substitute for 0
+  (let ((sxhash (logxor (%sxhash-simple-substring string 0 length)
+                        most-positive-fixnum)))
+    ;; The low 32 bits of the word in memory should have at least a 1 bit somewhere.
+    ;; If not, OR in a constant value.
+    (if (ldb-test (byte (- 32 sb-vm:n-fixnum-tag-bits) 0) sxhash)
+        sxhash
+        (logior sxhash #x55AA)))) ; arbitrary
 
 ;; Return SYMBOL's hash, a strictly positive fixnum, computing it if not stored.
 ;; The inlined code for (SXHASH symbol) only calls ENSURE-SYMBOL-HASH if
@@ -100,10 +104,6 @@ distinct from the global value. Can also be SETF."
         (let ((name (symbol-name symbol)))
           (%set-symbol-hash symbol (compute-symbol-hash name (length name))))
       hash)))
-
-;;; Interpreter stub: Return whatever is in the SYMBOL-HASH slot of SYMBOL.
-(defun symbol-hash (symbol)
-  (symbol-hash symbol))
 
 (defun symbol-function (symbol)
   "Return SYMBOL's current function definition. Settable with SETF."
@@ -196,6 +196,7 @@ distinct from the global value. Can also be SETF."
   ;; gets the fixnum which is the VECTOR-LENGTH of the info vector.
   ;; So all we have to do is turn any fixnum to NIL, and we have a plist.
   ;; Ensure that this pun stays working.
+  #-ppc64 ; ppc64 has unevenly spaced lowtags
   (assert (= (- (* sb-vm:n-word-bytes sb-vm:cons-car-slot)
                 sb-vm:list-pointer-lowtag)
              (- (* sb-vm:n-word-bytes sb-vm:vector-length-slot)
@@ -203,12 +204,11 @@ distinct from the global value. Can also be SETF."
 
 (defun symbol-plist (symbol)
   "Return SYMBOL's property list."
-  #+(vop-translates cl:symbol-plist)
-  (symbol-plist symbol)
-  #-(vop-translates cl:symbol-plist)
-  (let ((list (car (truly-the list (symbol-info symbol))))) ; a white lie
-    ;; Just ensure the result is not a fixnum, and we're done.
-    (if (fixnump list) nil list)))
+  (if (sb-c::vop-existsp :translate cl:symbol-plist)
+      (symbol-plist symbol)
+      (let ((list (car (truly-the list (symbol-info symbol))))) ; a harmless lie
+        ;; Just ensure the result is not a fixnum, and we're done.
+        (if (fixnump list) nil list))))
 
 (declaim (ftype (sfunction (symbol t) cons) %ensure-plist-holder)
          (inline %ensure-plist-holder))
@@ -475,7 +475,7 @@ distinct from the global value. Can also be SETF."
                            (code-char (+ (char-code #\0) r)))
                      s)))
           (recurse 1 counter)))
-      (with-simple-output-to-string (s)
+      (%with-output-to-string (s)
         (write-string prefix s)
         (%output-integer-in-base counter 10 s)))))
 
@@ -542,7 +542,11 @@ distinct from the global value. Can also be SETF."
                       (eq kind :unknown))
                  (with-single-package-locked-error
                      (:symbol symbol "setting the value of ~S"))
-                 nil))
+                 nil)
+                ((eq action 'makunbound)
+                 (with-single-package-locked-error (:symbol symbol "unbinding the symbol ~A")
+                   (when (eq (info :variable :always-bound symbol) :always-bound)
+                     (values "Can't ~@?" nil)))))
         (when what
           (if continue
               (cerror "Modify the constant." what (describe-action) symbol)

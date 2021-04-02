@@ -133,8 +133,6 @@
   :metaclass-constructor make-static-classoid
   :dd-type funcallable-structure)
 
-(declaim (freeze-type ctor))
-
 ;;; All defined ctors.
 (defglobal *all-ctors* (make-hash-table :test #'equal
                                         :weakness :value))
@@ -145,7 +143,7 @@
 
 ;;; Reset CTOR to use a default function that will compute an
 ;;; optimized constructor function when called.
-(defun install-initial-constructor (ctor &key force-p)
+(defun install-initial-constructor (ctor &optional force-p)
   (when (or force-p (ctor-class ctor))
     (setf (ctor-class ctor) nil
           (ctor-state ctor) 'initial)
@@ -190,7 +188,7 @@
 ;;; Keep this a separate function for testing.
 (defun make-ctor (function-name class-name initargs safe-p)
   (let ((ctor (%make-ctor 'ctor class-name nil initargs nil safe-p)))
-    (install-initial-constructor ctor :force-p t)
+    (install-initial-constructor ctor t)
     (setf (gethash function-name *all-ctors*) ctor)
     ctor))
 
@@ -201,7 +199,7 @@
 
 (defun make-allocator (function-name class-name)
   (let ((ctor (%make-ctor 'allocator class-name nil nil nil nil)))
-    (install-initial-constructor ctor :force-p t)
+    (install-initial-constructor ctor t)
     (setf (gethash function-name *all-ctors*) ctor)
     ctor))
 
@@ -239,20 +237,12 @@
 (declaim (inline sxhash-symbol-or-class))
 (defun sxhash-symbol-or-class (x)
   (cond ((symbolp x) (sxhash x))
-        ;; FIXME: if we could ensure that metaobjects (or at least just CLASS
-        ;; metaobjects) always have a precomputed hash, then instead of calling
-        ;; STD-INSTANCE-HASH which might have to compute and install the hash,
-        ;; a faster variant of this can assume that the hash is definitely nonzero.
-        ;; We could go back to always computing hashes for all standard instances,
-        ;; but I don't like that, because it will cause great pain for trying
-        ;; to generate deterministic core images. Since GFs usually have names
-        ;; (and classes do too), but instances in general don't, if you stay away
-        ;; from anonymous objects, reproducibility is an attainable goal.
-        ((std-instance-p x) (sb-impl::std-instance-hash x))
-        ((fsc-instance-p x) (sb-impl::fsc-instance-hash x))
+        ((std-instance-p x) (sb-impl::instance-sxhash x))
+        ((fsc-instance-p x) (fsc-instance-hash x))
         (t
          (bug "Something strange where symbol or class expected."))))
 
+(export '(+ctor-list-max-size+ +ctor-table-max-size+)) ; for a test
 ;;; Max number of CTORs kept in an inline list cache. Once this is
 ;;; exceeded we switch to a table.
 (defconstant +ctor-list-max-size+ 12)
@@ -765,21 +755,20 @@
          (declare #.*optimize-speed*)
          (block nil
            (when (layout-invalid ,wrapper)
-             (install-initial-constructor ,ctor)
+             (install-initial-constructor ,ctor t)
              (return (funcall ,ctor ,@(make-ctor-parameter-list ctor))))
            ,(wrap-in-allocate-forms ctor body early-unbound-markers-p)))
        locations
        names
        t))))
 
-(defun optimizing-allocator-generator
-    (ctor)
+(defun optimizing-allocator-generator (ctor)
   (let ((wrapper (class-wrapper (ctor-class ctor))))
     `(lambda ()
        (declare #.*optimize-speed*)
        (block nil
          (when (layout-invalid ,wrapper)
-           (install-initial-constructor ,ctor)
+           (install-initial-constructor ,ctor t)
            (return (funcall ,ctor)))
          ,(wrap-in-allocate-forms ctor nil t)))))
 
@@ -790,11 +779,10 @@
 ;;; the instance, and .SLOTS. to the instance's slot vector around BODY.
 (defun wrap-in-allocate-forms (ctor body early-unbound-markers-p)
   (let* ((class (ctor-class ctor))
-         (wrapper (class-wrapper class))
-         (allocation-function (raw-instance-allocator class))
-         (slots-fetcher (slots-fetcher class)))
-    (if (eq allocation-function 'allocate-standard-instance)
-        `(let ((.instance. (%make-standard-instance nil #-compact-instance-header 0))
+         (wrapper (class-wrapper class)))
+    (etypecase class
+      (standard-class
+        `(let ((.instance. (%make-instance (1+ sb-vm:instance-data-start)))
                (.slots. (make-array
                          ,(layout-length wrapper)
                          ,@(when early-unbound-markers-p
@@ -802,13 +790,10 @@
            (setf (%instance-layout .instance.) ,wrapper)
            (setf (std-instance-slots .instance.) .slots.)
            ,body
-           .instance.)
-        (let ((more
-               (when (memq allocation-function '(allocate-standard-funcallable-instance
-                                                 allocate-standard-funcallable-instance-immobile))
-                 '(nil))))
-          `(let* ((.instance. (,allocation-function ,wrapper ,@more))
-                  (.slots. (,slots-fetcher .instance.)))
+           .instance.))
+      (funcallable-standard-class
+        `(let* ((.instance. (allocate-standard-funcallable-instance ,wrapper nil))
+                (.slots. (fsc-instance-slots .instance.)))
              (declare (ignorable .slots.))
              ,body
              .instance.)))))

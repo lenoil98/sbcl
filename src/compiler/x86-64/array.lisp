@@ -33,36 +33,17 @@
           (ea (+ (* array-dimensions-offset n-word-bytes) lowtag-mask)
               nil rank (ash 1 (- word-shift n-fixnum-tag-bits))))
     (inst and :dword bytes (lognot lowtag-mask))
-    (inst lea :dword header (ea (fixnumize (1- array-dimensions-offset)) rank))
-    (inst shl :dword header n-widetag-bits)
+    ;; rank 1 is stored as 0, 2 is stored as 1, ...
+    (inst lea :dword header (ea (fixnumize -1) rank))
+    (inst and :dword header (fixnumize array-rank-mask))
+    (inst shl :dword header array-rank-byte-pos)
     (inst or  :dword header type)
     (inst shr :dword header n-fixnum-tag-bits)
     (instrument-alloc bytes node)
     (pseudo-atomic ()
-     (allocation result bytes node nil 0)
+     (allocation nil bytes 0 node nil result)
      (storew header result 0 0)
      (inst or :byte result other-pointer-lowtag))))
-
-(define-vop (make-array-header/c)
-  (:translate make-array-header)
-  (:policy :fast-safe)
-  (:arg-types (:constant t) (:constant t))
-  (:info type rank)
-  (:results (result :scs (descriptor-reg) :from :eval))
-  (:node-var node)
-  (:generator 12
-    (let* ((header-size (+ rank
-                           (1- array-dimensions-offset)))
-           (bytes (* (align-up (1+ header-size) 2) n-word-bytes))
-           (header (logior (ash header-size
-                                n-widetag-bits)
-                           type)))
-     (instrument-alloc bytes node)
-     (pseudo-atomic ()
-      (allocation result bytes node nil 0)
-      (storew* header result 0 0 t)
-      (inst or :byte result other-pointer-lowtag)))))
-
 
 ;;;; additional accessors and setters for the array header
 (define-full-reffer %array-dimension *
@@ -73,33 +54,17 @@
   array-dimensions-offset other-pointer-lowtag
   (any-reg) positive-fixnum %set-array-dimension)
 
-(define-vop (array-rank-vop)
+(define-vop ()
   (:translate %array-rank)
   (:policy :fast-safe)
   (:args (x :scs (descriptor-reg)))
   (:results (res :scs (unsigned-reg)))
   (:result-types positive-fixnum)
   (:generator 3
-    ;; An unaligned dword read not spanning a 16-byte boundary is as fast as
-    ;; and shorter by 5 bytes than a qword read and right-shift by 8.
-    (inst mov :dword res (ea (1+ (- other-pointer-lowtag)) x))
-    (inst sub :dword res (1- array-dimensions-offset))))
+    (inst movzx '(:byte :dword) res (ea (- 2 other-pointer-lowtag) x))
+    (inst inc :byte res)))
 
-(define-vop (array-rank-vop=>fixnum)
-  (:translate %array-rank)
-  (:policy :fast-safe)
-  (:args (x :scs (descriptor-reg)))
-  (:results (res :scs (any-reg)))
-  (:result-types positive-fixnum)
-  (:generator 2
-    (inst mov :dword res (ea (1+ (- other-pointer-lowtag)) x))
-    (inst lea :dword res
-          (let ((scale (ash 1 n-fixnum-tag-bits)))
-            ;; Compute [res*N-disp]. for N=2 use [res+res-disp]
-            (ea (- (* scale (1- array-dimensions-offset)))
-                (if (= scale 2) res nil) res (if (= scale 2) 1 scale))))))
-
-(define-vop (array-rank=)
+(define-vop ()
   (:translate %array-rank=)
   (:policy :fast-safe)
   (:args (array :scs (descriptor-reg)))
@@ -107,12 +72,78 @@
   (:arg-types * (:constant t))
   (:conditional :e)
   (:generator 2
-    (inst cmp :dword
-          (ea (1+ (- other-pointer-lowtag)) array)
-          (+ rank
-             (1- array-dimensions-offset)))))
+    (inst cmp :byte (ea (- 2 other-pointer-lowtag) array)
+          (encode-array-rank rank))))
+
+(define-vop (array-vectorp simple-type-predicate)
+  ;; SIMPLE-TYPE-PREDICATE says that it takes stack locations, but that's no good.
+  (:args (array :scs (any-reg descriptor-reg)))
+  (:translate vectorp)
+  (:conditional :z)
+  (:info)
+  (:guard (lambda (node)
+            (let ((arg (car (sb-c::combination-args node))))
+              (csubtypep (sb-c::lvar-type arg) (specifier-type 'array)))))
+  (:generator 1
+    (inst cmp :byte (ea (- 2 other-pointer-lowtag) array) (encode-array-rank 1))))
 
 ;;;; bounds checking routine
+(defun emit-bounds-check (vop %test-fixnum array index limit)
+  (let*  ((use-length-p (null limit))
+          (error
+           (if use-length-p
+               (generate-error-code vop 'sb-kernel::invalid-vector-index-error
+                                    array index)
+               (generate-error-code vop 'invalid-array-index-error array limit
+                                    index)))
+          (bound (if (and (tn-p limit) (sc-is limit immediate))
+                     (let ((value (tn-value limit)))
+                       (cond ((and %test-fixnum
+                                   (power-of-two-limit-p (1- value)))
+                              (lognot (fixnumize (1- value))))
+                             ((sc-is index any-reg descriptor-reg)
+                              (fixnumize value))
+                             (t
+                              value)))
+                     limit))
+          (index (if (sc-is index immediate)
+                     (let ((value (tn-value index)))
+                       (if (or (null bound) ; from array header
+                               (sc-is bound any-reg descriptor-reg))
+                           (fixnumize value)
+                           value))
+                     index)))
+      (cond ((typep bound '(integer * -1))
+             ;; Power of two bound, can be checked for fixnumness at
+             ;; the same time as it always occupies a consecutive bit
+             ;; range, everything else, including the tag, has to be
+             ;; zero.
+             (inst test index (if (eql bound -1)
+                                  index ;; zero?
+                                  bound))
+             (inst jmp :ne error))
+            (t
+             (when (and %test-fixnum (not (integerp index)))
+               (%test-fixnum index nil error t))
+             (cond (use-length-p
+                    (let ((len (ea (- (ash vector-length-slot word-shift)
+                                      other-pointer-lowtag)
+                                   array)))
+                      (cond ((integerp index)
+                             (inst cmp :qword len index)
+                             (inst jmp :be error))
+                            (t
+                             (inst cmp index len)
+                             (inst jmp :nb error)))))
+                   ((integerp bound)
+                    (inst cmp index bound)
+                    (inst jmp :nb error))
+                   (t
+                    (if (eql index 0)
+                        (inst test bound bound)
+                        (inst cmp bound index))
+                    (inst jmp :be error)))))))
+
 (define-vop (check-bound)
   (:translate %check-bound)
   (:policy :fast-safe)
@@ -130,45 +161,8 @@
   (:variant t)
   (:vop-var vop)
   (:save-p :compute-only)
-  (:generator 6
-    (let ((error (generate-error-code vop 'invalid-array-index-error
-                                      array bound index))
-          (bound (if (sc-is bound immediate)
-                     (let ((value (tn-value bound)))
-                       (cond ((and %test-fixnum
-                                   (power-of-two-limit-p (1- value)))
-                              (lognot (fixnumize (1- value))))
-                             ((sc-is index any-reg descriptor-reg)
-                              (fixnumize value))
-                             (t
-                              value)))
-                     bound))
-          (index (if (sc-is index immediate)
-                     (let ((value (tn-value index)))
-                       (if (sc-is bound any-reg descriptor-reg)
-                           (fixnumize value)
-                           value))
-                     index)))
-      (cond ((typep bound '(integer * -1))
-             ;; Power of two bound, can be checked for fixnumness at
-             ;; the same time as it always occupies a consecutive bit
-             ;; range, everything else, including the tag, has to be
-             ;; zero.
-             (inst test index (if (eql bound -1)
-                                  index ;; zero?
-                                  bound))
-             (inst jmp :ne error))
-            (t
-             (when (and %test-fixnum (not (integerp index)))
-               (%test-fixnum index nil error t))
-             (cond ((integerp bound)
-                    (inst cmp index bound)
-                    (inst jmp :nb error))
-                   (t
-                    (if (eql index 0)
-                        (inst test bound bound)
-                        (inst cmp bound index))
-                    (inst jmp :be error))))))))
+  (:generator 6 (emit-bounds-check vop %test-fixnum array index bound)))
+
 (define-vop (check-bound/fast check-bound)
   (:policy :fast)
   (:variant nil)
@@ -190,6 +184,60 @@
                 (:or unsigned-num signed-num))
   (:variant nil)
   (:variant-cost 5))
+
+(define-vop (check-vector-bound)
+  (:args (array :scs (descriptor-reg)) ; no constant sc allowed
+         (index :scs (any-reg descriptor-reg)
+                :load-if (not (and (sc-is index immediate)
+                                   (typep (tn-value index)
+                                          'sc-offset)))))
+  (:variant-vars %test-fixnum)
+  (:variant t)
+  (:vop-var vop)
+  (:save-p :compute-only)
+  (:generator 5 (emit-bounds-check vop %test-fixnum array index nil)))
+
+(define-vop (check-vector-bound/fast check-vector-bound)
+  (:policy :fast)
+  (:variant nil)
+  (:variant-cost 3))
+
+(define-vop (check-vector-bound/fixnum check-vector-bound)
+  (:args (array)
+         (index :scs (any-reg)))
+  (:arg-types * tagged-num)
+  (:variant nil)
+  (:variant-cost 3))
+
+(flet ((try-absorb-load (vop replacement)
+         (let ((prev (sb-c::vop-prev vop)))
+           ;; If the 2nd arg is the result of VECTOR-LENGTH of the 1st arg, then
+           ;; don't load the length; instead absorb it into a CMP instruction.
+           (when (and prev
+                      (eq (vop-name prev) 'slot)
+                      (eq (car (vop-codegen-info prev)) 'sb-c::vector-length)
+                      (eq (tn-ref-tn (sb-c::vop-args prev))
+                          (tn-ref-tn (sb-c::vop-args vop))))
+             (let* ((args (sb-c::vop-args vop))
+                    (array (tn-ref-tn args))
+                    (limit (tn-ref-tn (tn-ref-across args)))
+                    (index (tn-ref-tn (tn-ref-across (tn-ref-across args)))))
+               ;; Don't eliminate VECTOR-LENGTH if it has more than one read ref
+               (unless (tn-ref-next (sb-c::tn-reads limit))
+                 (let ((new (sb-c::emit-and-insert-vop
+                             (sb-c::vop-node vop) (vop-block vop)
+                             (template-or-lose replacement)
+                             (sb-c::reference-tn-list (list array index) nil)
+                             nil vop)))
+                   (sb-c::delete-vop prev)
+                   (sb-c::delete-vop vop)
+                   new)))))))
+  (setf (sb-c::vop-info-optimizer (template-or-lose 'check-bound))
+        (lambda (vop) (try-absorb-load vop 'check-vector-bound))
+        (sb-c::vop-info-optimizer (template-or-lose 'check-bound/fast))
+        (lambda (vop) (try-absorb-load vop 'check-vector-bound/fast))
+        (sb-c::vop-info-optimizer (template-or-lose 'check-bound/fixnum))
+        (lambda (vop) (try-absorb-load vop 'check-vector-bound/fixnum))))
 
 ;;;; accessors/setters
 
@@ -216,6 +264,20 @@
       signed-num signed-reg)
   (def-full-data-vector-frobs simple-array-unsigned-byte-63 unsigned-num
     unsigned-reg))
+
+(define-vop (data-vector-ref-with-offset/constant-simple-vector)
+  (:policy :fast-safe)
+  (:args (object :scs (constant))
+         (index :scs (any-reg)))
+  (:temporary (:sc unsigned-reg) array)
+  (:info offset)
+  (:arg-types simple-vector tagged-num (:constant fixnum))
+  (:results (value :scs (descriptor-reg any-reg immediate)))
+  (:result-types *)
+  (:generator 3
+    (inst lea array object)
+    (inst mov value (ea (* offset n-word-bytes) array
+                        index (ash 1 (- word-shift n-fixnum-tag-bits))))))
 
 (define-full-compare-and-swap %compare-and-swap-svref simple-vector
   vector-data-offset other-pointer-lowtag
@@ -282,7 +344,7 @@
          (:arg-types ,type positive-fixnum (:constant (integer 0 0)))
          (:results (result :scs (unsigned-reg) :from (:argument 0)))
          (:result-types positive-fixnum)
-         (:temporary (:sc unsigned-reg :offset ecx-offset) ecx)
+         (:temporary (:sc unsigned-reg :offset rcx-offset) ecx)
          (:generator 20
            (aver (zerop offset))
            (move ecx index)
@@ -332,7 +394,7 @@
          (:result-types positive-fixnum)
          (:temporary (:sc unsigned-reg) word-index)
          (:temporary (:sc unsigned-reg) old)
-         (:temporary (:sc unsigned-reg :offset ecx-offset) ecx)
+         (:temporary (:sc unsigned-reg :offset rcx-offset) ecx)
          (:generator 25
            (aver (zerop offset))
            (move word-index index)
@@ -422,7 +484,7 @@
   (def-small-data-vector-frobs simple-array-unsigned-byte-4 4))
 ;;; And the float variants.
 
-(defun make-ea-for-float-ref (object index offset element-size
+(defun float-ref-ea (object index offset element-size
                               &key (scale 1) (complex-offset 0))
   (etypecase index
       (integer
@@ -457,8 +519,8 @@
       ,@(if use-temp
             '((move dword-index index)
               (inst shr dword-index (1+ (- n-fixnum-tag-bits word-shift)))
-              (inst movss value (make-ea-for-float-ref object dword-index offset 4)))
-            '((inst movss value (make-ea-for-float-ref object index offset 4
+              (inst movss value (float-ref-ea object dword-index offset 4)))
+            '((inst movss value (float-ref-ea object index offset 4
                                  :scale (ash 4 (- n-fixnum-tag-bits)))))))))
 
 (define-vop (data-vector-ref-with-offset/simple-array-single-float-c)
@@ -473,7 +535,7 @@
   (:results (value :scs (single-reg)))
   (:result-types single-float)
   (:generator 4
-   (inst movss value (make-ea-for-float-ref object index offset 4))))
+   (inst movss value (float-ref-ea object index offset 4))))
 
 #.
 (let ((use-temp (<= word-shift n-fixnum-tag-bits)))
@@ -496,8 +558,8 @@
       ,@(if use-temp
             '((move dword-index index)
               (inst shr dword-index (1+ (- n-fixnum-tag-bits word-shift)))
-              (inst movss (make-ea-for-float-ref object dword-index offset 4) value))
-            '((inst movss (make-ea-for-float-ref object index offset 4
+              (inst movss (float-ref-ea object dword-index offset 4) value))
+            '((inst movss (float-ref-ea object index offset 4
                            :scale (ash 4 (- n-fixnum-tag-bits))) value)))
       (move result value))))
 
@@ -515,7 +577,7 @@
   (:results (result :scs (single-reg)))
   (:result-types single-float)
   (:generator 4
-   (inst movss (make-ea-for-float-ref object index offset 4) value)
+   (inst movss (float-ref-ea object index offset 4) value)
    (move result value)))
 
 (define-vop (data-vector-ref-with-offset/simple-array-double-float)
@@ -531,7 +593,7 @@
   (:results (value :scs (double-reg)))
   (:result-types double-float)
   (:generator 7
-   (inst movsd value (make-ea-for-float-ref object index offset 8
+   (inst movsd value (float-ref-ea object index offset 8
                                             :scale (ash 1 (- word-shift n-fixnum-tag-bits))))))
 
 (define-vop (data-vector-ref-c/simple-array-double-float)
@@ -546,7 +608,7 @@
   (:results (value :scs (double-reg)))
   (:result-types double-float)
   (:generator 6
-   (inst movsd value (make-ea-for-float-ref object index offset 8))))
+   (inst movsd value (float-ref-ea object index offset 8))))
 
 (define-vop (data-vector-set-with-offset/simple-array-double-float)
   (:note "inline array store")
@@ -563,7 +625,7 @@
   (:results (result :scs (double-reg)))
   (:result-types double-float)
   (:generator 20
-   (inst movsd (make-ea-for-float-ref object index offset 8
+   (inst movsd (float-ref-ea object index offset 8
                                       :scale (ash 1 (- word-shift n-fixnum-tag-bits)))
          value)
    (move result value)))
@@ -582,7 +644,7 @@
   (:results (result :scs (double-reg)))
   (:result-types double-float)
   (:generator 19
-   (inst movsd (make-ea-for-float-ref object index offset 8) value)
+   (inst movsd (float-ref-ea object index offset 8) value)
    (move result value)))
 
 
@@ -601,7 +663,7 @@
   (:results (value :scs (complex-single-reg)))
   (:result-types complex-single-float)
   (:generator 5
-    (inst movq value (make-ea-for-float-ref object index offset 8
+    (inst movq value (float-ref-ea object index offset 8
                                             :scale (ash 1 (- word-shift n-fixnum-tag-bits))))))
 
 (define-vop (data-vector-ref-with-offset/simple-array-complex-single-float-c)
@@ -616,7 +678,7 @@
   (:results (value :scs (complex-single-reg)))
   (:result-types complex-single-float)
   (:generator 4
-    (inst movq value (make-ea-for-float-ref object index offset 8))))
+    (inst movq value (float-ref-ea object index offset 8))))
 
 (define-vop (data-vector-set-with-offset/simple-array-complex-single-float)
   (:note "inline array store")
@@ -634,7 +696,7 @@
   (:result-types complex-single-float)
   (:generator 5
     (move result value)
-    (inst movq (make-ea-for-float-ref object index offset 8
+    (inst movq (float-ref-ea object index offset 8
                                       :scale (ash 1 (- word-shift n-fixnum-tag-bits)))
           value)))
 
@@ -653,7 +715,7 @@
   (:result-types complex-single-float)
   (:generator 4
     (move result value)
-    (inst movq (make-ea-for-float-ref object index offset 8) value)))
+    (inst movq (float-ref-ea object index offset 8) value)))
 
 (define-vop (data-vector-ref-with-offset/simple-array-complex-double-float)
   (:note "inline array access")
@@ -668,7 +730,7 @@
   (:results (value :scs (complex-double-reg)))
   (:result-types complex-double-float)
   (:generator 7
-    (inst movapd value (make-ea-for-float-ref object index offset 16
+    (inst movapd value (float-ref-ea object index offset 16
                                               :scale (ash 2 (- word-shift n-fixnum-tag-bits))))))
 
 (define-vop (data-vector-ref-with-offset/simple-array-complex-double-float-c)
@@ -683,7 +745,7 @@
   (:results (value :scs (complex-double-reg)))
   (:result-types complex-double-float)
   (:generator 6
-    (inst movapd value (make-ea-for-float-ref object index offset 16))))
+    (inst movapd value (float-ref-ea object index offset 16))))
 
 (define-vop (data-vector-set-with-offset/simple-array-complex-double-float)
   (:note "inline array store")
@@ -700,7 +762,7 @@
   (:results (result :scs (complex-double-reg)))
   (:result-types complex-double-float)
   (:generator 20
-    (inst movapd (make-ea-for-float-ref object index offset 16
+    (inst movapd (float-ref-ea object index offset 16
                                         :scale (ash 2 (- word-shift n-fixnum-tag-bits)))
           value)
     (move result value)))
@@ -719,7 +781,7 @@
   (:results (result :scs (complex-double-reg)))
   (:result-types complex-double-float)
   (:generator 19
-    (inst movapd (make-ea-for-float-ref object index offset 16) value)
+    (inst movapd (float-ref-ea object index offset 16) value)
     (move result value)))
 
 
@@ -842,7 +904,8 @@
   (:results (result :scs (unsigned-reg)))
   (:result-types unsigned-num)
   (:generator 4
-    (inst xadd (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)
-                   array index (ash 1 (- word-shift n-fixnum-tag-bits)))
-          diff :lock)
+    (inst xadd :lock
+          (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)
+              array index (ash 1 (- word-shift n-fixnum-tag-bits)))
+          diff)
     (move result diff)))

@@ -22,6 +22,7 @@
 #include "interrupt.h"
 #include "interr.h"
 #include "breakpoint.h"
+#include "getallocptr.h"
 
 os_vm_address_t
 arch_get_bad_addr(int signam, siginfo_t *siginfo, os_context_t *context)
@@ -59,7 +60,7 @@ boolean arch_pseudo_atomic_atomic(os_context_t *context)
      * to arch_pseudo_atomic_atomic, but this seems clearer.
      * --NS 2007-05-15 */
 #ifdef LISP_FEATURE_GENCGC
-    return SymbolValue(PSEUDO_ATOMIC_ATOMIC, 0) != NIL;
+    return get_pseudo_atomic_atomic(get_sb_vm_thread());
 #else
     return (!foreign_function_call_active)
         && (NIL != SymbolValue(PSEUDO_ATOMIC_ATOMIC,0));
@@ -68,12 +69,12 @@ boolean arch_pseudo_atomic_atomic(os_context_t *context)
 
 void arch_set_pseudo_atomic_interrupted(os_context_t *context)
 {
-    SetSymbolValue(PSEUDO_ATOMIC_INTERRUPTED, (lispobj)do_pending_interrupt, 0);
+    set_pseudo_atomic_interrupted(get_sb_vm_thread());
 }
 
 void arch_clear_pseudo_atomic_interrupted(os_context_t *context)
 {
-    SetSymbolValue(PSEUDO_ATOMIC_INTERRUPTED, 0, 0);
+    clear_pseudo_atomic_interrupted(get_sb_vm_thread());
 }
 
 unsigned int arch_install_breakpoint(void *pc)
@@ -101,7 +102,7 @@ arch_handle_breakpoint(os_context_t *context)
 void
 arch_handle_fun_end_breakpoint(os_context_t *context)
 {
-    *os_context_pc_addr(context) = (int) handle_fun_end_breakpoint(context);
+    *os_context_pc_addr(context) = (long) handle_fun_end_breakpoint(context);
 }
 
 void
@@ -120,14 +121,14 @@ arch_handle_single_step_trap(os_context_t *context, int trap)
 void
 sigtrap_handler(int signal, siginfo_t *info, os_context_t *context)
 {
-    u32 trap_instruction = *((u32 *)*os_context_pc_addr(context));
+    uint32_t trap_instruction = *((uint32_t *)*os_context_pc_addr(context));
 
     if (trap_instruction != 0x100073) {
-        lose("Unrecognized trap instruction %08lx in sigtrap_handler()",
+        lose("Unrecognized trap instruction %08x in sigtrap_handler()",
              trap_instruction);
     }
 
-    u32 code = *((u32 *)(4 + *os_context_pc_addr(context)));
+    uint32_t code = *((uint32_t *)(4 + *os_context_pc_addr(context)));
 
     if (code == trap_PendingInterrupt) {
       arch_skip_instruction(context);
@@ -139,63 +140,19 @@ sigtrap_handler(int signal, siginfo_t *info, os_context_t *context)
 void
 arch_install_interrupt_handlers(void)
 {
-    undoably_install_low_level_interrupt_handler(SIGTRAP, sigtrap_handler);
+    ll_install_handler(SIGTRAP, sigtrap_handler);
 }
 
-#ifdef LISP_FEATURE_LINKAGE_TABLE
-
-/* Linkage tables
- *
- * Linkage entry size is 8 or 20, because we need 2 instructions for the 32-bit case and we need 3 instructions and an 8 byte address in the 64-bit case.
- */
-
-#define LINKAGE_TEMP_REG reg_NL7
-
-void arch_write_linkage_table_entry(char *reloc_addr, void *target_addr, int datap)
+/* Linkage table */
+void arch_write_linkage_table_entry(int index, void *target_addr, int datap)
 {
-    if (datap) {
-      *(unsigned long *)reloc_addr = (unsigned long)target_addr;
-      return;
-    }
-    int* inst_ptr;
-    unsigned inst;
-
-    inst_ptr = (int*) reloc_addr;
-
-#ifndef LISP_FEATURE_64_BIT
-    /*
-      lui   reg, %hi(address)
-      jr    reg, %lo(address)
-    */
-    unsigned int addr = (unsigned int)target_addr;
-    unsigned int hi = ((addr + 0x800) >> 12);
-    int lo = addr - (hi << 12);
-
-    inst = 0x37 | LINKAGE_TEMP_REG << 7 | hi << 12;
-    *inst_ptr++ = inst;
-
-    inst = 0x67 | LINKAGE_TEMP_REG << 15 | lo << 20;
-    *inst_ptr++ = inst;
-#else
-    /*
-      auipc reg, 0
-      load reg, 12(reg)
-      jr  reg
-      address
-    */
-
-    inst = 0x17 | LINKAGE_TEMP_REG << 7;
-    *inst_ptr++ = inst;
-
-    inst = 0x3 | LINKAGE_TEMP_REG << 7 | WORD_SHIFT << 12 | LINKAGE_TEMP_REG << 15 | 12 << 20;
-    *inst_ptr++ = inst;
-
-    inst = 0x67 | LINKAGE_TEMP_REG << 15;
-    *inst_ptr++ = inst;
-
-    *(unsigned long *)inst_ptr++ = (unsigned long)target_addr;
-#endif
-
-    os_flush_icache((os_vm_address_t) reloc_addr, (char*) inst_ptr - reloc_addr);
+    // allocate successive entries downward
+    char *reloc_addr =
+        (char*)LINKAGE_TABLE_SPACE_END - (index + 1) * LINKAGE_TABLE_ENTRY_SIZE;
+    *(uword_t*)reloc_addr = (uword_t)target_addr;
 }
-#endif
+
+lispobj call_into_lisp(lispobj fun, lispobj *args, int nargs) {
+    return ((lispobj(*)(lispobj, lispobj *, int, struct thread*))SYMBOL(CALL_INTO_LISP)->value)
+      (fun, args, nargs, get_sb_vm_thread());
+}

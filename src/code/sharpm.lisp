@@ -157,8 +157,9 @@
         (simple-reader-error stream
                              "~S is not a defined structure type."
                              (car body)))
-      (let ((default-constructor (dd-default-constructor
-                                  (layout-info (classoid-layout classoid)))))
+      (let ((default-constructor
+             (dd-default-constructor
+              (sb-kernel::wrapper-%info (classoid-wrapper classoid)))))
         (unless default-constructor
           (simple-reader-error
            stream
@@ -236,6 +237,9 @@
          ;; though the docs say this is undefined behavior, so it's ok,
          ;; other than it being something we should complain about
          ;; for portability reasons.
+         ;; Some other things that shouldn't work:
+         ;; * (read-from-string "#x a") => 10
+         ;; * (read-from-string "#x #+foo a b") => 11
          (let ((res (let ((*read-base* radix))
                       (read stream t nil t))))
            (unless (typep res 'rational)
@@ -262,47 +266,54 @@
 (declaim (freeze-type sharp-equal-wrapper))
 
 ;; This function is kind of like NSUBLIS, but checks for circularities and
-;; substitutes in arrays and structures as well as lists. The first arg is an
-;; alist of the things to be replaced assoc'd with the things to replace them.
-(defun circle-subst (circle-table tree)
-  (cond ((and (sharp-equal-wrapper-p tree)
-              (not (eq (sharp-equal-wrapper-value tree) +sharp-equal-marker+)))
-         (sharp-equal-wrapper-value tree))
-        ((null (gethash tree circle-table))
-         (setf (gethash tree circle-table) t)
-         (cond ((consp tree)
-                (let ((a (circle-subst circle-table (car tree)))
-                      (d (circle-subst circle-table (cdr tree))))
-                  (unless (eq a (car tree))
-                    (rplaca tree a))
-                  (unless (eq d (cdr tree))
-                    (rplacd tree d))))
-               ((arrayp tree)
-                (with-array-data ((data tree) (start) (end))
-                  (declare (fixnum start end))
-                  (do ((i start (1+ i)))
-                      ((>= i end))
-                    (let* ((old (aref data i))
-                           (new (circle-subst circle-table old)))
-                      (unless (eq old new)
-                        (setf (aref data i) new))))))
-               ((typep tree 'instance)
-                ;; We don't grovel the layout.
-                (do-instance-tagged-slot (i tree)
-                  (let* ((old (%instance-ref tree i))
-                         (new (circle-subst circle-table old)))
-                    (unless (eq old new)
-                      (setf (%instance-ref tree i) new)))))
-               ((typep tree 'funcallable-instance)
-                (do ((i sb-vm:instance-data-start (1+ i))
-                     (end (- (1+ (get-closure-length tree)) sb-vm:funcallable-instance-info-offset)))
-                    ((= i end))
-                  (let* ((old (%funcallable-instance-info tree i))
-                         (new (circle-subst circle-table old)))
-                    (unless (eq old new)
-                      (setf (%funcallable-instance-info tree i) new))))))
-         tree)
-        (t tree)))
+;; substitutes in arrays and structures as well as lists.
+(defun circle-subst (tree)
+  (declare (inline alloc-xset))
+  (dx-let ((circle-table (alloc-xset)))
+    (named-let recurse ((tree tree))
+      (when (and (sharp-equal-wrapper-p tree)
+                 (neq (sharp-equal-wrapper-value tree) +sharp-equal-marker+))
+        (return-from recurse (sharp-equal-wrapper-value tree)))
+      ;; pick off types that never need to be sought in or added to the xset.
+      ;; (there are others, but these are common and quick to check)
+      (when (typep tree '(or number symbol))
+        (return-from recurse tree))
+      (unless (xset-member-p tree circle-table)
+        (add-to-xset tree circle-table)
+        (macrolet ((process (place)
+                     `(let* ((old ,place)
+                             (new (recurse old)))
+                        (unless (eq old new)
+                          (setf ,place new)))))
+          (typecase tree
+            (cons
+             (process (car tree))
+             (process (cdr tree)))
+            ((array t)
+             (with-array-data ((data tree) (start) (end))
+               (declare (fixnum start end))
+               (do ((i start (1+ i)))
+                   ((>= i end))
+                 (process (aref data i)))))
+            (instance
+             ;; Don't refer to the DD-SLOTS unless there is reason to,
+             ;; that is, unless some slot might be raw.
+             (if (/= +layout-all-tagged+ (layout-bitmap (%instance-layout tree)))
+                 (let ((dd (layout-dd (%instance-layout tree))))
+                   (dolist (dsd (dd-slots dd))
+                     (when (eq (dsd-raw-type dsd) t)
+                       (process (%instance-ref tree (dsd-index dsd))))))
+                 (do ((len (%instance-length tree))
+                      (i sb-vm:instance-data-start (1+ i)))
+                     ((>= i len))
+                   (process (%instance-ref tree i)))))
+            ;; ASSUMPTION: all funcallable instances have at least 1 slot
+            ;; accessible via FUNCALLABLE-INSTANCE-INFO.
+            ;; The only such objects with reader syntax are CLOS objects,
+            ;; and those have exactly 1 slot in the primitive object.
+            (funcallable-instance
+             (process (%funcallable-instance-info tree 0))))))
+      tree)))
 
 ;;; Sharp-equal works as follows.
 ;;; When creating a new label a SHARP-EQUAL-WRAPPER is pushed onto
@@ -329,7 +340,7 @@
                            "Must label something more than just #~D#"
                            label))
     (setf (sharp-equal-wrapper-value wrapper) obj)
-    (circle-subst (make-hash-table :test 'eq) obj)))
+    (circle-subst obj)))
 
 (defun sharp-sharp (stream ignore label)
   (declare (ignore ignore))
@@ -370,9 +381,15 @@
        ((:or or) (some #'featurep (cdr x)))
        (t
         (error "unknown operator in feature expression: ~S." x))))
-    (symbol (not (null (memq x *features*))))
+    (symbol
+     (let ((present (memq x *features*)))
+       (cond (present
+              t)
+             ((and (boundp '+internal-features+)
+                   (memq x (symbol-value '+internal-features+)))
+              (warn "~s is no longer present in ~s" x '*features*)))))
     (t
-      (error "invalid feature expression: ~S" x))))
+     (error "invalid feature expression: ~S" x))))
 
 (defun sharp-plus-minus (stream sub-char numarg)
     (ignore-numarg sub-char numarg)
@@ -417,7 +434,6 @@
              'sb-kernel::character-decoding-error-in-dispatch-macro-char-comment
              :sub-char sub-char :position (file-position stream) :stream stream)
             (invoke-restart 'attempt-resync))))
-    (let ((stream (in-stream-from-designator stream)))
       (macrolet ((munch (get-char &optional finish)
                    `(do ((level 1)
                          (prev ,get-char char)
@@ -436,7 +452,7 @@
             (prepare-for-fast-read-char stream
               (munch (fast-read-char) (done-with-fast-read-char)))
             ;; fundamental-stream
-            (munch (read-char stream t)))))))
+            (munch (read-char stream t))))))
 
 ;;;; a grab bag of other sharp readmacros: #', #:, and #.
 

@@ -40,7 +40,7 @@
 #include "validate.h"
 #include "gc-internal.h"
 #include "gc-private.h"
-#include "pseudo-atomic.h"
+#include "getallocptr.h"
 #include "code.h"
 
 #include <errno.h>
@@ -83,7 +83,7 @@ open_binary(char *filename, int mode)
     return open(filename, mode);
 }
 
-#if defined(LISP_FEATURE_LINUX) && defined(LISP_FEATURE_IMMOBILE_CODE)
+#if defined(LISP_FEATURE_ELF) && defined(LISP_FEATURE_IMMOBILE_CODE)
 #define ELFCORE 1
 #elif !defined(ELFCORE)
 #define ELFCORE 0
@@ -168,46 +168,9 @@ lose:
     return core_start;
 }
 
-#ifndef LISP_FEATURE_HPUX
-#define load_core_bytes(fd, where, addr, len) os_map(fd, where, addr, len)
-#else
-#define load_core_bytes(fd, where, addr, len) copy_core_bytes(fd, where, addr, len)
-/* If more platforms don't support overlapping mmap rename this
- * def to something like ifdef nommapoverlap */
-/* currently hpux only */
-static void copy_core_bytes(int fd, os_vm_offset_t offset,
-                            os_vm_address_t addr, int len)
-{
-  unsigned char buf[4096];
-  int c,x;
-  int old_fd = lseek(fd, 0, SEEK_CUR);
-
-  if(len & (4096-1)){
-    fprintf(stderr, "cant copy a slice of core because slice-length is not of page size(4096)\n");
-    exit(-1);
-  }
-  if(old_fd < 0){
-    fprintf(stderr, "cant perform lseek() on corefile\n");
-  }
-  lseek(fd, offset, SEEK_SET);
-  if(fd < 0){
-    fprintf(stderr, "cant perform lseek(%u,%lu,SEEK_SET) on corefile\n", fd, offset);
-  }
-  for(x = 0; x < len; x += 4096){
-    c = read(fd, buf, 4096);
-    if(c != 4096){
-      fprintf(stderr, "cant read memory area from corefile at position %lu, got %d\n", offset + x, c);
-      exit(-1);
-    }
-    memcpy(addr+x, buf, 4096);
-  }
-  os_flush_icache(addr, len);
-}
-#endif
-
 #ifndef LISP_FEATURE_SB_CORE_COMPRESSION
 # define inflate_core_bytes(fd,offset,addr,len) \
-    lose("This runtime was not built with zlib-compressed core support... aborting\n")
+    lose("This runtime was not built with zlib-compressed core support... aborting")
 #else
 # define ZLIB_BUFFER_SIZE (1u<<16)
 static void inflate_core_bytes(int fd, os_vm_offset_t offset,
@@ -220,11 +183,11 @@ static void inflate_core_bytes(int fd, os_vm_offset_t offset,
 # ifdef LISP_FEATURE_WIN32
     /* Ensure the memory is committed so zlib doesn't segfault trying to
        inflate. */
-    os_validate_recommit(addr, len);
+    os_commit_memory(addr, len);
 # endif
 
     if (-1 == lseek(fd, offset, SEEK_SET)) {
-        lose("Unable to lseek() on corefile\n");
+        lose("Unable to lseek() on corefile");
     }
 
     stream.zalloc = NULL;
@@ -235,14 +198,14 @@ static void inflate_core_bytes(int fd, os_vm_offset_t offset,
 
     ret = inflateInit(&stream);
     if (ret != Z_OK)
-        lose("zlib error %i\n", ret);
+        lose("zlib error %i", ret);
 
     stream.next_out  = (void*)addr;
     stream.avail_out = len;
     do {
         ssize_t count = read(fd, buf, ZLIB_BUFFER_SIZE);
         if (count < 0)
-            lose("unable to read core file (errno = %i)\n", errno);
+            lose("unable to read core file (errno = %i)", errno);
         stream.next_in = buf;
         stream.avail_in = count;
         if (count == 0) break;
@@ -252,13 +215,13 @@ static void inflate_core_bytes(int fd, os_vm_offset_t offset,
             break;
         case Z_OK:
             if (stream.avail_out == 0)
-                lose("Runaway gzipped core directory... aborting\n");
+                lose("Runaway gzipped core directory... aborting");
             if (stream.avail_in > 0)
                 lose("zlib inflate returned without fully"
-                     "using up input buffer... aborting\n");
+                     "using up input buffer... aborting");
             break;
         default:
-            lose("zlib inflate error: %i\n", ret);
+            lose("zlib inflate error: %i", ret);
             break;
         }
     } while (ret != Z_STREAM_END);
@@ -289,18 +252,6 @@ struct heap_adjust {
     int n_relocs_rel; // relative
 };
 
-static inline struct code* get_asm_routine_code_component() {
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
-    return (struct code*)VARYOBJ_SPACE_START;
-#else
-    return (struct code*)READ_ONLY_SPACE_START;
-#endif
-}
-
-#ifndef LISP_FEATURE_RELOCATABLE_HEAP
-#define adjust_word(ignore,thing) thing
-#define relocate_heap(ignore)
-#else
 #include "genesis/gc-tables.h"
 #include "genesis/cons.h"
 #include "genesis/hash-table.h"
@@ -410,18 +361,20 @@ adjust_code_refs(struct heap_adjust __attribute__((unused)) *adj,
             FIXUP32(UNALIGNED_STORE32(fixup_where, adjusted), fixup_where);
     }
     sword_t displacement = (lispobj)code - original_vaddr;
-    if (!displacement) // if this code didn't move, do nothing
-        return;
     prev_loc = 0;
     while (varint_unpack(&unpacker, &loc) && loc != 0) {
         loc += prev_loc;
         prev_loc = loc;
         void* fixup_where = instructions + loc;
         int32_t rel32operand = UNALIGNED_LOAD32(fixup_where);
-        sword_t adjusted = (sword_t)rel32operand - displacement;
-        if (!(adjusted >= INT32_MIN && adjusted <= INT32_MAX))
+        int32_t abs_operand = (sword_t)fixup_where + 4 + rel32operand - displacement;
+        int32_t new_abs_operand = abs_operand + calc_adjustment(adj, abs_operand);
+        sword_t new_rel32operand = new_abs_operand - ((sword_t)fixup_where + 4);
+        // check for overflow before checking whether to write the new value
+        if (!(new_rel32operand >= INT32_MIN && new_rel32operand <= INT32_MAX))
             lose("Relative fixup @ %p exceeds 32 bits", fixup_where);
-        FIXUP_rel(UNALIGNED_STORE32(fixup_where, adjusted), fixup_where);
+        if (new_rel32operand != rel32operand)
+            FIXUP_rel(UNALIGNED_STORE32(fixup_where, new_rel32operand), fixup_where);
     }
 #endif
 }
@@ -430,63 +383,31 @@ static inline void fix_fun_header_layout(lispobj __attribute__((unused)) *fun,
                                          struct heap_adjust __attribute__((unused)) *adj)
 {
 #if defined(LISP_FEATURE_COMPACT_INSTANCE_HEADER) && defined(LISP_FEATURE_64_BIT)
-    lispobj ptr = function_layout(fun);
+    lispobj ptr = funinstance_layout(fun);
     lispobj adjusted = adjust_word(adj, ptr);
-    if (adjusted != ptr)
-        FIXUP(set_function_layout(fun, adjusted), fun);
+    if (adjusted != ptr) FIXUP(funinstance_layout(fun)=adjusted, fun);
 #endif
 }
 
-/* About relocation of fdefns - suppose we had originally intended to load:
- *   [ range of adjustable addresses  ]
- *   | fixedobj space | varyobj space |
- *          fdefn --------> callee
- *   0x1000000        0x2000000
- * and the subspaces were actually placed at much higher addresses
- * that do not overlap at all with the intended addresses:
- *                                       | fixedoboj space | varyobj space |
- *                                       0x8000000 ...
- * Then given an fdefn, its callee as computed from the new address appears
- * such there would be no relocation adjustment for the addressed object.
- * We correctly do not adjust the fdefn's callee displacement.
- * But suppose the moved spaces overlap the expected load addresses:
- *        [ range of adjustable addresses  ]
- *        | fixedobj space | varyobj space |
- *               fdefn --------> callee
- *   0x1000000 = desired
- *        0x1008000 = actual
- * In that case there can be an fdefn whose callee appears to be in the
- * adjustment range, and we'd compute an (incorrect) adjustment. In reality,
- * both the fdefn and its intended target moved by the same amount,
- * so the net change to the fdefn JMP instruction displacement ought to be zero.
- * To deal with this, we have to compute the fdefn callee as if the fdefn were
- * at its intended load address, then check whether that callee needs adjustment,
- * and compute a net adjustment by incorporating the amount by which the fdefn
- * itself moved.  Since both spaces move together for now, these two deltas
- * cancel out, and the net adjustment becomes zero. The full complexity is
- * required to handle the situation where only one of the immobile subspaces
- * moved, which we can't actually handle yet at all.
- * But already there was a bug when they move together by a small amount.
- */
 static void relocate_space(uword_t start, lispobj* end, struct heap_adjust* adj)
 {
     lispobj *where = (lispobj*)start;
-    lispobj header_word;
     int widetag;
     long nwords;
-    lispobj layout, adjusted_layout, bitmap;
+    lispobj layout, adjusted_layout;
     struct code* code;
     sword_t delta;
+    int i;
 
     adj->n_relocs_abs = adj->n_relocs_rel = 0;
     for ( ; where < end ; where += nwords ) {
-        header_word = *where;
-        if (is_cons_half(header_word)) {
+        lispobj word = *where;
+        if (!is_header(word)) {
             adjust_pointers(where, 2, adj);
             nwords = 2;
             continue;
         }
-        widetag = header_widetag(header_word);
+        widetag = header_widetag(word);
         nwords = sizetab[widetag](where);
         switch (widetag) {
         case FUNCALLABLE_INSTANCE_WIDETAG:
@@ -496,57 +417,24 @@ static void relocate_space(uword_t start, lispobj* end, struct heap_adjust* adj)
             // - Otherwise, the word might point to a relocated range,
             //   either the instance itself, or a trampoline in immobile space.
             adjust_word_at(where+1, adj);
+            /* FALLTHROUGH */
         case INSTANCE_WIDETAG:
-            layout = (widetag == FUNCALLABLE_INSTANCE_WIDETAG) ?
-                funinstance_layout(where) : instance_layout(where);
+            layout = layout_of(where);
             adjusted_layout = adjust_word(adj, layout);
-            // Do not alter the layout as stored in the instance if non-compact
-            // header. instance_scan() will do it if necessary.
-#ifdef LISP_FEATURE_COMPACT_INSTANCE_HEADER
-            if (adjusted_layout != layout)
-                instance_layout(where) = adjusted_layout;
-#endif
-            bitmap = LAYOUT(adjusted_layout)->bitmap;
-            gc_assert(fixnump(bitmap)
-                      || widetag_of(native_pointer(bitmap))==BIGNUM_WIDETAG);
-            // If the post-adjustment address of 'layout' is higher than 'where',
-            // then the layout's pointer slots need adjusting.
-            // This is true regardless of whether the core was mapped at a higher
-            // or lower address than desired.
-            if (is_lisp_pointer(bitmap) && adjusted_layout > (lispobj)where) {
-                // Do not write back the adjusted bitmap pointer. Each heap word
-                // must be touched at most once. When the layout itself gets scanned,
-                // the bitmap slot will be rewritten if needed.
-                bitmap = adjust_word(adj, bitmap);
-            }
-
-            instance_scan((void(*)(lispobj*,sword_t,uword_t))adjust_pointers,
-                          where+1, nwords-1, bitmap, (uintptr_t)adj);
+            // writeback the layout if it changed. The layout is not a tagged slot
+            // so it would not be fixed up otherwise.
+            if (adjusted_layout != layout) layout_of(where) = adjusted_layout;
+            struct bitmap bitmap = get_layout_bitmap(LAYOUT(adjusted_layout));
+            lispobj* slots = where+1;
+            for (i=0; i<(nwords-1); ++i)
+                if (bitmap_logbitp(i, bitmap)) adjust_pointers(slots+i, 1, adj);
             continue;
         case FDEFN_WIDETAG:
             adjust_pointers(where+1, 2, adj);
-            // 'raw_addr' doesn't satisfy is_lisp_pointer() for x86,
+            // For most architectures, 'raw_addr' doesn't satisfy is_lisp_pointer()
             // so adjust_pointers() would ignore it. Therefore we need to
-            // forcibly adjust it.
-#ifndef LISP_FEATURE_IMMOBILE_CODE
+            // forcibly adjust it. This is correct whether or not there are tag bits.
             adjust_word_at(where+3, adj);
-#elif defined(LISP_FEATURE_X86_64)
-            // the offset from fdefns to code can change if:
-            // - static space fdefn -> immobile space code and immobile space moved
-            // - immobile spaces changed relative position
-            {
-                // See comment above this function concerning fdefn adjustment.
-                lispobj orig = inverse_adjust(adj, (lispobj)where);
-                lispobj callee = virtual_fdefn_callee_lispobj((struct fdefn*)where, orig);
-                sword_t callee_delta = calc_adjustment(adj, callee);
-                delta = callee_delta - ((lispobj)where - orig);
-                if (delta != 0) {
-                    void* prel32 = 1 + (char*)(where+3);
-                    FIXUP_rel(UNALIGNED_STORE32(prel32, UNALIGNED_LOAD32(prel32) + delta),
-                              prel32);
-                }
-            }
-#endif
             continue;
         case CODE_HEADER_WIDETAG:
             if (filler_obj_p(where)) {
@@ -556,6 +444,13 @@ static void relocate_space(uword_t start, lispobj* end, struct heap_adjust* adj)
             // Fixup the constant pool. The word at where+1 is a fixnum.
             code = (struct code*)where;
             adjust_pointers(where+2, code_header_words(code)-2, adj);
+#if defined LISP_FEATURE_X86 || defined LISP_FEATURE_X86_64 || \
+    defined LISP_FEATURE_PPC || defined LISP_FEATURE_PPC64
+            // Fixup absolute jump table
+            lispobj* jump_table = code_jumptable_start(code);
+            int count = jumptable_count(jump_table);
+            for (i = 1; i < count; ++i) adjust_word_at(jump_table+i, adj);
+#endif
             // Fixup all embedded simple-funs
             for_each_simple_fun(i, f, code, 1, {
                 fix_fun_header_layout((lispobj*)f, adj);
@@ -588,7 +483,7 @@ static void relocate_space(uword_t start, lispobj* end, struct heap_adjust* adj)
             break;
         // Vectors require extra care because of address-based hashing.
         case SIMPLE_VECTOR_WIDETAG:
-          if (is_vector_subtype(*where, VectorAddrHashing)) {
+          if (vector_flagp(*where, VectorAddrHashing)) {
               struct vector* v = (struct vector*)where;
               // If you could make a hash-table vector with space for exactly 1 k/v pair,
               // it would have length 5.
@@ -623,7 +518,6 @@ static void relocate_space(uword_t start, lispobj* end, struct heap_adjust* adj)
         case COMPLEX_CHARACTER_STRING_WIDETAG:
 #endif
         case COMPLEX_BASE_STRING_WIDETAG:
-        case COMPLEX_VECTOR_NIL_WIDETAG:
         case COMPLEX_BIT_VECTOR_WIDETAG:
         case COMPLEX_VECTOR_WIDETAG:
         case COMPLEX_ARRAY_WIDETAG:
@@ -663,7 +557,7 @@ static void relocate_space(uword_t start, lispobj* end, struct heap_adjust* adj)
               && specialized_vector_widetag_p(widetag))
               continue;
           else
-              lose("Unrecognized heap object: @%p: %"OBJ_FMTX, where, header_word);
+              lose("Unrecognized heap object: @%p: %"OBJ_FMTX, where, *where);
         }
         adjust_pointers(where+1, nwords-1, adj);
     }
@@ -685,7 +579,7 @@ static void relocate_heap(struct heap_adjust* adj)
                         (char*)adj->range[i].start + adj->range[i].delta,
                         (char*)adj->range[i].end + adj->range[i].delta);
     }
-    relocate_space(STATIC_SPACE_START, static_space_free_pointer, adj);
+    relocate_space(STATIC_SPACE_OBJECTS_START, static_space_free_pointer, adj);
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
     relocate_space(FIXEDOBJ_SPACE_START, fixedobj_free_pointer, adj);
 #endif
@@ -694,18 +588,14 @@ static void relocate_heap(struct heap_adjust* adj)
 #else
     relocate_space(DYNAMIC_SPACE_START, (lispobj*)get_alloc_pointer(), adj);
 #endif
-
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
-    // Assembler routines move with varyobj space.
-    // (They're in readonly space if no immobile space)
-    struct code* code = get_asm_routine_code_component();
-    lispobj* jump_table = (lispobj*)code_text_start(code);
-    for ( ; *jump_table ; ++jump_table )
-        adjust_word_at(jump_table, adj);
     // Pointers within varyobj space to varyobj space do not need adjustment
     // so remove any delta before performing the relocation pass on this space.
-    if (lisp_code_in_elf())
+    // FIXME: this was probably for PIE mode, which doesn't work.
+    if (lisp_code_in_elf() && adj->range[2].delta != 0) {
+        lose("code-in-elf + PIE not supported yet\n");
         adj->range[2].delta = 0; // FIXME: isn't this this already the case?
+    }
     relocate_space(VARYOBJ_SPACE_START, varyobj_free_pointer, adj);
 #endif
 }
@@ -723,13 +613,70 @@ set_adjustment(struct heap_adjust* adj,
     adj->range[j].delta = actual_addr - desired_addr;
     adj->n_ranges = j+1;
 }
-#endif
 
 #if defined(LISP_FEATURE_ELF) && defined(LISP_FEATURE_IMMOBILE_SPACE)
     extern int apply_pie_relocs(long,long,int);
 #else
 #   define apply_pie_relocs(dummy1,dummy2,dummy3) (0)
 #endif
+
+/// Compute the bounds of the lisp assembly routine code object
+void calc_asm_routine_bounds()
+{
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+    asm_routines_start = VARYOBJ_SPACE_START;
+#else
+    if (widetag_of((lispobj*)READ_ONLY_SPACE_START) == CODE_HEADER_WIDETAG) {
+        asm_routines_start = READ_ONLY_SPACE_START;
+    } else {
+        lispobj *where = (lispobj*)STATIC_SPACE_OBJECTS_START;
+        for (; where < static_space_free_pointer; where += OBJECT_SIZE(*where, where))
+            if (widetag_of((lispobj*)where) == CODE_HEADER_WIDETAG) {
+                asm_routines_start = (uword_t)where;
+                break;
+            }
+        if (!asm_routines_start) lose("Can't find asm routines");
+    }
+#endif
+    asm_routines_end = asm_routines_start +
+      N_WORD_BYTES * sizetab[CODE_HEADER_WIDETAG]((lispobj*)asm_routines_start);
+}
+
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+void calc_immobile_space_bounds()
+{
+    /* Suppose we have:
+     *   A               B                             C                D
+     *   | varyobj space | .... other random stuff ... | fixedobj space | ...
+     * then the lower bound is A, the upper bound is D,
+     * the max_offset is the distance from A to D,
+     * and the excluded middle is the range spanned by B to C.
+     */
+    struct range {
+        uword_t start, end;
+    };
+    struct range range1 =
+        {FIXEDOBJ_SPACE_START, FIXEDOBJ_SPACE_START + FIXEDOBJ_SPACE_SIZE};
+    struct range range2 =
+        {VARYOBJ_SPACE_START, VARYOBJ_SPACE_START + varyobj_space_size};
+    if (range2.start < range1.start) { // swap
+        struct range temp = range1;
+        range1 = range2;
+        range2 = temp;
+    }
+    immobile_space_lower_bound  = range1.start;
+    immobile_space_max_offset   = range2.end - range1.start;
+    immobile_range_1_max_offset = range1.end - range1.start;
+    immobile_range_2_min_offset = range2.start - range1.start;
+}
+#endif
+
+/* TODO: If static + readonly were mapped as desired without disabling ASLR
+ * but one of the large spaces couldn't be mapped as desired, start over from
+ * the top, disabling ASLR. This should help to avoid relocating the heap
+ * if at all possible. It might make sense to parse the core header sooner in
+ * startup to avoid wasting time on all actions performed prior to re-exec.
+ */
 
 static void
 process_directory(int count, struct ndir_entry *entry,
@@ -757,13 +704,23 @@ process_directory(int count, struct ndir_entry *entry,
 #endif
         // This order is determined by constants in compiler/generic/genesis
         {0, 0, STATIC_SPACE_START, &static_space_free_pointer},
+
         {0, 0, READ_ONLY_SPACE_START, &read_only_space_free_pointer},
+
+#ifdef LISP_FEATURE_DARWIN_JIT
+        {0, 0, STATIC_CODE_SPACE_START, &static_code_space_free_pointer},
+#endif
+
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
         {FIXEDOBJ_SPACE_SIZE | 1, 0,
             FIXEDOBJ_SPACE_START, &fixedobj_free_pointer},
         {1, 0, VARYOBJ_SPACE_START, &varyobj_free_pointer}
 #endif
     };
+
+#ifdef LISP_FEATURE_DARWIN_JIT
+    static_code_space_free_pointer = (lispobj *)STATIC_CODE_SPACE_START;
+#endif
 
 #if ELFCORE
     if (&lisp_code_start) {
@@ -792,15 +749,15 @@ process_directory(int count, struct ndir_entry *entry,
         // (Rarely would a jmp indirection be used; maybe for newly compiled code?)
         lispobj* ptr = &lisp_linkage_values;
         gc_assert(ptr);
-        char *link_target = (char*)(intptr_t)LINKAGE_TABLE_SPACE_START;
+        int entry_index = 0;
         int count;
         extern int lisp_linkage_table_n_prelinked;
         count = lisp_linkage_table_n_prelinked = *ptr++;
-        for ( ; count-- ; link_target += LINKAGE_TABLE_ENTRY_SIZE ) {
+        for ( ; count-- ; entry_index++ ) {
             boolean datap = *ptr == (lispobj)-1; // -1 can't be a function address
             if (datap)
                 ++ptr;
-            arch_write_linkage_table_entry(link_target, (void*)*ptr++, datap);
+            arch_write_linkage_table_entry(entry_index, (void*)*ptr++, datap);
         }
 
         // unprotect the pages
@@ -824,11 +781,9 @@ process_directory(int count, struct ndir_entry *entry,
         int compressed = id & DEFLATED_CORE_SPACE_ID_FLAG;
         id -= compressed;
         if (id < 1 || id > MAX_CORE_SPACE_ID)
-            lose("unknown space ID %ld addr %p\n", id, (void*)addr);
+            lose("unknown space ID %ld addr %p", id, (void*)addr);
 
-#ifndef LISP_FEATURE_RELOCATABLE_HEAP
-        int enforce_address = 1;
-#elif defined(LISP_FEATURE_IMMOBILE_SPACE)
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
         // Enforce address of readonly, static, immobile varyobj
         int enforce_address = id != DYNAMIC_CORE_SPACE_ID
           && id != IMMOBILE_FIXEDOBJ_CORE_SPACE_ID
@@ -855,14 +810,12 @@ process_directory(int count, struct ndir_entry *entry,
         spaces[id].base = addr;
         uword_t len = os_vm_page_size * entry->page_count;
         if (id == DYNAMIC_CORE_SPACE_ID && len > dynamic_space_size) {
-            lose("dynamic space too small for core: %luKiB required, %luKiB available.\n",
+            lose("dynamic space too small for core: %luKiB required, %luKiB available.",
                  (unsigned long)len >> 10,
                  (unsigned long)dynamic_space_size >> 10);
         }
         if (len != 0) {
             spaces[id].len = len;
-            uword_t __attribute__((unused)) aligned_start;
-#ifdef LISP_FEATURE_RELOCATABLE_HEAP
             // Try to map at address requested by the core file.
             size_t request = spaces[id].desired_size;
             int sub_2gb_flag = (request & 1);
@@ -875,8 +828,19 @@ process_directory(int count, struct ndir_entry *entry,
             else
 #endif
             if (request) {
-                addr = (uword_t)os_validate(sub_2gb_flag ? MOVABLE_LOW : MOVABLE,
-                                            (os_vm_address_t)addr, request);
+#ifdef LISP_FEATURE_WIN32
+                if (id == DYNAMIC_CORE_SPACE_ID) {
+                    addr = (uword_t)os_validate_nocommit(sub_2gb_flag ? MOVABLE_LOW : MOVABLE,
+                                                         (os_vm_address_t)addr, request);
+                }
+                else
+#endif
+                {
+                    addr = (uword_t)os_validate(sub_2gb_flag ? MOVABLE_LOW : MOVABLE,
+                                                (os_vm_address_t)addr, request,
+                                                id == READ_ONLY_CORE_SPACE_ID,
+                                                id == DYNAMIC_CORE_SPACE_ID);
+                }
                 if (!addr) {
                     lose("Can't allocate %#"OBJ_FMTX" bytes for space %ld",
                          (lispobj)request, id);
@@ -896,43 +860,59 @@ process_directory(int count, struct ndir_entry *entry,
 #endif
             case DYNAMIC_CORE_SPACE_ID:
 #ifdef LISP_FEATURE_CHENEYGC
-                aligned_start = ALIGN_UP(addr, BACKEND_PAGE_BYTES);
-                /* Misalignment can happen only if page size exceeds OS page.
-                 * Drop one page to avoid overrunning the allocated space */
-                if (aligned_start > addr) // not page-aligned
-                    dynamic_space_size -= BACKEND_PAGE_BYTES;
-                DYNAMIC_0_SPACE_START = addr = aligned_start;
-                current_dynamic_space = (lispobj*)addr;
-                { // Request that much again now
-#ifdef LISP_FEATURE_ALPHA /* meaning: is this a 32-on-64 SBCL implementation */
-                  uword_t addr1 = (uword_t)os_validate(MOVABLE_LOW, 0, request);
-                  extern os_set_cheneygc_spaces(uword_t,uword_t);
-                  os_set_cheneygc_spaces(addr, addr1);
-#else
+                {
+                  uword_t semispace_0_start = ALIGN_UP(addr, BACKEND_PAGE_BYTES);
+                  uword_t semispace_0_end = ALIGN_DOWN(addr + request, BACKEND_PAGE_BYTES);
+                  // assign to 'addr' too, because that's where we load the core file
+                  DYNAMIC_0_SPACE_START = addr = semispace_0_start;
+                  current_dynamic_space = (lispobj*)addr;
+                  // Request that much again now
                   uword_t addr1 = (uword_t)os_allocate(request);
-#endif
-                  aligned_start = ALIGN_UP(addr1, BACKEND_PAGE_BYTES);
-                  if (aligned_start > addr) // same test again
-                      dynamic_space_size -= BACKEND_PAGE_BYTES;
-                  DYNAMIC_1_SPACE_START = aligned_start;
+                  uword_t semispace_1_start = ALIGN_UP(addr1, BACKEND_PAGE_BYTES);
+                  uword_t semispace_1_end = ALIGN_DOWN(addr1 + request, BACKEND_PAGE_BYTES);
+
+                  DYNAMIC_1_SPACE_START = semispace_1_start;
+                  uword_t semispace_0_size = semispace_0_end - semispace_0_start;
+                  uword_t semispace_1_size = semispace_1_end - semispace_1_start;
+                  dynamic_space_size =
+                      semispace_0_size < semispace_1_size ? semispace_0_size : semispace_1_size;
                 }
-#else
-                aligned_start = ALIGN_UP(addr, GENCGC_CARD_BYTES);
+#else /* gencgc */
+                {
+                uword_t aligned_start = ALIGN_UP(addr, GENCGC_CARD_BYTES);
                 /* Misalignment can happen only if card size exceeds OS page.
                  * Drop one card to avoid overrunning the allocated space */
                 if (aligned_start > addr) // not card-aligned
                     dynamic_space_size -= GENCGC_CARD_BYTES;
                 DYNAMIC_SPACE_START = addr = aligned_start;
+                }
 #endif
                 break;
             }
-#endif /* LISP_FEATURE_RELOCATABLE_HEAP */
 
             sword_t offset = os_vm_page_size * (1 + entry->data_page);
-            if (compressed)
+            if (compressed) {
+#ifdef LISP_FEATURE_DARWIN_JIT
+                if (id == READ_ONLY_CORE_SPACE_ID)
+                    os_protect((os_vm_address_t)addr, len, OS_VM_PROT_WRITE);
+#endif
                 inflate_core_bytes(fd, offset + file_offset, (os_vm_address_t)addr, len);
+
+#ifdef LISP_FEATURE_DARWIN_JIT
+                if (id == READ_ONLY_CORE_SPACE_ID)
+                    os_protect((os_vm_address_t)addr, len, OS_VM_PROT_READ | OS_VM_PROT_EXECUTE);
+#endif
+
+            }
             else
-                load_core_bytes(fd, offset + file_offset, (os_vm_address_t)addr, len);
+#ifdef LISP_FEATURE_DARWIN_JIT
+            if (id == DYNAMIC_CORE_SPACE_ID || id == STATIC_CODE_CORE_SPACE_ID) {
+                load_core_bytes_jit(fd, offset + file_offset, (os_vm_address_t)addr, len);
+            } else
+#endif
+              {
+                load_core_bytes(fd, offset + file_offset, (os_vm_address_t)addr, len, id == READ_ONLY_CORE_SPACE_ID);
+            }
         }
 
 #ifdef MADV_MERGEABLE
@@ -963,7 +943,7 @@ process_directory(int count, struct ndir_entry *entry,
         }
     }
 
-#ifdef LISP_FEATURE_RELOCATABLE_HEAP
+    calc_asm_routine_bounds();
 #  ifdef LISP_FEATURE_GENCGC
     set_adjustment(adj, DYNAMIC_SPACE_START, // actual
                    spaces[DYNAMIC_CORE_SPACE_ID].base, // expected
@@ -986,12 +966,8 @@ process_directory(int count, struct ndir_entry *entry,
                    spaces[DYNAMIC_CORE_SPACE_ID].len);
 #  endif // LISP_FEATURE_GENCGC
     if (adj->range[0].delta | adj->range[1].delta | adj->range[2].delta) {
-        if (adj->range[1].delta && lisp_code_in_elf())
-            lose("Relocation of fixedobj space not supported with ELF core.\n\
-Please report this as a bug");
         relocate_heap(adj);
     }
-#endif
 
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
     /* Now determine page characteristics (such as object spacing)
@@ -1000,29 +976,7 @@ Please report this as a bug");
      * on what it's address should be, not what it was in the file */
     immobile_space_coreparse(spaces[IMMOBILE_FIXEDOBJ_CORE_SPACE_ID].len,
                              spaces[IMMOBILE_VARYOBJ_CORE_SPACE_ID].len);
-    /* Suppose we have:
-     *   A               B                             C                D
-     *   | varyobj space | .... other random stuff ... | fixedobj space | ...
-     * then the lower bound is A, the upper bound is D,
-     * the max_offset is the distance from A to D,
-     * and the excluded middle is the range spanned by B to C.
-     */
-    struct range {
-        uword_t start, end;
-    };
-    struct range range1 =
-        {FIXEDOBJ_SPACE_START, FIXEDOBJ_SPACE_START + FIXEDOBJ_SPACE_SIZE};
-    struct range range2 =
-        {VARYOBJ_SPACE_START, VARYOBJ_SPACE_START + varyobj_space_size};
-    if (range2.start < range1.start) { // swap
-        struct range temp = range1;
-        range1 = range2;
-        range2 = temp;
-    }
-    immobile_space_lower_bound  = range1.start;
-    immobile_space_max_offset   = range2.end - range1.start;
-    immobile_range_1_max_offset = range1.end - range1.start;
-    immobile_range_2_min_offset = range2.start - range1.start;
+    calc_immobile_space_bounds();
 #endif
 #ifdef LISP_FEATURE_X86_64
     tune_asm_routines_for_microarch(); // before WPing immobile space
@@ -1031,7 +985,7 @@ Please report this as a bug");
 
 #ifdef LISP_FEATURE_GENCGC
 extern void gc_load_corefile_ptes(core_entry_elt_t, core_entry_elt_t,
-                                  off_t offset, int fd);
+                                  os_vm_offset_t offset, int fd);
 #else
 #define gc_load_corefile_ptes(dummy1,dummy2,dummy3,dummy4)
 #endif
@@ -1067,7 +1021,7 @@ load_core_file(char *file, os_vm_offset_t file_offset, int merge_core_pages)
 
     count = read(fd, header, os_vm_page_size);
     if (count < (ssize_t) os_vm_page_size) {
-        lose("premature end of core file\n");
+        lose("premature end of core file");
     }
 
     ptr = header;
@@ -1111,6 +1065,14 @@ load_core_file(char *file, os_vm_offset_t file_offset, int merge_core_pages)
                 // fprintf(stderr, "NOTE: TLS size increased to %x\n", dynamic_values_bytes);
             }
 #endif
+#ifdef LISP_FEATURE_GENCGC
+            if (widetag_of(native_pointer(initial_function)) == SIMPLE_FUN_WIDETAG
+                && !lisp_startup_options.noinform) {
+                fprintf(stderr, "Initial page table:\n");
+                extern void print_generation_stats(void);
+                print_generation_stats();
+            }
+#endif
             sanity_check_loaded_core(initial_function);
             return initial_function;
         case RUNTIME_OPTIONS_MAGIC: break; // already processed
@@ -1123,9 +1085,9 @@ load_core_file(char *file, os_vm_offset_t file_offset, int merge_core_pages)
 #include "genesis/hash-table.h"
 #include "genesis/vector.h"
 #include "genesis/cons.h"
-os_vm_address_t get_asm_routine_by_name(const char* name)
+char* get_asm_routine_by_name(const char* name)
 {
-    struct code* code = get_asm_routine_code_component();
+    struct code* code = (struct code*)asm_routines_start;
     lispobj ht = CONS(code->debug_info)->car;
     if (ht) {
         struct vector* table =
@@ -1146,7 +1108,7 @@ os_vm_address_t get_asm_routine_by_name(const char* name)
 
 void asm_routine_poke(const char* routine, int offset, char byte)
 {
-    char *address = (char *)get_asm_routine_by_name(routine);
+    char *address = get_asm_routine_by_name(routine);
     if (address)
         address[offset] = byte;
 }
@@ -1185,7 +1147,7 @@ static void graph_visit(lispobj __attribute__((unused)) referer,
     if (hopscotch_get(seen, ptr, 0))
         return;
     hopscotch_insert(seen, ptr, 1);
-    lispobj layout, bitmap, *obj;
+    lispobj layout, *obj;
     int nwords, i;
     if (lowtag_of(ptr) == LIST_POINTER_LOWTAG) {
         RECURSE(CONS(ptr)->car);
@@ -1195,35 +1157,30 @@ static void graph_visit(lispobj __attribute__((unused)) referer,
             nwords = fixnum_value(obj[1]); // vector length
             for(i=0; i<nwords; ++i) RECURSE(obj[i+2]);
             break;
-        // In all the following cases except for CODE, 'nwords' is the count
-        // of payload words (following the header), so we iterate up to and
-        // including that word index. For example, if there are 2 payload words,
-        // then we scan word indices 1 and 2 off the object base address.
         case INSTANCE_WIDETAG:
-            layout = instance_layout(obj);
-            graph_visit(ptr, layout, seen);
-            nwords = instance_length(*obj);
-            bitmap = ((struct layout*)native_pointer(layout))->bitmap;
-            for(i=1; i<=nwords; ++i)
-                if (layout_bitmap_logbitp(i-1, bitmap)) RECURSE(obj[i]);
-            break;
         case FUNCALLABLE_INSTANCE_WIDETAG:
-            layout = funinstance_layout(obj);
+            layout = layout_of(obj);
             graph_visit(ptr, layout, seen);
-            bitmap = ((struct layout*)native_pointer(layout))->bitmap;
-            nwords = SHORT_BOXED_NWORDS(*obj);
-            // We don't need to scan the word at index 1 (the trampoline pointer)
-            // because it either points to the FIN itself or to readonly space.
-            for(i=2; i<=nwords; ++i)
-                if (layout_bitmap_logbitp(i-1, bitmap)) RECURSE(obj[i]);
+            nwords = sizetab[widetag_of(obj)](obj);
+            struct bitmap bitmap = get_layout_bitmap(LAYOUT(layout));
+            for (i=0; i<(nwords-1); ++i)
+                if (bitmap_logbitp(i, bitmap)) RECURSE(obj[1+i]);
             break;
+        case CODE_HEADER_WIDETAG:
+            nwords = code_header_words((struct code*)obj);
+            for(i=2; i<nwords; ++i) RECURSE(obj[i]);
+            break;
+        // In all the remaining cases, 'nwords' is the count of payload words
+        // (following the header), so we iterate up to and including that
+        // word index. For example, if there are 2 payload words,
+        // then we scan word indices 1 and 2 off the object base address.
         case CLOSURE_WIDETAG:
             // We must scan the closure's trampoline word.
+            graph_visit(ptr, fun_taggedptr_from_self(obj[1]), seen);
             // Closures can utilize one payload word beyond what the header
             // indicates. This is quite sucky and I don't know why I did that.
             // However, it is correctly accounted for by SHORT_BOXED_NWORDS
             // which gives you the right number of words to scan.
-            graph_visit(ptr, obj[1] - FUN_RAW_ADDR_OFFSET, seen);
             nwords = SHORT_BOXED_NWORDS(*obj);
             for(i=2; i<=nwords; ++i) RECURSE(obj[i]);
             break;
@@ -1237,14 +1194,10 @@ static void graph_visit(lispobj __attribute__((unused)) referer,
             RECURSE(obj[2]);
             RECURSE(fdefn_callee_lispobj((struct fdefn*)obj));
             break;
-        case CODE_HEADER_WIDETAG:
-            nwords = code_header_words((struct code*)obj);
-            for(i=2; i<nwords; ++i) RECURSE(obj[i]);
-            break;
         default:
             if (!leaf_obj_widetag_p(widetag_of(obj))) {
-                nwords = BOXED_NWORDS(*obj);
-                for(i=1; i<=nwords; ++i) RECURSE(obj[i]);
+                int size = sizetab[widetag_of(obj)](obj);
+                for(i=1; i<size; ++i) RECURSE(obj[i]);
             }
       }
 }
@@ -1255,19 +1208,20 @@ static void tally(lispobj ptr, struct visitor* v)
         ++v->headers[0].count;
     else {
         lispobj* obj = native_pointer(ptr);
-        int widetag = widetag_of(obj);
+        lispobj header = *obj;
+        int widetag = header_widetag(header);
         int header_index = widetag>>2;
-        int words = OBJECT_SIZE(*obj, obj);
+        int words = OBJECT_SIZE(header, obj);
         ++v->headers[header_index].count;
         v->headers[header_index].words += words;
         if (widetag == SIMPLE_VECTOR_WIDETAG) {
-            int st = 0;
-            switch ((*obj >> N_WIDETAG_BITS) & 7) {
-            case subtype_VectorWeak: st = 1; break;
-            case subtype_VectorValidHashing: st = 2; break;
-            }
-            ++v->sv_subtypes[st].count;
-            v->sv_subtypes[st].words += words;
+            int subtype = 0;
+            if (vector_flagp(header, VectorHashing))
+                subtype = 2;
+            else if (vector_flagp(header, VectorWeak))
+                subtype = 1;
+            ++v->sv_subtypes[subtype].count;
+            v->sv_subtypes[subtype].words += words;
         }
     }
 }
@@ -1303,7 +1257,7 @@ static void sanity_check_loaded_core(lispobj initial_function)
                      1<<18, /* initial size */
                      0);
     {
-      lispobj* where = (lispobj*)STATIC_SPACE_START;
+      lispobj* where = (lispobj*)STATIC_SPACE_OBJECTS_START;
       lispobj* end = static_space_free_pointer;
       while (where<end) {
         // This falsely treats NIL as 4 conses but it doesn't really matter.

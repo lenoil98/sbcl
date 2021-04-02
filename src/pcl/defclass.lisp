@@ -82,7 +82,7 @@
       ;; metaclass.
       (mapc #'sb-int:check-deprecated-type direct-superclasses)
       (sb-int:check-deprecated-type metaclass)
-      (let ((canonical-slots (canonize-defclass-slots name direct-slots env))
+      (let ((canonical-slots (canonize-defclass-slots name metaclass direct-slots env))
             ;; DEFSTRUCT-P should be true if the class is defined
             ;; with a metaclass STRUCTURE-CLASS, so that a DEFSTRUCT
             ;; is compiled for the class.
@@ -161,7 +161,6 @@
            options)
   (let (metaclass
         default-initargs
-        documentation
         canonized-options)
       (dolist (option options)
         (unless (listp option)
@@ -191,7 +190,6 @@
           (:documentation
            (unless (stringp (second option))
              (error "~S is not a legal :documentation value" (second option)))
-           (setf documentation t)
            (push `(:documentation ,(second option)) canonized-options))
           (otherwise
            (push `(',(car option) ',(cdr option)) canonized-options))))
@@ -199,81 +197,80 @@
         (push '(:direct-default-initargs nil) canonized-options))
       (values (or metaclass 'standard-class) (nreverse canonized-options))))
 
-(defun canonize-defclass-slots (class-name slots env)
-  (let (canonized-specs)
-    (dolist (spec slots)
-      (let ((location (or (and (boundp 'sb-c::*current-path*)
-                               (boundp 'sb-c::*source-paths*)
-                               (let ((sb-c::*current-path*
-                                       (or (sb-c::get-source-path spec)
-                                           sb-c::*current-path*)))
-                                 (sb-c::make-definition-source-location)))
-                          (sb-c::make-definition-source-location))))
-        (when (atom spec)
-          (setf spec (list spec)))
-       (when (and (cdr spec) (null (cddr spec)))
-         (%program-error "~@<in DEFCLASS ~S, the slot specification ~S ~
-                          is invalid; the probable intended meaning may ~
-                          be achieved by specifiying ~S instead.~:>"
-                         class-name spec `(,(car spec) :initform ,(cadr spec))))
-       (let* ((name (car spec))
-              (plist (cdr spec))
-              (readers ())
-              (writers ())
-              (initargs ())
-              (others ())
-              (unsupplied (list nil))
-              (type t)
-              (initform unsupplied))
-         (check-slot-name-for-defclass name class-name env)
-         (push name *slot-names-for-this-defclass*)
-         (flet ((note-reader (x)
-                  (unless (symbolp x)
-                    (%program-error "Slot reader name ~S for slot ~S in ~
-                                     DEFCLASS ~S is not a symbol."
-                                    x name class-name))
-                  (push x readers)
-                  (push x *readers-for-this-defclass*))
-                (note-writer (x)
-                  (push x writers)
-                  (push x *writers-for-this-defclass*)))
-           (doplist (key val) plist
+(defun canonize-defclass-slot (class-name metaclass spec env)
+  (let ((location (sb-c::make-definition-source-location))
+        (spec (sb-int:ensure-list spec)))
+    (when (and (cdr spec) (null (cddr spec)))
+      (%program-error "~@<in DEFCLASS ~S, the slot specification ~S ~
+                       is invalid; the probable intended meaning may ~
+                       be achieved by specifiying ~S instead.~:>"
+                      class-name spec `(,(car spec) :initform ,(cadr spec))))
+    (let* ((name (car spec))
+           (plist (cdr spec))
+           (readers ())
+           (writers ())
+           (initargs ())
+           (others ())
+           (unsupplied (list nil))
+           (type t)
+           (initform unsupplied))
+      (check-slot-name-for-defclass name class-name env)
+      (push name *slot-names-for-this-defclass*)
+      (flet ((note-reader (x)
+               (unless (symbolp x)
+                 (%program-error "Slot reader name ~S for slot ~S in ~
+                                  DEFCLASS ~S is not a symbol."
+                                 x name class-name))
+               (push x readers)
+               (push x *readers-for-this-defclass*))
+             (note-writer (x)
+               (push x writers)
+               (push x *writers-for-this-defclass*)))
+        (doplist (key val) plist
+          (case key
+            (:accessor (note-reader val) (note-writer `(setf ,val)))
+            (:reader   (note-reader val))
+            (:writer   (note-writer val))
+            (:initarg
+             (unless (symbolp val)
+               (%program-error "Slot initarg name ~S for slot ~S in ~
+                                DEFCLASS ~S is not a symbol."
+                               val name class-name))
+             (push val initargs))
+            ((:initform :type :allocation :documentation)
              (case key
-               (:accessor (note-reader val) (note-writer `(setf ,val)))
-               (:reader   (note-reader val))
-               (:writer   (note-writer val))
-               (:initarg
-                (unless (symbolp val)
-                  (%program-error "Slot initarg name ~S for slot ~S in ~
-                                   DEFCLASS ~S is not a symbol."
-                                  val name class-name))
-                (push val initargs))
-               (otherwise
-                (when (member key '(:initform :allocation :type :documentation))
-                  (when (eq key :initform)
-                    (setf initform val))
-                  (when (eq key :type)
-                    (setf type val))
-                  (when (get-properties others (list key))
-                    (%program-error "Duplicate slot option ~S for slot ~
-                                     ~S in DEFCLASS ~S."
-                                    key name class-name)))
-                ;; For non-standard options multiple entries go in a list
-                (push val (getf others key))))))
-         ;; Unwrap singleton lists (AMOP 5.4.2)
-         (do ((head others (cddr head)))
-             ((null head))
-           (unless (cdr (second head))
-             (setf (second head) (car (second head)))))
-         (let ((canon `(:name ',name :readers ',readers :writers ',writers
-                        :initargs ',initargs  'source ,location ',others)))
-           (push (if (eq initform unsupplied)
-                     `(list* ,@canon)
-                     `(list* :initfunction ,(make-initfunction initform)
-                             ,@canon))
-                 canonized-specs)))))
-    (nreverse canonized-specs)))
+               (:initform
+                (setf initform val))
+               (:type
+                (when (eq metaclass 'standard-class)
+                  (sb-kernel::check-slot-type-specifier
+                   val name (cons 'defclass class-name))
+                  (setf type val))))
+             (when (get-properties others (list key))
+               (%program-error "Duplicate slot option ~S for slot ~
+                                ~S in DEFCLASS ~S."
+                               key name class-name))
+             (push val (getf others key)))
+            (otherwise
+             ;; For non-standard options multiple entries go in a list
+             (push val (getf others key))))))
+      ;; Unwrap singleton lists (AMOP 5.4.2)
+      (do ((head others (cddr head)))
+          ((null head))
+        (unless (cdr (second head))
+          (setf (second head) (car (second head)))))
+      (let ((canon `(:name ',name :readers ',readers :writers ',writers
+                     :initargs ',initargs  'source ,location ',others)))
+        (if (eq initform unsupplied)
+            `(list* ,@canon)
+            `(list* :initfunction ,(make-initfunction initform type spec)
+                    ,@canon))))))
 
+(defun canonize-defclass-slots (class-name metaclass slots env)
+  (map 'list (lambda (spec)
+               (with-current-source-form (spec)
+                 (canonize-defclass-slot class-name metaclass spec env)))
+       slots))
 
 (defun check-slot-name-for-defclass (name class-name env)
   (flet ((slot-name-illegal (reason)
@@ -290,19 +287,32 @@
            (%program-error "Multiple slots named ~S in DEFCLASS ~S."
                            name class-name)))))
 
-(defun make-initfunction (initform)
-  (cond ((or (eq initform t)
-             (equal initform ''t))
+(defun make-initfunction (initform &optional (type t)
+                                             source-form)
+  (cond ((and (or (eq initform t)
+                  (equal initform ''t))
+              (eq type t))
          '(function constantly-t))
-        ((or (eq initform nil)
-             (equal initform ''nil))
+        ((and (or (eq initform nil)
+                  (equal initform ''nil))
+              (eq type t))
          '(function constantly-nil))
-        ((or (eql initform 0)
-             (equal initform ''0))
+        ((and (or (eql initform 0)
+                  (equal initform ''0))
+              (eq type t))
          '(function constantly-0))
         (t
-         (let ((entry (assoc initform *initfunctions-for-this-defclass*
-                             :test #'equal)))
+         (let* ((initform (if (eq type t)
+                              initform
+                              `(sb-c::with-source-form ,source-form
+                                (the* (,type :source-form ,initform
+                                       ;; Don't want to insert a cast,
+                                       ;; as a subclass may change the type,
+                                       ;; just report this at compile-time.
+                                             :use-annotations t)
+                                      ,initform))))
+                (entry (assoc initform *initfunctions-for-this-defclass*
+                              :test #'equal)))
            (unless entry
              (setq entry (list initform
                                (gensym)

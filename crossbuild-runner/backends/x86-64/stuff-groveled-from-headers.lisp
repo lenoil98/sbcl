@@ -7,6 +7,9 @@
 (define-alien-type uint (unsigned 32))
 (define-alien-type ulong (unsigned 64))
 
+(defconstant error_file_not_found 2)
+(defconstant error_file_exists #x50)
+
 ;; these are total fabrications
 (defconstant max_path 1024)
 (defconstant error-no-data 1)
@@ -95,15 +98,12 @@
 (defconstant epipe 32) ; #x20
 (defconstant ewouldblock 11) ; #xb
 
-;;; for wait3(2) in run-program.lisp
+;;; for waitpid() in run-program.lisp
 (defconstant wnohang 1) ; #x1
 (defconstant wuntraced 2) ; #x2
 
 ;;; various ioctl(2) flags
 (defconstant tiocgpgrp 21519) ; #x540f
-(defconstant tiocspgrp 21520) ; #x5410
-(defconstant tiocgwinsz 21523) ; #x5413
-(defconstant tiocswinsz 21524) ; #x5414
 
 ;;; signals
 (defconstant sigalrm 14) ; #xe
@@ -115,7 +115,6 @@
 (defconstant sigill 4) ; #x4
 (defconstant sigint 2) ; #x2
 (defconstant sigio 29) ; #x1d
-(defconstant sigiot 6) ; #x6
 (defconstant sigkill 9) ; #x9
 (defconstant sigpipe 13) ; #xd
 (defconstant sigprof 27) ; #x1b

@@ -43,20 +43,51 @@
         (cons (and (find-package "SB-INTERPRETER") value1)
               value2)))))
 
-(defvar *make-host-parallelism*
-  (or #+sbcl
-      (let ((envvar (sb-ext:posix-getenv "SBCL_MAKE_PARALLEL")))
-        (when envvar
-          (require :sb-posix)
-          (parse-make-host-parallelism envvar)))))
-
+(defvar *make-host-parallelism* nil)
+(defvar *fail-on-warnings* t)
 (defun make-host-1-parallelism () (car *make-host-parallelism*))
 (defun make-host-2-parallelism () (cdr *make-host-parallelism*))
 
 #+sbcl
-(let ((f (multiple-value-bind (sym access) (find-symbol "OS-EXIT" "SB-SYS")
-           (if (eq access :external) sym 'sb-unix:unix-exit))))
-  (defun exit-process (arg) (funcall f arg)))
+(progn
+  (setq *make-host-parallelism*
+        (let ((envvar (sb-ext:posix-getenv "SBCL_MAKE_PARALLEL")))
+          (when envvar
+            (require :sb-posix)
+            (parse-make-host-parallelism envvar))))
+  (defmacro with-subprocesses (&rest body) `(progn ,@body))
+  (let ((f (multiple-value-bind (sym access) (find-symbol "OS-EXIT" "SB-SYS")
+             (if (eq access :external) sym 'sb-unix:unix-exit))))
+    (defun exit-process (arg) (funcall f arg))
+    (defun exit-subprocess (arg) (funcall f arg)))
+  ;; Lazily reference sb-posix because it may not be loaded
+  (defun posix-fork () (funcall (intern "FORK" "HOST-SB-POSIX")))
+  (defun getpid () (funcall (intern "UNIX-GETPID" "HOST-SB-UNIX")))
+  (defun posix-wait () (funcall (intern "WAIT" "HOST-SB-POSIX"))))
+
+#+clisp
+(progn
+  (setq *make-host-parallelism*
+        (let ((envvar (ext:getenv "SBCL_MAKE_PARALLEL")))
+          (when envvar
+            (parse-make-host-parallelism envvar))))
+  ;; FFI symbols won't exist if libffcall could not be found at build time.
+  (defmacro with-subprocesses (&rest rest)
+    (cons (or (find-symbol "WITH-SUBPROCESSES" "POSIX") 'progn) rest))
+  ;; clisp doesn't expose fork() and consequently doesn't behave
+  ;; correctly when (EXT:EXIT) is called in a forked child process.
+  (defun exit-process (arg) (ext:exit arg))
+  #+#.(cl:if (cl:find-package "FFI") '(and) '(or))
+  (progn (ffi:def-call-out exit-subprocess (:name "exit") (:arguments (arg ffi:int))
+                  (:library :default) (:language :stdc))
+         (ffi:def-call-out posix-fork (:name "fork") (:return-type ffi:int)
+                  (:library :default) (:language :stdc)))
+  (defun getpid () (posix:process-id))
+  (defun posix-wait ()
+    (multiple-value-bind (pid status code) (posix:wait)
+      (if (eql status :exited)
+          (values pid code)
+          (values pid (- code))))))
 
 ;;; If TRUE, then COMPILE-FILE is being invoked only to process
 ;;; :COMPILE-TOPLEVEL forms, not to produce an output file.
@@ -90,7 +121,8 @@
 
 ;;; a function of one functional argument, which calls its functional argument
 ;;; in an environment suitable for compiling the target. (This environment
-;;; includes e.g. a suitable *FEATURES* value.)
+;;; includes e.g. a suitable *READTABLE* that looks in SB-XC:*FEATURES*
+;;; when it reads #- and #+ syntax)
 (declaim (type function *in-target-compilation-mode-fn*))
 (defvar *in-target-compilation-mode-fn*)
 
@@ -159,14 +191,17 @@
       result)))
 (compile 'read-from-file)
 
-;;; Try to minimize/conceal any non-standardness of the host Common Lisp.
-#-sbcl (load "src/cold/ansify.lisp")
+#+sbcl (let ((ext (find-package "SB-EXT")))
+         ;; prevent things from working by accident when they would not work in
+         ;; ANSI lisp, e.g. ~/print-symbol-with-prefix/ (missing SB-EXT:)
+         (when (member ext (package-use-list "CL-USER"))
+           (unuse-package ext "CL-USER")))
 
-;;;; Do not put SBCL-specific things in 'ansify'. Put them here.
-;;;; And there had better not be a reason that SBCL needs ansification.
+#+cmu
+(setq cl:*compile-print* nil) ; too much noise, can't see the actual warnings
 #+sbcl
 (progn
-  (setq *compile-print* nil)
+  (setq cl:*compile-print* nil)
   (load "src/cold/muffler.lisp")
   ;; Let's just say we never care to see these.
   (declaim (sb-ext:muffle-conditions
@@ -178,6 +213,15 @@
 ;;;; building some of our tools for building the cold system)
 
 (load "src/cold/shebang.lisp")
+
+(defvar *shebang-backend-subfeatures*
+  (let* ((default-subfeatures nil)
+         (customizer-file-name "customize-backend-subfeatures.lisp")
+         (customizer (if (probe-file customizer-file-name)
+                         (compile nil
+                                  (read-from-file customizer-file-name))
+                         #'identity)))
+    (funcall customizer default-subfeatures)))
 
 ;;; When cross-compiling, the *FEATURES* set for the target Lisp is
 ;;; not in general the same as the *FEATURES* set for the host Lisp.
@@ -206,35 +250,42 @@
                                       (read-from-file customizer-file-name))
                              #'identity))
              (target-feature-list (funcall customizer default-features))
+             (gc (find-if (lambda (x) (member x '(:cheneygc :gencgc)))
+                          target-feature-list))
              (arch (target-platform-keyword target-feature-list)))
-        ;; Sort the arch name to the front and de-dup the rest in case the
-        ;; command line had a redundant --with-mumble option and/or the
-        ;; customizer decided to return dups.
-        (cons arch (sort (remove-duplicates (remove arch target-feature-list))
-                         #'string<))))
+        ;; Win32 conditionally adds :sb-futex in grovel-features.sh
+        (when (featurep '(:and :sb-thread (:or :linux :freebsd)) target-feature-list)
+          (pushnew :sb-futex target-feature-list))
+        (when (featurep '(:and :sb-thread (:not :win32)) target-feature-list)
+          (push :pauseless-threadstart target-feature-list))
+        (when (featurep '(:and :sb-thread (:or :darwin :openbsd)) target-feature-list)
+          (push :os-thread-stack target-feature-list))
+        (when (and (member :x86 target-feature-list)
+                   (member :int4-breakpoints target-feature-list))
+          ;; 0xCE is a perfectly good 32-bit instruction,
+          ;; unlike on x86-64 where it is illegal. It's therefore
+          ;; confusing to allow this feature in a 32-bit build.
+          ;; But it's annoying to have a build script that otherwise works
+          ;; for a native x86/x86-64 build except for needing one change.
+          ;; Just print something and go on with life.
+          (setq target-feature-list
+                (remove :int4-breakpoints target-feature-list))
+          (warn "Removed :INT4-BREAKPOINTS from target features"))
+        (when (or (member :arm64 target-feature-list)
+                  (member :sse4 *shebang-backend-subfeatures*))
+          (push :round-float target-feature-list))
+        (when (and (member :arm64 target-feature-list)
+                  (member :darwin target-feature-list))
+          (push :arm-v8.1 *shebang-backend-subfeatures*))
 
-(defvar *build-features* (let ((filename "build-features.lisp-expr"))
-                           (when (probe-file filename)
-                             (read-from-file filename))))
-(dolist (target-feature '(:sb-after-xc-core :cons-profiling))
-  (when (member target-feature sb-xc:*features*)
-    (setf sb-xc:*features* (delete target-feature sb-xc:*features*))
-    ;; If you use --fancy and --with-sb-after-xc-core you might
-    ;; add the feature twice if you don't use pushnew
-    (pushnew target-feature *build-features*)))
-
-;; We update the host's features, because a build-feature is essentially
-;; an option to check in the host enviroment
-(setf *features* (append *build-features* *features*))
-
-(defvar *shebang-backend-subfeatures*
-  (let* ((default-subfeatures nil)
-         (customizer-file-name "customize-backend-subfeatures.lisp")
-         (customizer (if (probe-file customizer-file-name)
-                         (compile nil
-                                  (read-from-file customizer-file-name))
-                         #'identity)))
-    (funcall customizer default-subfeatures)))
+        ;; Putting arch and gc choice first is visually convenient, versus
+        ;; having to parse a random place in the line to figure out the value
+        ;; of a binary choice {cheney vs gencgc} and architecture.
+        ;; De-duplicate the rest of the symbols because the command line
+        ;; can add redundant --with-mumble options.
+        (list* arch gc (sort (remove-duplicates
+                              (remove arch (remove gc target-feature-list)))
+                             #'string<))))
 
 ;;; Call for effect of signaling an error if no target picked.
 (target-platform-keyword)
@@ -251,28 +302,24 @@
 (let ((feature-compatibility-tests
        '(("(and sb-thread (not gencgc))"
           ":SB-THREAD requires :GENCGC")
-         ("(and sb-thread (not (or ppc x86 x86-64 arm64)))"
+         ("(and pauseless-threadstart (not sb-thread))"
+          ":PAUSELESS-THREADSTART requires :SB-THREAD")
+         ("(and sb-safepoint (not sb-thread))" ":SB-SAFEPOINT requires :SB-THREAD")
+         ("(and sb-thread (not (or riscv ppc ppc64 x86 x86-64 arm64)))"
           ":SB-THREAD not supported on selected architecture")
          ("(and gencgc cheneygc)"
           ":GENCGC and :CHENEYGC are incompatible")
-         ("(and cheneygc (not (or alpha arm hppa mips ppc riscv sparc)))"
+         ("(and cheneygc (not (or arm arm64 mips ppc riscv sparc)))"
           ":CHENEYGC not supported on selected architecture")
          ("(and gencgc (not (or sparc ppc ppc64 x86 x86-64 arm arm64 riscv)))"
           ":GENCGC not supported on selected architecture")
          ("(not (or gencgc cheneygc))"
           "One of :GENCGC or :CHENEYGC must be enabled")
-         ("(and sb-safepoint (not (or arm64 ppc x86 x86-64)))"
-          ":SB-SAFEPOINT not supported on selected architecture")
-         ("(and sb-safepoint-strictly (not sb-safepoint))"
-          ":SB-SAFEPOINT-STRICTLY requires :SB-SAFEPOINT")
+         ("(and sb-safepoint (not (and (or arm64 x86 x86-64) (or darwin linux win32))))"
+          ":SB-SAFEPOINT not supported on selected arch/OS")
          ("(not (or elf mach-o win32))"
           "No execute object file format feature defined")
-         ("(and sb-dynamic-core (not linkage-table))"
-          ":SB-DYNAMIC-CORE requires :LINKAGE-TABLE")
-         ("(and relocatable-heap win32)"
-          "Relocatable heap requires (not win32)")
-         ("(and sb-linkable-runtime (not sb-dynamic-core))"
-          ":SB-LINKABLE-RUNTIME requires :SB-DYNAMIC-CORE")
+         ("(and cons-profiling (not sb-thread))" ":CONS-PROFILING requires :SB-THREAD")
          ("(and sb-linkable-runtime (not (or x86 x86-64)))"
           ":SB-LINKABLE-RUNTIME not supported on selected architecture")
          ("(and sb-linkable-runtime (not (or darwin linux win32)))"
@@ -283,30 +330,25 @@
           "At most one interpreter can be selected")
          ("(and immobile-space (not x86-64))"
           ":IMMOBILE-SPACE is supported only on x86-64")
-         ("(and immobile-space (not relocatable-heap))"
-          ":IMMOBILE-SPACE requires :RELOCATABLE-HEAP")
          ("(and compact-instance-header (not immobile-space))"
           ":COMPACT-INSTANCE-HEADER requires :IMMOBILE-SPACE feature")
          ("(and immobile-code (not immobile-space))"
           ":IMMOBILE-CODE requires :IMMOBILE-SPACE feature")
          ("(and immobile-symbols (not immobile-space))"
           ":IMMOBILE-SYMBOLS requires :IMMOBILE-SPACE feature")
-         ("(and int4-breakpoints x86)"
-          ;; 0xCE is a perfectly good 32-bit instruction,
-          ;; unlike on x86-64 where it is illegal. It's therefore
-          ;; confusing to allow this feature in a 32-bit build.
-          ":INT4-BREAKPOINTS are incompatible with x86")
+         ("(and sb-futex (not sb-thread))"
+          "Can't enable SB-FUTEX on platforms lacking thread support")
          ;; There is still hope to make multithreading on DragonFly x86-64
          ("(and sb-thread x86 dragonfly)"
           ":SB-THREAD not supported on selected architecture")))
       (failed-test-descriptions nil))
   (dolist (test feature-compatibility-tests)
-    (let ((cl:*features* sb-xc:*features*))
+    (let ((*readtable* *xc-readtable*))
       (when (read-from-string (concatenate 'string "#+" (first test) "T NIL"))
         (push (second test) failed-test-descriptions))))
   (when failed-test-descriptions
     (error "Feature compatibility check failed, ~S"
-           failed-test-descriptions)))
+           (reverse failed-test-descriptions))))
 
 ;;;; cold-init-related PACKAGE and SYMBOL tools
 
@@ -344,6 +386,11 @@
     ;; of exciting low-level information about representation selection,
     ;; VOPs used by the compiler, and bits of assembly.
     :trace-file
+    ;; meaning: The #'COMPILE-STEM argument :BLOCK-COMPILE should be
+    ;; T. That is, the entire file will be block compiled. Like
+    ;; :TRACE-FILE, this applies to all COMPILE-FILEs which support
+    ;; something like :BLOCK-COMPILE.
+    :block-compile
     ;; meaning: This file is to be processed with the SBCL assembler,
     ;; not COMPILE-FILE. (Note that this doesn't make sense unless
     ;; :NOT-HOST is also set, since the SBCL assembler doesn't exist
@@ -373,29 +420,26 @@
     ;; just to avoid that ugly mess.
     nil))
 
-;;; The specialized array registry has file-wide scope. Hacking that aspect
-;;; into the xc build scaffold seemed slightly easier than hacking the
-;;; compiler (i.e. making the registry a slot of the fasl-output struct)
-(defvar *array-to-specialization* (make-hash-table :test #'eq))
-
 (defmacro do-stems-and-flags ((stem flags build-phase) &body body)
   (let ((stem-and-flags (gensym "STEM-AND-FLAGS")))
     `(dolist (,stem-and-flags (get-stems-and-flags ,build-phase))
        (let ((,stem (first ,stem-and-flags))
              (,flags (rest ,stem-and-flags)))
-         ,@body
-         (clrhash *array-to-specialization*)))))
+         ,@body))))
 
 ;;; Given a STEM, remap the path component "/target/" to a suitable
 ;;; target directory.
 (defun stem-remap-target (stem)
-  (let ((position (search "/target/" stem)))
-    (if position
-      (concatenate 'string
-                   (subseq stem 0 (1+ position))
-                   (string-downcase (target-platform-keyword))
-                   (subseq stem (+ position 7)))
-      stem)))
+  (flet ((try-replacing (this that)
+           (let ((position (search this stem)))
+             (when position
+               (concatenate 'string
+                            (subseq stem 0 (1+ position))
+                            (string-downcase that)
+                            (subseq stem (+ position (length this) -1)))))))
+    (or (try-replacing "/target/" (target-platform-keyword))
+        (try-replacing "/asm-target/" (backend-assembler-target-name))
+        stem)))
 (compile 'stem-remap-target)
 
 ;;; Determine the source path for a stem by remapping from the abstract name
@@ -410,9 +454,9 @@
 (compile 'stem-source-path)
 
 ;;; Determine the object path for a stem/flags/mode combination.
+(export 'stem-object-path)
 (defun stem-object-path (stem flags mode)
-  (multiple-value-bind
-        (obj-prefix obj-suffix)
+  (multiple-value-bind (obj-prefix obj-suffix)
       (ecase mode
         (:host-compile
          ;; On some xc hosts, it's impossible to LOAD a fasl file unless it
@@ -422,10 +466,11 @@
          (values *host-obj-prefix*
                  (concatenate 'string "."
                               (pathname-type (compile-file-pathname stem)))))
-        (:target-compile (values *target-obj-prefix*
-                                 (if (find :assem flags)
-                                     *target-assem-obj-suffix*
-                                     *target-obj-suffix*))))
+        (:target-compile
+         (values *target-obj-prefix*
+                 (cond ((find :extra-artifact flags) "")
+                       ((find :assem flags) *target-assem-obj-suffix*)
+                       (t *target-obj-suffix*)))))
     (concatenate 'string obj-prefix (stem-remap-target stem) obj-suffix)))
 (compile 'stem-object-path)
 
@@ -502,15 +547,27 @@
                        (if *compile-for-effect-only* "-scratch" "-tmp")))
 
          (compile-file (ecase mode
-                         (:host-compile #'compile-file)
+                         (:host-compile
+                          #+ccl
+                          (lambda (&rest args)
+                            ;; CCL doesn't like NOTINLINE on uknown functions
+                            (handler-bind ((ccl:compiler-warning
+                                             (lambda (c)
+                                               (when (eq (ccl::compiler-warning-warning-type c)
+                                                         :unknown-declaration-function)
+                                                 (muffle-warning c)))))
+                              (apply #'compile-file args)))
+                          #-ccl
+                          #'compile-file)
                          (:target-compile (if (find :assem flags)
                                               *target-assemble-file*
                                               *target-compile-file*))))
-         (trace-file (find :trace-file flags))
+         (trace-file (if (find :trace-file flags) t nil))
+         (block-compile (if (find :block-compile flags) t :specified))
          (ignore-failure-p (find :ignore-failure-p flags)))
     (declare (type function compile-file))
 
-    (ensure-directories-exist obj :verbose *compile-print*) ; host's value
+    (ensure-directories-exist obj :verbose cl:*compile-print*) ; host's value
 
     ;; We're about to set about building a new object file. First, we
     ;; delete any preexisting object file in order to avoid confusing
@@ -558,10 +615,26 @@
        retry-compile-file
          (multiple-value-bind (output-truename warnings-p failure-p)
              (restart-case
-                 (if trace-file
-                     (funcall compile-file src :output-file tmp-obj
-                                               :trace-file t :allow-other-keys t)
-                     (funcall compile-file src :output-file tmp-obj))
+                 (apply compile-file src :output-file tmp-obj
+                          :block-compile (and ;; Block compilation was
+                                              ;; completely broken
+                                              ;; from the beginning of
+                                              ;; SBCL history until
+                                              ;; version 2.0.2.
+                                              #+sbcl
+                                              (or (eq mode :target-compile)
+                                                  (and (find-symbol "SPLIT-VERSION-STRING" "SB-C")
+                                                       (funcall (find-symbol "VERSION>=" "SB-C")
+                                                                (funcall (find-symbol "SPLIT-VERSION-STRING" "SB-C")
+                                                                         (lisp-implementation-version))
+                                                                '(2 0 2))))
+                                              block-compile)
+                          :allow-other-keys t
+                          ;; If tracing, also print, but don't specify :PRINT unless specifying
+                          ;; :TRACE-FILE so that whatever the default is for *COMPILE-PRINT*
+                          ;; prevails, insensitively to whether it's the SB-XC: or CL: symbol.
+                          (when trace-file
+                            '(:trace-file t :print t)))
                (recompile ()
                  :report report-recompile-restart
                  (go retry-compile-file)))
@@ -601,7 +674,7 @@
 (compile 'compile-stem)
 
 (defparameter *host-quirks*
-  (or #+cmu  '(:host-quirks-cmu :no-ansi-print-object)
+  (or #+cmu  '(:host-quirks-cmu)
       #+ecl  '(:host-quirks-ecl)
       #+sbcl '(:host-quirks-sbcl))) ; not so much a "quirk", but consistent anyway
 
@@ -670,6 +743,8 @@
 ;;;; Floating-point number reader interceptor
 
 (defvar *choke-on-host-irrationals* t)
+;;; FIXME: this gets stuck on forms which contain literal CTYPE objects
+;;; because of infinite recursion.
 (defun install-read-interceptor ()
   ;; Intercept READ to catch inadvertent use of host floating-point literals.
   ;; This prevents regressions in the portable float logic and allows passing
@@ -688,8 +763,13 @@
              '(or))
   (labels ((contains-irrational (x)
              (typecase x
-               (cons (or (contains-irrational (car x))
-                         (contains-irrational (cdr x))))
+               (cons
+                ;; Tail-recursion not guaranteed
+                (do ((cons x (cdr cons)))
+                    ((atom cons)
+                     (contains-irrational cons))
+                  (when (contains-irrational (car cons))
+                    (return t))))
                (simple-vector (some #'contains-irrational x))
                ;; We use package literals -- see e.g. SANE-PACKAGE - which
                ;; must be treated as opaque, but COMMAs should not be opaque.
@@ -749,3 +829,32 @@
                     table stream))
          (format t "~&; wrote ~a - ~d entries"
                  filename (hash-table-count table))))))
+
+;;;; Please avoid writing "consecutive" (un-nested) reader conditionals
+;;;; in this file, whether for the same or different feature test.
+;;;; The following example prints 3 different results in 3 different lisp
+;;;; implementations all of which have feature :linux (and not :nofeat).
+#|
+(let ((i 0))
+  (dolist (s '("#-nofeat #+linux a b c d e"
+               "#-nofeat #-linux a b c d e"
+               "#+nofeat #-linux a b c d e"
+               "#+nofeat #+linux a b c d e"
+               "#+linux #-nofeat a b c d e"
+               "#-linux #-nofeat a b c d e"
+               "#-linux #+nofeat a b c d e"
+               "#+linux #+nofeat a b c d e"
+               "#+linux #-linux a b c d e"
+               "#-linux #-linux a b c d e"
+               "#-linux #+linux a b c d e"
+               "#+linux #+linux a b c d e"
+               "#+nofeat #-nofeat a b c d e"
+               "#-nofeat #-nofeat a b c d e"
+               "#-nofeat #+nofeat a b c d e"
+               "#+nofeat #+nofeat a b c d e"))
+  (format t "test ~2d: ~a ~s~%"
+          (incf i)
+          (let ((stream (make-string-input-stream s)))
+            (list (read stream) (read stream) (read stream)))
+          s)))
+|#

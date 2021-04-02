@@ -21,6 +21,7 @@
   (register-args 0)
   (xmm-args 0)
   (stack-frame-size 0))
+(declaim (freeze-type arg-state))
 
 (defconstant max-int-args #.(length *c-call-register-arg-offsets*))
 (defconstant max-xmm-args #+win32 4 #-win32 8)
@@ -68,11 +69,12 @@
 
 (defstruct (result-state (:copier nil))
   (num-results 0))
+(declaim (freeze-type result-state))
 
 (defun result-reg-offset (slot)
   (ecase slot
-    (0 eax-offset)
-    (1 edx-offset)))
+    (0 rax-offset)
+    (1 rdx-offset)))
 
 (define-alien-type-method (integer :result-tn) (type state)
   (let ((num-results (result-state-num-results state)))
@@ -122,7 +124,7 @@
     (collect ((arg-tns))
       (dolist (arg-type (alien-fun-type-arg-types type))
         (arg-tns (invoke-alien-type-method :arg-tn arg-type arg-state)))
-      (values (make-wired-tn* 'positive-fixnum any-reg-sc-number esp-offset)
+      (values (make-wired-tn* 'positive-fixnum any-reg-sc-number rsp-offset)
               (* (arg-state-stack-frame-size arg-state) n-word-bytes)
               (arg-tns)
               (invoke-alien-type-method :result-tn
@@ -198,6 +200,11 @@
 (defknown sign-extend ((signed-byte 64) t) fixnum
     (foldable flushable movable))
 
+(defoptimizer (sign-extend derive-type) ((x size))
+  (declare (ignore x))
+  (when (sb-c::constant-lvar-p size)
+    (specifier-type `(signed-byte ,(sb-c::lvar-value size)))))
+
 (define-vop (sign-extend)
   (:translate sign-extend)
   (:policy :fast-safe)
@@ -228,7 +235,6 @@
   (:generator 2
    (inst mov res (make-fixup foreign-symbol :foreign))))
 
-#+linkage-table
 (define-vop (foreign-symbol-dataref-sap)
   (:translate foreign-symbol-dataref-sap)
   (:policy :fast-safe)
@@ -238,13 +244,19 @@
   (:results (res :scs (sap-reg)))
   (:result-types system-area-pointer)
   (:generator 2
-   (inst mov res (make-fixup foreign-symbol :foreign-dataref))))
+   (inst mov res (ea (make-fixup foreign-symbol :foreign-dataref)))))
 
 #+sb-safepoint
-(defconstant thread-saved-csp-offset -1)
+(defconstant thread-saved-csp-offset (- (1+ sb-vm::thread-header-slots)))
 
 (eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
   (defun destroyed-c-registers ()
+    ;; Safepoints do not save interrupt contexts to be scanned during
+    ;; GCing, it only looks at the stack, so if a register isn't
+    ;; spilled it won't be visible to the GC.
+    #+sb-safepoint
+    '((:save-p t))
+    #-sb-safepoint
     (let ((gprs (list rcx-offset rdx-offset
                       #-win32 rsi-offset #-win32 rdi-offset
                       r8-offset r9-offset r10-offset r11-offset))
@@ -252,10 +264,10 @@
       (append
        (loop for gpr in gprs
              collect `(:temporary (:sc any-reg :offset ,gpr :from :eval :to :result)
-                                  ,(car (push (gensym) vars))))
+                                  ,(car (push (sb-xc:gensym) vars))))
        (loop for float to 15
              collect `(:temporary (:sc single-reg :offset ,float :from :eval :to :result)
-                                  ,(car (push (gensym) vars))))
+                                  ,(car (push (sb-xc:gensym) vars))))
        `((:ignore ,@vars))))))
 
 (define-vop (call-out)
@@ -280,7 +292,6 @@
 
 ;;; Calls to C can generally be made without loading a register
 ;;; with the function. We receive the function name as an info argument.
-#+sb-dynamic-core ;; broken when calling ldso-stubs
 (define-vop (call-out-named)
   (:args (args :more t))
   (:results (results :more t))
@@ -300,6 +311,11 @@
   ;; GC understands
   #+sb-safepoint
   (let ((label (gen-label)))
+    ;; This looks unnecessary. GC can look at the stack word physically below
+    ;; the CSP-around-foreign-call, which must be a PC pointing into the lisp caller.
+    ;; A more interesting question would arise if we had callee-saved registers
+    ;; within lisp code, which we don't at the moment. If we did, those
+    ;; wouldn't be anywhere on the stack unless C code decides to save them.
     (inst lea rax (rip-relative-ea label))
     (emit-label label)
     (move pc-save rax))
@@ -320,26 +336,31 @@
                         while tn-ref
                         count (eq (sb-name (sc-sb (tn-sc (tn-ref-tn tn-ref))))
                                   'float-registers))))
+
+  ;; Store SP in thread struct, unless the enclosing block says not to
   #+sb-safepoint
-  ;; Store SP in thread struct
-  (storew rsp-tn thread-base-tn thread-saved-csp-offset)
+  (when (policy (sb-c::vop-node vop) (/= sb-c:insert-safepoints 0))
+    (storew rsp-tn thread-base-tn thread-saved-csp-offset))
+
   #+win32 (inst sub rsp-tn #x20)       ;MS_ABI: shadow zone
+
   ;; From immobile space we use the "CALL rel32" format to the linkage
   ;; table jump, and from dynamic space we use "CALL [ea]" format
   ;; where ea is the address of the linkage table entry's operand.
   ;; So while the former is a jump to a jump, we can optimize out
   ;; one jump in a statically linked executable.
-
   (inst call (cond ((tn-p fun) fun)
                    ((sb-c::code-immobile-p vop) (make-fixup fun :foreign))
                    (t (ea (make-fixup fun :foreign 8)))))
   ;; For the undefined alien error
   (note-this-location vop :internal-error)
   #+win32 (inst add rsp-tn #x20)       ;MS_ABI: remove shadow space
+
+  ;; Zero the saved CSP, unless this code shouldn't ever stop for GC
   #+sb-safepoint
-  ;; Zero the saved CSP
-  (inst xor (make-ea-for-object-slot thread-base-tn thread-saved-csp-offset 0)
-        rsp-tn))
+  (when (policy (sb-c::vop-node vop) (/= sb-c:insert-safepoints 0))
+    (inst xor (object-slot-ea thread-base-tn thread-saved-csp-offset 0)
+          rsp-tn)))
 
 (define-vop (alloc-number-stack-space)
   (:info amount)
@@ -534,7 +555,7 @@
       (finalize-segment segment)
       ;; Now that the segment is done, convert it to a static
       ;; vector we can point foreign code to.
-      (let ((buffer (sb-assem::segment-buffer segment)))
+      (let ((buffer (sb-assem:segment-buffer segment)))
         (make-static-vector (length buffer)
                             :element-type '(unsigned-byte 8)
                             :initial-contents buffer)))))

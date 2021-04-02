@@ -19,7 +19,7 @@
 #include <sys/file.h>
 
 #include "sbcl.h"
-#if defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_SB_THREAD)
+#ifdef LISP_FEATURE_WIN32
 #include "pthreads_win32.h"
 #else
 #include <signal.h>
@@ -35,7 +35,7 @@
 #include "gc-internal.h"
 #include "thread.h"
 #include "arch.h"
-#include "pseudo-atomic.h"
+#include "getallocptr.h"
 #include "genesis/static-symbols.h"
 #include "genesis/symbol.h"
 #include "genesis/vector.h"
@@ -77,7 +77,7 @@ write_lispobj(lispobj obj, FILE *file)
 }
 
 static void
-write_bytes_to_file(FILE * file, char *addr, long bytes, int compression)
+write_bytes_to_file(FILE * file, char *addr, size_t bytes, int compression)
 {
     if (compression == COMPRESSION_LEVEL_NONE) {
         while (bytes > 0) {
@@ -88,7 +88,7 @@ write_bytes_to_file(FILE * file, char *addr, long bytes, int compression)
             }
             else {
                 perror(GENERAL_WRITE_FAILURE_MSG);
-                lose("core file is incomplete or corrupt\n");
+                lose("core file is incomplete or corrupt");
             }
         }
 #ifdef LISP_FEATURE_SB_CORE_COMPRESSION
@@ -106,12 +106,12 @@ write_bytes_to_file(FILE * file, char *addr, long bytes, int compression)
         stream.next_in  = (void*)addr;
         ret = deflateInit(&stream, compression);
         if (ret != Z_OK)
-            lose("deflateInit: %i\n", ret);
+            lose("deflateInit: %i", ret);
         do {
             stream.avail_out = ZLIB_BUFFER_SIZE;
             stream.next_out = buf;
             ret = deflate(&stream, Z_FINISH);
-            if (ret < 0) lose("zlib deflate error: %i... exiting\n", ret);
+            if (ret < 0) lose("zlib deflate error: %i... exiting", ret);
             written = buf;
             end     = buf+ZLIB_BUFFER_SIZE-stream.avail_out;
             total_written += end - written;
@@ -121,7 +121,7 @@ write_bytes_to_file(FILE * file, char *addr, long bytes, int compression)
                     written += count;
                 } else {
                     perror(GENERAL_WRITE_FAILURE_MSG);
-                    lose("core file is incomplete or corrupt\n");
+                    lose("core file is incomplete or corrupt");
                 }
             }
         } while (stream.avail_out == 0);
@@ -133,26 +133,35 @@ write_bytes_to_file(FILE * file, char *addr, long bytes, int compression)
 #endif
     } else {
 #ifdef LISP_FEATURE_SB_CORE_COMPRESSION
-        lose("Unknown core compression level %i, exiting\n", compression);
+        lose("Unknown core compression level %i, exiting", compression);
 #else
-        lose("zlib-compressed core support not built in this runtime\n");
+        lose("zlib-compressed core support not built in this runtime");
 #endif
     }
 
     if (fflush(file) != 0) {
       perror(GENERAL_WRITE_FAILURE_MSG);
-      lose("core file is incomplete or corrupt\n");
+      lose("core file is incomplete or corrupt");
     }
 };
 
+#if defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_64_BIT)
+#define FTELL _ftelli64
+#define FSEEK _fseeki64
+typedef __int64 ftell_type;
+#else
+#define FTELL ftell
+#define FSEEK fseek
+typedef long ftell_type;
+#endif
 
-static long write_bytes(FILE *file, char *addr, long bytes,
+static long write_bytes(FILE *file, char *addr, size_t bytes,
                         os_vm_offset_t file_offset, int compression)
 {
-    long here, data;
+    ftell_type here, data;
 
 #ifdef LISP_FEATURE_WIN32
-    long count;
+    size_t count;
     /* touch every single page in the space to force it to be mapped. */
     for (count = 0; count < bytes; count += 0x1000) {
         volatile int temp = addr[count];
@@ -160,12 +169,12 @@ static long write_bytes(FILE *file, char *addr, long bytes,
 #endif
 
     fflush(file);
-    here = ftell(file);
-    fseek(file, 0, SEEK_END);
-    data = ALIGN_UP(ftell(file), os_vm_page_size);
-    fseek(file, data, SEEK_SET);
+    here = FTELL(file);
+    FSEEK(file, 0, SEEK_END);
+    data = ALIGN_UP(FTELL(file), os_vm_page_size);
+    FSEEK(file, data, SEEK_SET);
     write_bytes_to_file(file, addr, bytes, compression);
-    fseek(file, here, SEEK_SET);
+    FSEEK(file, here, SEEK_SET);
     return ((data - file_offset) / os_vm_page_size) - 1;
 }
 
@@ -188,10 +197,23 @@ output_space(FILE *file, int id, lispobj *addr, lispobj *end,
 
     bytes = words * sizeof(lispobj);
 
+#ifdef LISP_FEATURE_CHENEYGC
+    /* KLUDGE: cheneygc can not restart a saved core if the dynamic space is empty,
+     * because coreparse would never get to make the second semispace. That GC is such
+     * a total piece of garbage that I don't care to fix, but yet it shouldn't be in
+     * such bad shape that saved cores don't work. This seems to do the trick. */
+    if (id == DYNAMIC_CORE_SPACE_ID && bytes == 0) bytes = 2*N_WORD_BYTES;
+#endif
+
     if (!lisp_startup_options.noinform)
         printf("writing %lu bytes from the %s space at %p\n",
                (long unsigned)bytes, names[id], addr);
 
+    /* FIXME: it sure would be nice to discover and document the behavior of this function
+     * with regard to aligning up the byte count as pertains to bytes spanned by a rounded
+     * up count that were not zeroized and would not have been written had we not rounded.
+     * That seems quite bogus to operate on bytes that the caller didn't promise were OK
+     * to be saved out (and didn't contain, say, a password and social security number) */
     data = write_bytes(file, (char *)addr, ALIGN_UP(bytes, os_vm_page_size),
                        file_offset, core_compression_level);
 
@@ -252,7 +274,7 @@ save_to_filehandle(FILE *file, char *filename, lispobj init_function,
         fflush(stdout);
     }
 
-    os_vm_offset_t core_start_pos = ftell(file);
+    os_vm_offset_t core_start_pos = FTELL(file);
     write_lispobj(CORE_MAGIC, file);
 
     /* If 'save_runtime_options' is specified then the saved thread stack size
@@ -293,6 +315,14 @@ save_to_filehandle(FILE *file, char *filename, lispobj init_function,
                  static_space_free_pointer,
                  core_start_pos,
                  core_compression_level);
+#ifdef LISP_FEATURE_DARWIN_JIT
+    output_space(file,
+                 STATIC_CODE_CORE_SPACE_ID,
+                 (lispobj *)STATIC_CODE_SPACE_START,
+                 static_code_space_free_pointer,
+                 core_start_pos,
+                 core_compression_level);
+#endif
     output_space(file,
                  DYNAMIC_CORE_SPACE_ID,
                  current_dynamic_space,
@@ -489,8 +519,7 @@ prepare_to_save(char *filename, boolean prepend_runtime, void **runtime_bytes,
                 size_t *runtime_size)
 {
     FILE *file;
-    char *runtime_path;
-    extern char *saved_runtime_path; // path computed from argv[0]
+    extern char *sbcl_runtime;
 
     // SB-IMPL::DEINIT already checked for exactly 1 thread,
     // so this really shouldn't happen.
@@ -500,19 +529,11 @@ prepare_to_save(char *filename, boolean prepend_runtime, void **runtime_bytes,
     }
 
     if (prepend_runtime) {
-        runtime_path = os_get_runtime_executable_path(0);
-
-        if (runtime_path == NULL && saved_runtime_path == NULL) {
+        if (!sbcl_runtime) {
             fprintf(stderr, "Unable to get default runtime path.\n");
             return NULL;
         }
-
-        if (runtime_path == NULL)
-            *runtime_bytes = load_runtime(saved_runtime_path, runtime_size);
-        else {
-            *runtime_bytes = load_runtime(runtime_path, runtime_size);
-            free(runtime_path);
-        }
+        *runtime_bytes = load_runtime(sbcl_runtime, runtime_size);
 
         if (*runtime_bytes == NULL)
             return 0;
@@ -550,6 +571,7 @@ save(char *filename, lispobj init_function, boolean prepend_runtime,
      * too late to remove old references from the binding stack.
      * There's probably no safe way to do that from Lisp */
     unwind_binding_stack();
+    os_unlink_runtime();
     return save_to_filehandle(file, filename, init_function, prepend_runtime,
                               save_runtime_options,
                               compressed ? compressed : COMPRESSION_LEVEL_NONE);

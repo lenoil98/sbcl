@@ -200,79 +200,70 @@
 ;;; P-A FLAG-TN is also acceptable here.
 
 #+gencgc
-(defun allocation-tramp (alloc-tn size back-label)
-  (let ((fixup (gen-label)))
-    (when (integerp size)
-      (load-immediate-word alloc-tn size))
-    (inst word (logior #xe92d0000
-                       (ash 1 (if (integerp size) (tn-offset alloc-tn) (tn-offset size)))
-                       (ash 1 (tn-offset lr-tn))))
-    (inst load-from-label alloc-tn alloc-tn fixup)
-    (inst blx alloc-tn)
-    (inst word (logior #xe8bd0000
-                       (ash 1 (tn-offset alloc-tn))
-                       (ash 1 (tn-offset lr-tn))))
-    (inst b back-label)
-    (emit-label fixup)
-    (inst word (make-fixup "alloc_tramp" :foreign))))
+(defun allocation-tramp (type alloc-tn size back-label)
+  (when (integerp size)
+    (load-immediate-word alloc-tn size))
+  ;; Using the native stack is OK - the register values have fixnum nature.
+  (inst word (logior #xe92d0000 ; PUSH {rN, lr}
+                     (ash 1 (if (integerp size) (tn-offset alloc-tn) (tn-offset size)))
+                     (ash 1 (tn-offset lr-tn))))
+  ;; select the C function index as per *LINKAGE-SPACE-PREDEFINED-ENTRIES*
+  (let ((index (if (eq type 'list) 1 0)))
+    (inst ldr alloc-tn (@ null-tn (- (linkage-table-entry-address index)
+                                     nil-value))))
+  (inst blx alloc-tn)
+  (inst word (logior #xe8bd0000 ; POP {rN, lr}
+                     (ash 1 (tn-offset alloc-tn))
+                     (ash 1 (tn-offset lr-tn))))
+  (inst b back-label))
 
-(defmacro allocation (result-tn size lowtag &key flag-tn
-                                                 stack-allocate-p)
+(defun allocation (type size lowtag result-tn &key flag-tn stack-allocate-p)
   ;; Normal allocation to the heap.
-  (once-only ((result-tn result-tn)
-              (size size)
-              (lowtag lowtag)
-              (flag-tn flag-tn)
-              (stack-allocate-p stack-allocate-p))
-    `(cond (,stack-allocate-p
-            (load-csp ,result-tn)
-            (inst tst ,result-tn lowtag-mask)
-            (inst add :ne ,result-tn ,result-tn n-word-bytes)
-            (if (integerp ,size)
-                (composite-immediate-instruction add ,flag-tn ,result-tn ,size)
-                (inst add ,flag-tn ,result-tn ,size))
-            (store-csp ,flag-tn)
-            ;; :ne is from TST above, this needs to be done after the
-            ;; stack pointer has been stored.
-            (storew null-tn ,result-tn -1 0 :ne)
-            (inst orr ,result-tn ,result-tn ,lowtag))
-           #-gencgc
-           (t
-            (load-symbol-value ,flag-tn *allocation-pointer*)
-            (inst add ,result-tn ,flag-tn ,lowtag)
-            (if (integerp ,size)
-                (composite-immediate-instruction add ,flag-tn ,flag-tn ,size)
-                (inst add ,flag-tn ,flag-tn ,size))
-            (store-symbol-value ,flag-tn *allocation-pointer*))
-           #+gencgc
-           (t
-            (let ((fixup (gen-label))
-                  (alloc (gen-label))
-                  (back-from-alloc (gen-label)))
-              (inst load-from-label ,flag-tn ,flag-tn FIXUP)
-              (loadw ,result-tn ,flag-tn)
-              (loadw ,flag-tn ,flag-tn 1)
-              (if (integerp ,size)
-                  (composite-immediate-instruction add ,result-tn ,result-tn ,size)
-                  (inst add ,result-tn ,result-tn ,size))
-              (inst cmp ,result-tn ,flag-tn)
-              (inst b :hi ALLOC)
-              (inst load-from-label ,flag-tn ,flag-tn FIXUP)
-              (storew ,result-tn ,flag-tn)
+  (cond (stack-allocate-p
+         (load-csp result-tn)
+         (inst tst result-tn lowtag-mask)
+         (inst add :ne result-tn result-tn n-word-bytes)
+         (if (integerp size)
+             (composite-immediate-instruction add flag-tn result-tn size)
+             (inst add flag-tn result-tn size))
+         (store-csp flag-tn)
+         ;; :ne is from TST above, this needs to be done after the
+         ;; stack pointer has been stored.
+         (storew null-tn result-tn -1 0 :ne)
+         (inst orr result-tn result-tn lowtag))
+        #-gencgc
+        (t
+         (load-symbol-value flag-tn *allocation-pointer*)
+         (inst add result-tn flag-tn lowtag)
+         (if (integerp size)
+             (composite-immediate-instruction add flag-tn flag-tn size)
+             (inst add flag-tn flag-tn size))
+         (store-symbol-value flag-tn *allocation-pointer*))
+        #+gencgc
+        (t
+         (let ((region-disp (- boxed-region nil-value))
+               (alloc (gen-label))
+               (back-from-alloc (gen-label)))
+           (inst ldr result-tn (@ null-tn region-disp)) ; free ptr
+           (inst ldr flag-tn (@ null-tn (+ region-disp n-word-bytes))) ; end ptr
+           (if (integerp size)
+               (composite-immediate-instruction add result-tn result-tn size)
+               (inst add result-tn result-tn size))
+           (inst cmp result-tn flag-tn)
+           (inst b :hi ALLOC)
+           (inst str result-tn (@ null-tn region-disp)) ; free ptr
 
-              (if (integerp ,size)
-                  (composite-immediate-instruction sub ,result-tn ,result-tn ,size)
-                  (inst sub ,result-tn ,result-tn ,size))
+           (if (integerp size)
+               (composite-immediate-instruction sub result-tn result-tn size)
+               (inst sub result-tn result-tn size))
 
-              (emit-label BACK-FROM-ALLOC)
-              (when ,lowtag
-                (inst orr ,result-tn ,result-tn ,lowtag))
+           (emit-label BACK-FROM-ALLOC)
+           (when lowtag
+             (inst orr result-tn result-tn lowtag))
 
-              (assemble (:elsewhere)
-                (emit-label ALLOC)
-                (allocation-tramp ,result-tn ,size BACK-FROM-ALLOC)
-                (emit-label FIXUP)
-                (inst word (make-fixup "gc_alloc_region" :foreign))))))))
+           (assemble (:elsewhere)
+             (emit-label ALLOC)
+             (allocation-tramp type result-tn size BACK-FROM-ALLOC))))))
 
 (defmacro with-fixed-allocation ((result-tn flag-tn type-code size
                                             &key (lowtag other-pointer-lowtag)
@@ -286,7 +277,7 @@
   (once-only ((result-tn result-tn) (flag-tn flag-tn)
               (type-code type-code) (size size) (lowtag lowtag))
     `(pseudo-atomic (,flag-tn)
-       (allocation ,result-tn (pad-data-block ,size) ,lowtag
+       (allocation nil (pad-data-block ,size) ,lowtag ,result-tn
                    :flag-tn ,flag-tn
                    :stack-allocate-p ,stack-allocate-p)
        (when ,type-code

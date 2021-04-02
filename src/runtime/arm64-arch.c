@@ -23,7 +23,7 @@
 #include "interr.h"
 #include "breakpoint.h"
 #include "monitor.h"
-#include "pseudo-atomic.h"
+#include "getallocptr.h"
 
 os_vm_address_t arch_get_bad_addr(int sig, siginfo_t *code, os_context_t *context)
 {
@@ -32,7 +32,7 @@ os_vm_address_t arch_get_bad_addr(int sig, siginfo_t *code, os_context_t *contex
 
 void arch_skip_instruction(os_context_t *context)
 {
-    u32 trap_instruction = *((u32 *)*os_context_pc_addr(context));
+    uint32_t trap_instruction = *((uint32_t *)*os_context_pc_addr(context));
     unsigned code = trap_instruction >> 5 & 0xFF;
     *os_context_pc_addr(context) += 4;
     switch (code)
@@ -63,7 +63,7 @@ boolean arch_pseudo_atomic_atomic(os_context_t *context)
      * to arch_pseudo_atomic_atomic, but this seems clearer.
      * --NS 2007-05-15 */
 #ifdef LISP_FEATURE_GENCGC
-    return get_pseudo_atomic_atomic(arch_os_get_current_thread());
+    return get_pseudo_atomic_atomic(get_sb_vm_thread());
 #else
     return (!foreign_function_call_active)
         && (NIL != SymbolValue(PSEUDO_ATOMIC_ATOMIC,0));
@@ -72,12 +72,12 @@ boolean arch_pseudo_atomic_atomic(os_context_t *context)
 
 void arch_set_pseudo_atomic_interrupted(os_context_t *context)
 {
-    set_pseudo_atomic_interrupted(arch_os_get_current_thread());
+    set_pseudo_atomic_interrupted(get_sb_vm_thread());
 }
 
 void arch_clear_pseudo_atomic_interrupted(os_context_t *context)
 {
-    clear_pseudo_atomic_interrupted(arch_os_get_current_thread());
+    clear_pseudo_atomic_interrupted(get_sb_vm_thread());
 }
 
 unsigned int arch_install_breakpoint(void *pc)
@@ -119,7 +119,7 @@ arch_handle_single_step_trap(os_context_t *context, int trap)
 static void
 sigtrap_handler(int signal, siginfo_t *siginfo, os_context_t *context)
 {
-    u32 trap_instruction = *((u32 *)*os_context_pc_addr(context));
+    uint32_t trap_instruction = *((uint32_t *)*os_context_pc_addr(context));
     unsigned code = trap_instruction >> 5 & 0xFF;
     if ((trap_instruction >> 21) != 0x6A1) {
         lose("Unrecognized trap instruction %08lx in sigtrap_handler() (PC: %p)",
@@ -136,12 +136,10 @@ sigill_handler(int signal, siginfo_t *siginfo, os_context_t *context) {
 
 void arch_install_interrupt_handlers()
 {
-    undoably_install_low_level_interrupt_handler(SIGTRAP, sigtrap_handler);
-    undoably_install_low_level_interrupt_handler(SIGILL, sigill_handler);
+    ll_install_handler(SIGTRAP, sigtrap_handler);
+    ll_install_handler(SIGILL, sigill_handler);
 }
 
-
-#ifdef LISP_FEATURE_LINKAGE_TABLE
 
 /* Linkage tables
  *
@@ -150,11 +148,14 @@ void arch_install_interrupt_handlers()
 
 #define LINKAGE_TEMP_REG reg_NL9
 
-void arch_write_linkage_table_entry(char *reloc_addr, void *target_addr, int datap)
+void arch_write_linkage_table_entry(int index, void *target_addr, int datap)
 {
+  THREAD_JIT(0);
+  char *reloc_addr = (char*)LINKAGE_TABLE_SPACE_START + index * LINKAGE_TABLE_ENTRY_SIZE;
+
   if (datap) {
     *(unsigned long *)reloc_addr = (unsigned long)target_addr;
-    return;
+    goto DONE;
   }
   /*
     ldr reg,=address
@@ -178,5 +179,7 @@ void arch_write_linkage_table_entry(char *reloc_addr, void *target_addr, int dat
   *(unsigned long *)inst_ptr++ = (unsigned long)target_addr;
 
   os_flush_icache((os_vm_address_t) reloc_addr, (char*) inst_ptr - reloc_addr);
+
+ DONE:
+  THREAD_JIT(1);
 }
-#endif

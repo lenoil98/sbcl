@@ -88,7 +88,7 @@
      ;; These are needed by the blitting code.
      (:temp dest any-reg nl2-offset) ;; Not live concurrent with ARGS.
      (:temp count any-reg nl3-offset)
-     (:temp temp descriptor-reg r8-offset)
+     (:temp temp descriptor-reg r9-offset)
      (:temp lip interior-reg lr-offset)
 
      ;; These are needed so we can get at the register args.
@@ -146,7 +146,7 @@
 (define-assembly-routine (throw
                              (:return-style :none))
     ((:arg target descriptor-reg r0-offset)
-     (:arg start any-reg r8-offset)
+     (:arg start any-reg r9-offset)
      (:arg count any-reg nargs-offset)
      (:temp catch any-reg r1-offset)
      (:temp tag descriptor-reg r2-offset))
@@ -159,9 +159,7 @@
   (let ((error (generate-error-code nil 'unseen-throw-tag-error target)))
     (inst cbz catch error))
 
-  #.(assert (and (= catch-block-previous-catch-slot 4)
-                 (= catch-block-tag-slot 5)))
-  (inst ldp tmp-tn tag (@ catch (* 4 n-word-bytes)))
+  (loadw-pair tmp-tn catch-block-previous-catch-slot tag catch-block-tag-slot catch)
   (inst cmp tag target)
   (inst b :eq DONE)
   (inst mov catch tmp-tn)
@@ -172,29 +170,45 @@
 
 (define-assembly-routine (unwind
                           (:return-style :none)
-                          (:translate %continue-unwind)
+                          (:translate %unwind)
                           (:policy :fast-safe))
     ((:arg block (any-reg descriptor-reg) r0-offset)
-     (:arg start (any-reg descriptor-reg) r8-offset)
+     (:arg start (any-reg descriptor-reg) r9-offset)
      (:arg count (any-reg descriptor-reg) nargs-offset)
      (:temp ocfp any-reg ocfp-offset)
      (:temp lra descriptor-reg lexenv-offset)
      (:temp cur-uwp any-reg nl2-offset)
-     (:temp lip interior-reg lr-offset))
+     (:temp lip interior-reg lr-offset)
+     (:temp next-uwp any-reg nl3-offset)
+     ;; for unbind-to-here
+     (:temp where any-reg r1-offset)
+     (:temp symbol descriptor-reg r2-offset)
+     (:temp value descriptor-reg r3-offset))
   (declare (ignore start count))
   (let ((error (generate-error-code nil 'invalid-unwind-error)))
     (inst cbz block error))
   (load-tl-symbol-value cur-uwp *current-unwind-protect-block*)
   (loadw ocfp block unwind-block-uwp-slot)
+  (inst mov next-uwp cur-uwp)
   (inst cmp cur-uwp ocfp)
   (inst b :eq EQ)
-  (loadw ocfp cur-uwp unwind-block-uwp-slot)
-  (store-tl-symbol-value ocfp *current-unwind-protect-block*)
+  (loadw next-uwp cur-uwp unwind-block-uwp-slot)
   EQ
   (inst csel cur-uwp block cur-uwp :eq)
+  (loadw where cur-uwp unwind-block-bsp-slot)
+  (unbind-to-here where symbol value tmp-tn)
 
-  #.(assert (and (= unwind-block-cfp-slot 1)
-                 (= unwind-block-code-slot 2)))
-  (inst ldp cfp-tn code-tn (@ cur-uwp n-word-bytes))
+  (store-tl-symbol-value next-uwp *current-unwind-protect-block*)
+  (loadw-pair cfp-tn unwind-block-cfp-slot code-tn unwind-block-code-slot cur-uwp)
+
+  (loadw next-uwp cur-uwp unwind-block-current-catch-slot)
+  (store-tl-symbol-value next-uwp *current-catch-block*)
+
+  (loadw-pair tmp-tn unwind-block-nfp-slot next-uwp unwind-block-nsp-slot cur-uwp)
+  (inst mov-sp nsp-tn next-uwp)
+  (inst cbz tmp-tn SKIP)
+  (inst mov (make-random-tn :kind :normal :sc (sc-or-lose 'any-reg) :offset nfp-offset) tmp-tn)
+  SKIP
+
   (loadw lra cur-uwp unwind-block-entry-pc-slot)
   (lisp-return lra lip :known))

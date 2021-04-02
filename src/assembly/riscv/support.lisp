@@ -11,27 +11,21 @@
 
 (in-package "SB-VM")
 
-(defun invoke-asm-routine (routine &optional tailp)
-  (inst jal (if tailp zero-tn lr-tn) (make-fixup routine :assembly-routine)))
+;;; Make sure to always write back into our return register so that
+;;; backtracing in assembly routines work correctly.
+(defun invoke-asm-routine (routine)
+  (inst jal lip-tn (make-fixup routine :assembly-routine)))
 
 (defun generate-call-sequence (name style vop options)
   (declare (ignore vop options))
   (ecase style
-    (:none
+    ((:none :raw)
      (values
-      `((inst j (make-fixup ',name :assembly-routine)))
-      `()))
-    (:raw
-     (values
-      `((inst jal lr-tn (make-fixup ',name :assembly-routine)))
+      `((inst jal lip-tn (make-fixup ',name :assembly-routine)))
       `()))))
 
 (defun generate-return-sequence (style)
   (ecase style
     (:none)
     (:raw
-     `((inst jalr zero-tn lr-tn 0)))))
-
-#-sb-xc-host ; CONTEXT-REGISTER is not defined at xc-time
-(defun return-machine-address (scp)
-  (context-register scp lr-offset))
+     `((inst jalr zero-tn lip-tn 0)))))

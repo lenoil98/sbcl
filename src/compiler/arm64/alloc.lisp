@@ -40,8 +40,8 @@
                         temp)))))
              (let* ((cons-cells (if star (1- num) num))
                     (alloc (* (pad-data-block cons-size) cons-cells)))
-               (pseudo-atomic (pa-flag)
-                 (allocation res alloc list-pointer-lowtag
+               (pseudo-atomic (pa-flag :sync nil)
+                 (allocation 'list alloc list-pointer-lowtag res
                              :flag-tn pa-flag
                              :stack-allocate-p (node-stack-allocate-p node)
                              :lip lip)
@@ -95,8 +95,7 @@
     (let* ((size (+ length closure-info-offset))
            (alloc-size (pad-data-block size)))
       (pseudo-atomic (pa-flag)
-        (allocation result alloc-size
-                    fun-pointer-lowtag
+        (allocation nil alloc-size fun-pointer-lowtag result
                     :flag-tn pa-flag
                     :stack-allocate-p stack-allocate-p
                     :lip lip)
@@ -152,19 +151,18 @@
 (define-vop (var-alloc)
   (:args (extra :scs (any-reg)))
   (:arg-types positive-fixnum)
-  (:info name words type lowtag)
-  (:ignore name)
+  (:info name words type lowtag stack-allocate-p)
+  (:ignore name stack-allocate-p)
   (:results (result :scs (descriptor-reg)))
   (:temporary (:scs (any-reg) :from :argument) bytes)
   (:temporary (:sc non-descriptor-reg) pa-flag header)
   (:temporary (:scs (interior-reg)) lip)
   (:generator 6
-    #+cheneygc (bug "cheneygc not working for arm64")
     ;; Build the object header, assuming that the header was in WORDS
     ;; but should not be in the header
     (inst lsl bytes extra (- word-shift n-fixnum-tag-bits))
     (inst add bytes bytes (add-sub-immediate (* (1- words) n-word-bytes)))
-    (inst lsl header bytes (- n-widetag-bits word-shift))
+    (inst lsl header bytes (- (length-field-shift type) word-shift))
     (inst add header header type)
     ;; Add the object header to the allocation size and round up to
     ;; the allocation granularity
@@ -172,5 +170,5 @@
     (inst and bytes bytes (bic-mask lowtag-mask))
     ;; Allocate the object and set its header
     (pseudo-atomic (pa-flag)
-      (allocation result bytes lowtag :flag-tn pa-flag :lip lip)
+      (allocation nil bytes lowtag result :flag-tn pa-flag :lip lip)
       (storew header result 0 lowtag))))

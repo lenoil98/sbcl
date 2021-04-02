@@ -262,10 +262,6 @@
 ;;;   :POLICY - A form which is supplied to the POLICY macro to determine
 ;;;             whether this transformation is appropriate. If the result
 ;;;             is false, then the transform automatically gives up.
-;;;   :EVAL-NAME
-;;;           - The name and argument/result types are actually forms to be
-;;;             evaluated. Useful for getting closures that transform similar
-;;;             functions.
 ;;;   :DEFUN-ONLY
 ;;;           - Don't actually instantiate a transform, instead just DEFUN
 ;;;             Name with the specified transform definition function. This
@@ -279,11 +275,9 @@
 (defmacro deftransform (name (lambda-list &optional (arg-types '*)
                                           (result-type '*)
                                           &key result policy node defun-only
-                                          eval-name (important :slightly))
+                                          (important :slightly))
                              &body body-decls-doc)
   (declare (type (member nil :slightly t) important))
-  (when (and eval-name defun-only)
-    (error "can't specify both DEFUN-ONLY and EVAL-NAME"))
   (multiple-value-bind (body decls doc) (parse-body body-decls-doc t)
     (let ((n-node (or node (make-symbol "NODE")))
           (n-decls (sb-xc:gensym))
@@ -298,9 +292,7 @@
                   (declare (ignorable ,@(mapcar #'car bindings)))
                   (declare (lambda-list (node)))
                   ,@decls
-                  ,@(and defun-only
-                         doc
-                         `(,doc))
+                  ,@(and defun-only doc `(,doc))
                   ;; What purpose does it serve to allow the transform's body
                   ;; to return decls as a second value? They would go in the
                   ;; right place if simply returned as part of the expression.
@@ -316,12 +308,9 @@
           (if defun-only
               `(defun ,name ,@stuff)
               `(%deftransform
-                ,(if eval-name name `',name)
-                ,(if eval-name
-                     ``(function ,,arg-types ,,result-type)
-                     `'(function ,arg-types ,result-type))
-                (named-lambda ,(if eval-name "xform" `(deftransform ,name))
-                  ,@stuff)
+                ',name
+                '(function ,arg-types ,result-type)
+                (named-lambda (deftransform ,name) ,@stuff)
                 ,doc
                 ,important
                 ,(and policy
@@ -378,8 +367,7 @@
                               &optional (node (sb-xc:gensym) node-p)
                               &rest vars)
                         &body body)
-  (binding* ((name
-              (flet ((function-name (name)
+  (let ((name (flet ((function-name (name)
                        (etypecase name
                          (symbol name)
                          ((cons (eql setf) (cons symbol null))
@@ -387,32 +375,49 @@
                 (if (symbolp what)
                     what
                     (symbolicate (function-name (first what))
-                                 "-" (second what) "-OPTIMIZER"))))
-             ((forms decls) (parse-body body nil))
-             ((var-decls more-decls) (extract-var-decls decls vars))
-             ;; In case the BODY declares IGNORE of the formal NODE var,
-             ;; we rebind it from N-NODE and never reference it from BINDS.
-             (n-node (make-symbol "NODE"))
-             ((binds lambda-vars gensyms)
-              (parse-deftransform lambda-list n-node
-                                  `(return-from ,name nil))))
-    (declare (ignore lambda-vars))
-    `(progn
-       ;; We can't stuff the BINDS as &AUX vars into the lambda list
-       ;; because there can be a RETURN-FROM in there.
-       (defun ,name (,n-node ,@vars)
-         ,@(if var-decls (list var-decls))
-         (let* (,@binds ,@(if node-p `((,node ,n-node))))
-           ;; Syntax requires naming NODE even if undesired if VARS
-           ;; are present, so in that case make NODE ignorable.
-           (declare (ignorable ,@(if (and vars node-p) `(,node))
-                               ,@gensyms))
-           ,@more-decls ,@forms))
-       ,@(when (consp what)
-           `((setf (,(let ((*package* (sb-xc:symbol-package 'fun-info)))
-                          (symbolicate "FUN-INFO-" (second what)))
-                       (fun-info-or-lose ',(first what)))
-                      #',name))))))
+                                 "-"
+                                 (if (consp (second what))
+                                     (caadr what)
+                                     (second what))
+                                 "-OPTIMIZER")))))
+    (if (typep what '(cons (eql vop-optimize)))
+        `(progn
+           (defun ,name (,lambda-list)
+             ,@body)
+           ,@(loop for vop-name in (ensure-list (second what))
+                   collect
+                   `(setf (vop-info-optimizer (template-or-lose ',vop-name))
+                          #',name)))
+        (binding* (((forms decls) (parse-body body nil))
+                   ((var-decls more-decls) (extract-var-decls decls vars))
+                   ;; In case the BODY declares IGNORE of the formal NODE var,
+                   ;; we rebind it from N-NODE and never reference it from BINDS.
+                   (n-node (make-symbol "NODE"))
+                   ((binds lambda-vars gensyms)
+                    (parse-deftransform lambda-list n-node
+                                        `(return-from ,name
+                                           ,(if (and (consp what)
+                                                     (eq (second what)
+                                                         'equality-constraint))
+                                                :give-up
+                                                nil)))))
+          (declare (ignore lambda-vars))
+          `(progn
+             ;; We can't stuff the BINDS as &AUX vars into the lambda list
+             ;; because there can be a RETURN-FROM in there.
+             (defun ,name (,n-node ,@vars)
+               ,@(if var-decls (list var-decls))
+               (let* (,@binds ,@(if node-p `((,node ,n-node))))
+                 ;; Syntax requires naming NODE even if undesired if VARS
+                 ;; are present, so in that case make NODE ignorable.
+                 (declare (ignorable ,@(if (and vars node-p) `(,node))
+                                     ,@gensyms))
+                 ,@more-decls ,@forms))
+             ,@(when (consp what)
+                 `((setf (,(let ((*package* (sb-xc:symbol-package 'fun-info)))
+                             (symbolicate "FUN-INFO-" (second what)))
+                          (fun-info-or-lose ',(first what)))
+                         #',name))))))))
 
 ;;;; IR groveling macros
 
@@ -428,7 +433,7 @@
 (defmacro do-blocks ((block-var component &optional ends result) &body body)
   (unless (member ends '(nil :head :tail :both))
     (error "losing ENDS value: ~S" ends))
-  (let ((n-component (gensym))
+  (let ((n-component (sb-xc:gensym))
         (n-tail (gensym)))
     `(let* ((,n-component ,component)
             (,n-tail ,(if (member ends '(:both :tail))
@@ -444,7 +449,7 @@
 (defmacro do-blocks-backwards ((block-var component &optional ends result) &body body)
   (unless (member ends '(nil :head :tail :both))
     (error "losing ENDS value: ~S" ends))
-  (let ((n-component (gensym))
+  (let ((n-component (sb-xc:gensym))
         (n-head (gensym)))
     `(let* ((,n-component ,component)
             (,n-head ,(if (member ends '(:both :head))
@@ -591,26 +596,19 @@
         (clrhash ,source-paths)))))
 
 ;;; Bind the hashtables used for keeping track of global variables,
-;;; functions, etc. Also establish condition handlers.
+;;; functions, etc.
 (defmacro with-ir1-namespace (&body forms)
-  `(let ((*free-vars* (make-hash-table :test 'eq))
-         (*free-funs* (make-hash-table :test 'equal))
-         (*constants* (make-hash-table :test 'equal)))
-     (unwind-protect
-          (progn ,@forms)
-       (clrhash *free-funs*)
-       (clrhash *free-vars*)
-       (clrhash *constants*))))
+  `(let ((*ir1-namespace* (make-ir1-namespace))) ,@forms))
 
 ;;; Look up NAME in the lexical environment namespace designated by
 ;;; SLOT, returning the <value, T>, or <NIL, NIL> if no entry. The
 ;;; :TEST keyword may be used to determine the name equality
 ;;; predicate.
-(defmacro lexenv-find (name slot &key test)
-  (once-only ((n-res `(assoc ,name (,(let ((*package* (sb-xc:symbol-package 'lexenv-funs)))
-                                          (symbolicate "LEXENV-" slot))
-                                     *lexenv*)
-                             :test ,(or test '#'eq))))
+(defmacro lexenv-find (name slot &key (lexenv '*lexenv*) test
+                                 &aux (accessor (package-symbolicate
+                                                 (cl:symbol-package 'lexenv-funs)
+                                                 "LEXENV-" slot)))
+  (once-only ((n-res `(assoc ,name (,accessor ,lexenv) :test ,(or test '#'eq))))
     `(if ,n-res
          (values (cdr ,n-res) t)
          (values nil nil))))
@@ -648,6 +646,7 @@
   ;; If true, a function that gets called with the node that the event
   ;; happened to.
   (action nil :type (or function null)))
+(declaim (freeze-type event-info))
 
 ;;; A hashtable from event names to event-info structures.
 (define-load-time-global *event-info* (make-hash-table :test 'eq))
@@ -748,7 +747,7 @@
 ;;;; functions on directly-linked lists (linked through specialized
 ;;;; NEXT operations)
 
-#-sb-fluid (declaim (inline find-in position-in))
+(declaim (inline find-in position-in))
 
 ;;; Find ELEMENT in a null-terminated LIST linked by the accessor
 ;;; function NEXT. KEY and TEST are the same as for generic sequence functions.
@@ -784,7 +783,7 @@
 
 (defmacro deletef-in (next place item &environment env)
   (multiple-value-bind (temps vals stores store access)
-      (#+sb-xc sb-xc:get-setf-expansion #-sb-xc get-setf-expansion place env)
+      (#-sb-xc-host get-setf-expansion #+sb-xc-host cl:get-setf-expansion place env)
     (when (cdr stores)
       (error "multiple store variables for ~S" place))
     (let ((n-item (gensym))
@@ -810,7 +809,7 @@
 ;;;
 (defmacro push-in (next item place &environment env)
   (multiple-value-bind (temps vals stores store access)
-      (#+sb-xc sb-xc:get-setf-expansion #-sb-xc get-setf-expansion place env)
+      (#-sb-xc-host get-setf-expansion #+sb-xc-host cl:get-setf-expansion place env)
     (when (cdr stores)
       (error "multiple store variables for ~S" place))
     `(let (,@(mapcar #'list temps vals)

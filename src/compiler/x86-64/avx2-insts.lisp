@@ -1,9 +1,5 @@
 (in-package "SB-X86-64-ASM")
 
-(defun !make-avx2-id (index)
-  (declare (type (mod 16) index))
-  (logior (ash index 3) 3))
-
 (defun get-avx2 (number)
   (svref (load-time-value
           (coerce (loop for i from 0 below 16
@@ -38,6 +34,22 @@
   :prefilter #'prefilter-xmmreg/mem
   :printer #'print-ymmreg/mem)
 
+(define-arg-type sized-xmmreg/mem
+  :prefilter #'prefilter-xmmreg/mem
+  :printer #'print-sized-xmmreg/mem)
+(define-arg-type sized-byte-xmmreg/mem
+  :prefilter #'prefilter-xmmreg/mem
+  :printer #'print-sized-byte-xmmreg/mem)
+(define-arg-type sized-word-xmmreg/mem
+  :prefilter #'prefilter-xmmreg/mem
+  :printer #'print-sized-word-xmmreg/mem)
+(define-arg-type sized-dword-xmmreg/mem
+  :prefilter #'prefilter-xmmreg/mem
+  :printer #'print-sized-dword-xmmreg/mem)
+(define-arg-type sized-xmmreg/mem-default-qword
+  :prefilter #'prefilter-xmmreg/mem
+  :printer #'print-sized-xmmreg/mem-default-qword)
+
 (defconstant +vex-l+ #b10000000000)
 
 (define-arg-type vex-l
@@ -59,6 +71,18 @@
 (define-arg-type vex-b
   :prefilter  (lambda (dstate value)
                 (dstate-setprop dstate (if (plusp value) 0 +rex-b+))))
+
+(defconstant-eqx +avx-conditions+
+    #(:eq :lt :le :unord :neq :nlt :nle :ord :eq_uq
+      :nge :ngt :false :neq_oq :ge :gt :true :eq_os :lt_oq
+      :le_oq :unord_s :neq_us :nlt_uq :nle_uq :ord_s :eq_us
+      :nge_uq :ngt_uq :false_os :neq_os :ge_oq :gt_oq :true_us)
+  #'equalp)
+
+(define-arg-type avx-condition-code
+  :type 'imm-byte
+  :printer +avx-conditions+)
+
 
 (define-instruction-format (vex2 16)
                            (vex :field (byte 8 0) :value #xC5)
@@ -209,10 +233,12 @@
                  ((xmm-register-p r)
                   0))))
     (let ((l (cond (l)
-                   ((xmm-register-p thing) ;; FIXME: provide some sort of checking for mismatched sizes
+                   (reg
+                    (xmm-size reg))
+                   ((xmm-register-p thing)
                     (xmm-size thing))
                    (t
-                    (xmm-size reg))))
+                    0)))
           (r (if (null reg)
                  0
                  (reg-7-p (reg-id reg))))
@@ -261,6 +287,8 @@
   (emit-bytes segment opcode)
   (when is4
     (incf remaining-bytes))
+  ;; FIXME: :xmm-index should be removed and we should alter the EA
+  ;; to have the proper FPR as the index reg when appropriate.
   (emit-ea segment thing reg :remaining-bytes remaining-bytes :xmm-index vm)
   (when is4
     (emit-byte segment (ash (reg-id-num (reg-id is4)) 4))))
@@ -282,6 +310,7 @@
                                  &key more-fields printer
                                       (opcode-prefix #x0F)
                                       reg-mem-size
+                                      xmmreg-mem-size
                                       w
                                       l
                                       nds)
@@ -290,13 +319,20 @@
                     (op ,opcode)
                     ,@(and w `((w ,w)))
                     ,@(and l `((l ,l)))
-                    ,@(and reg-mem-size
-                           `((reg/mem nil :type ',(case reg-mem-size
-                                                    (:qword 'sized-reg/mem-default-qword)
-                                                    (:dword 'sized-dword-reg/mem)
-                                                    (:word 'sized-word-reg/mem)
-                                                    (:byte 'sized-byte-reg/mem)
-                                                    (:sized 'sized-reg/mem)))))
+                    ,@(cond (xmmreg-mem-size
+                             `((reg/mem nil :type ',(case xmmreg-mem-size
+                                                      (:qword 'sized-xmmreg/mem-default-qword)
+                                                      (:dword 'sized-dword-xmmreg/mem)
+                                                      (:word 'sized-word-xmmreg/mem)
+                                                      (:byte 'sized-byte-xmmreg/mem)
+                                                      (:sized 'sized-xmmreg/mem)))))
+                            (reg-mem-size
+                             `((reg/mem nil :type ',(case reg-mem-size
+                                                      (:qword 'sized-reg/mem-default-qword)
+                                                      (:dword 'sized-dword-reg/mem)
+                                                      (:word 'sized-word-reg/mem)
+                                                      (:byte 'sized-byte-reg/mem)
+                                                      (:sized 'sized-reg/mem))))))
                     ,@more-fields))
           (inst-formats (if (or (eql w 1)
                                 (/= opcode-prefix #x0F))
@@ -547,19 +583,21 @@
 
 (macrolet
     ((def (name prefix opcode)
-       `(define-instruction ,name (segment dst src src2)
-          ,@(avx2-inst-printer-list 'ymm-ymm/mem prefix opcode :nds t
-                                                               :opcode-prefix #x0f3a)
+       `(define-instruction ,name (segment dst src src2 imm)
+          ,@(avx2-inst-printer-list 'ymm-ymm/mem-imm prefix opcode :opcode-prefix #x0f3a)
           (:emitter
            (emit-avx2-inst segment src2 dst ,prefix ,opcode
                            :opcode-prefix #x0f3a
-                           :vvvv src))))
+                           :vvvv src)
+           (emit-byte segment imm))))
      (def-two (name prefix opcode)
-       `(define-instruction ,name (segment dst src)
-          ,@(avx2-inst-printer-list 'ymm-ymm/mem prefix opcode :opcode-prefix #x0f3a)
+       `(define-instruction ,name (segment dst src imm)
+          ,@(avx2-inst-printer-list 'ymm-ymm/mem-imm prefix opcode :opcode-prefix #x0f3a
+                                    :printer '(:name :tab reg ", " reg/mem ", " imm))
           (:emitter
            (emit-avx2-inst segment src dst ,prefix ,opcode
-                           :opcode-prefix #x0f3a)))))
+                           :opcode-prefix #x0f3a)
+           (emit-byte segment imm)))))
   (def-two vroundps #x66 #x08)
   (def-two vroundpd #x66 #x09)
   (def-two vroundss #x66 #x0a)
@@ -580,6 +618,25 @@
   (def-two vpcmpistri #x66 #x63)
 
   (def-two vaeskeygenassist #x66 #xdf))
+
+(macrolet ((def (name prefix opcode
+                 name-suffix)
+             `(define-instruction ,name (segment condition dst src src2)
+                ,@(avx2-inst-printer-list 'ymm-ymm/mem-imm prefix opcode
+                                          :more-fields `((imm nil :type 'avx-condition-code))
+                                          :printer `("VCMP" imm ,name-suffix
+                                                            :tab reg ", " vvvv ", " reg/mem))
+                (:emitter
+                 (emit-avx2-inst segment src2 dst ,prefix ,opcode
+                                 :vvvv src)
+                 (emit-byte segment (or (position condition +avx-conditions+)
+                                        (error "~s not one of ~s"
+                                               condition
+                                               +avx-conditions+)))))))
+  (def vcmppd #x66 #xc2 "PD")
+  (def vcmpps nil  #xc2 "PS")
+  (def vcmpsd #xf2 #xc2 "SD")
+  (def vcmpss #xf3 #xc2 "SS"))
 
 (macrolet ((def (name prefix op)
              `(define-instruction ,name (segment dst src src2 mask)
@@ -838,34 +895,33 @@
 (define-instruction vzeroupper (segment)
   (:printer vex2-op ((op #x77) (l 0) (r 1) (pp 0)))
   (:emitter
-   (emit-two-byte-vex segment 0 #b1111 0 nil)
+   (emit-two-byte-vex segment 0 0 0 nil)
    (emit-byte segment #x77)))
 
 (define-instruction vzeroall (segment)
   (:printer vex2-op ((op #x77) (l 1) (r 1) (pp 0)))
   (:emitter
-   (emit-two-byte-vex segment 0 #b1111 1 nil)
+   (emit-two-byte-vex segment 0 0 1 nil)
    (emit-byte segment #x77)))
 
-(macrolet ((def (name opcode &optional l)
+(macrolet ((def (name opcode &optional l (mem-size :qword))
              `(define-instruction ,name (segment dst src)
                 ,@(avx2-inst-printer-list 'ymm-ymm/mem #x66 opcode
                                           :opcode-prefix #x0f38
-                                          ;;:reg-mem-size size FIXME
+                                          :xmmreg-mem-size mem-size
                                           :w 0 :l l)
                 (:emitter
-                 (aver (ea-p src))
                  (emit-avx2-inst segment src dst #x66 ,opcode
                                  :opcode-prefix #x0f38
                                  :w 0 :l ,l)))))
-  (def vbroadcastss #x18)
+  (def vbroadcastss #x18 nil :dword)
   (def vbroadcastsd #x19 1)
   (def vbroadcastf128 #x1a 1)
   (def vbroadcasti128 #x5a 1)
-  (def vbroadcastb #x78)
-  (def vbroadcastw #x79)
-  (def vbroadcastd #x58)
-  (def vbroadcastq #x59))
+  (def vpbroadcastb #x78 nil :byte)
+  (def vpbroadcastw #x79 nil :word)
+  (def vpbroadcastd #x58 nil :dword)
+  (def vpbroadcastq #x59))
 
 (macrolet ((def-insert (name prefix op)
              `(define-instruction ,name (segment dst src src2 imm)
@@ -1132,9 +1188,6 @@
   (:emitter
    (emit-avx2-inst segment src dst #x66 #x13
                    :opcode-prefix #x0f38
-                   :l (if (is-avx2-id-p (reg-id dst))
-                          1
-                          0)
                    :w 0))
   . #.(avx2-inst-printer-list 'ymm-ymm/mem #x66 #x13
                               :w 0
@@ -1144,9 +1197,6 @@
   (:emitter
    (emit-avx2-inst segment dst src #x66 #x1d
                    :opcode-prefix #x0f3a
-                   :l (if (is-avx2-id-p (reg-id src))
-                          1
-                          0)
                    :w 0
                    :remaining-bytes 1)
    (emit-byte segment imm))

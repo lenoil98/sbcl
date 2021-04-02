@@ -544,3 +544,82 @@
       (the single-float
        (labels ((%f () (the real p1))) (%f)))))
    ((-96088.234) -1.0)))
+
+(with-test (:name :inline-signum)
+  (assert (ctu:find-named-callees ; should be a full call
+           (compile nil '(lambda (x)
+                           (signum (truly-the number x))))))
+  ;; should not be a full call
+  (dolist (type '(integer
+                  (or (integer 1 10) (integer 50 90))
+                  rational
+                  single-float
+                  (or (single-float -10f0 0f0) (single-float 1f0 20f0))
+                  double-float
+                  (or (double-float -10d0 0d0) (double-float 1d0 20d0))))
+    (assert (null (ctu:find-named-callees
+                   (compile nil `(lambda (x)
+                                   (signum (truly-the ,type x))))))))
+  ;; check signed zero
+  (let ((f (compile nil '(lambda (x) (signum (the single-float x))))))
+    (assert (eql (funcall f -0f0) -0f0))
+    (assert (eql (funcall f +0f0) +0f0)))
+  (let ((f (compile nil '(lambda (x) (signum (the double-float x))))))
+    (assert (eql (funcall f -0d0) -0d0))
+    (assert (eql (funcall f +0d0) +0d0))))
+
+
+(with-test (:name :expt-double-no-complex)
+  (checked-compile-and-assert
+      (:allow-notes nil)
+      `(lambda (x y)
+         (> (expt (the double-float x) 4d0)
+            (the double-float y)))
+    ((1d0 0d0) t))
+  (checked-compile-and-assert
+      (:allow-notes nil)
+      `(lambda (x y)
+         (> (expt (the (double-float 0d0) x) (the double-float y))
+            y))
+    ((1d0 0d0) t)))
+
+(with-test (:name :ftruncate-inline
+            :skipped-on (not :64-bit))
+  (checked-compile
+   `(lambda (v d)
+      (declare (optimize speed)
+               (double-float d)
+               ((simple-array double-float (2)) v))
+      (setf (aref v 0) (ffloor (aref v 0) d))
+      v)
+   :allow-notes nil))
+
+(with-test (:name :ctype-of-nan)
+  (checked-compile '(lambda () #.(sb-kernel:make-single-float -1))))
+
+;; bug #1914094
+(with-test (:name :float-type-derivation :skipped-on (not :64-bit))
+  (labels ((car-type-equal (x y)
+             (and (subtypep (car x) (car y))
+                  (subtypep (car y) (car x)))))
+    (let ((long #+long-float 'long-float
+                #-long-float 'double-float))
+      (checked-compile-and-assert () '(lambda (x) (ctu:compiler-derived-type (* 3d0 x)))
+        ((1) (values `(or ,long (complex ,long)) t) :test #'car-type-equal))
+      (checked-compile-and-assert () '(lambda (x) (ctu:compiler-derived-type (* 3f0 x)))
+        ((1) (values `(or single-float ,long (complex single-float) (complex ,long)) t)
+         :test #'car-type-equal))
+      (checked-compile-and-assert () '(lambda (x) (ctu:compiler-derived-type (* 3f0 x)))
+        ((1) (values `(or single-float ,long (complex single-float) (complex ,long)) t)
+         :test #'car-type-equal))
+      (checked-compile-and-assert () '(lambda (x y) (ctu:compiler-derived-type (atan x y)))
+        ((1 2) (values `(or ,long single-float (complex ,long) (complex single-float)) t) :test #'car-type-equal)))))
+
+(with-test (:name :comparison-transform-overflow)
+  (checked-compile-and-assert
+   ()
+   `(lambda (a)
+      (declare (float a))
+      (= a 1854150818890592943838975159000134470424763027560))
+   ((1d0) nil)
+   ((1f0) nil)))

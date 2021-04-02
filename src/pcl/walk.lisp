@@ -301,20 +301,18 @@
   ;; if we're finding something in the real lexenv, we don't have a
   ;; bound declaration and so we specifically don't want to return
   ;; a special object that declarations can attach to, just the name.
-  (and env (find var (mapcar #'car (sb-c::lexenv-vars env)))))
+  (and env (find var (sb-c::lexenv-vars env) :key #'car)))
 
 (defun variable-symbol-macro-p (var env)
   ;; FIXME: crufty return convention
+  (declare (symbol var))
   (let ((entry (or (member var (env-lexical-variables env) :key #'car :test #'eq)
                    (and env (member var (sb-c::lexenv-vars env) :key #'car :test #'eq)))))
     (when (and (consp (cdar entry)) (eq (cadar entry) 'sb-sys:macro))
       (return-from variable-symbol-macro-p entry))
     (unless entry
-      (when (var-globally-symbol-macro-p var)
+      (when (eq (info :variable :kind var) :macro)
         (list (list* var 'sb-sys:macro (info :variable :macro-expansion var)))))))
-
-(defun var-globally-symbol-macro-p (var)
-  (eq (info :variable :kind var) :macro))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
 (defun walked-var-declaration-p (declaration)
@@ -413,16 +411,13 @@
 ;;;       interface to its walker which looks like the interface to this
 ;;;       walker.
 
-(defmacro get-walker-template-internal (x)
-  `(get ,x 'walker-template))
-
 (defmacro define-walker-template (name
                                   &optional (template '(nil repeat (eval))))
-  `(setf (get-walker-template-internal ',name) ',template))
+  `(setf (info :function :walker-template ',name) ',template))
 
 (defun get-walker-template (x context)
   (cond ((symbolp x)
-         (get-walker-template-internal x))
+         (info :function :walker-template x))
         ((and (listp x) (eq (car x) 'lambda))
          '(lambda repeat (eval)))
         (t
@@ -454,8 +449,6 @@
 (define-walker-template macrolet             walk-macrolet)
 (define-walker-template multiple-value-call  (nil eval repeat (eval)))
 (define-walker-template multiple-value-prog1 (nil return repeat (eval)))
-(define-walker-template multiple-value-setq  walk-multiple-value-setq)
-(define-walker-template multiple-value-bind  walk-multiple-value-bind)
 (define-walker-template progn                (nil repeat (eval)))
 (define-walker-template progv                (nil eval eval repeat (eval)))
 (define-walker-template quote                (nil quote))
@@ -466,15 +459,26 @@
 (define-walker-template the                  (nil quote eval))
 (define-walker-template throw                (nil eval eval))
 (define-walker-template unwind-protect       (nil return repeat (eval)))
+(define-walker-template defun                walk-defun)
 
 ;;; SBCL-only special forms
 (define-walker-template truly-the (nil quote eval))
 (define-walker-template sb-kernel:the* (nil quote eval))
+(define-walker-template sb-c::with-source-form (nil nil eval))
 ;;; FIXME: maybe we don't need this one any more, given that
 ;;; NAMED-LAMBDA now expands into (FUNCTION (NAMED-LAMBDA ...))?
 (define-walker-template named-lambda walk-named-lambda)
+#|
+;;; To find templateized symbols that aren't special operators:
+(do-all-symbols (s)
+  (let ((template
+         (sb-int:info :function :walker-template s)))
+    (when (and template (not (special-operator-p s)))
+      (format t "Why? ~S~%" s))))
+|#
 
 (defvar *walk-form-expand-macros-p* nil)
+(defvar *walk-form-preserve-source* nil)
 
 #+sb-fasteval
 (declaim (ftype (sfunction (sb-interpreter:basic-env &optional t) sb-kernel:lexenv)
@@ -522,7 +526,8 @@
             ((and (not (consp newform))
                   (or (eql context :eval)
                       (eql context :set)))
-             (let ((symmac (car (variable-symbol-macro-p newform env))))
+             (let ((symmac (and (symbolp newform)
+                                (car (variable-symbol-macro-p newform env)))))
                (if symmac
                    (let* ((newnewform (walk-form-internal (cddr symmac)
                                                           context
@@ -553,9 +558,12 @@
                         (let ((newnewnewform (walk-form-internal newnewform
                                                                  context
                                                                  env)))
-                          (if (eq newnewnewform newnewform)
-                              (if *walk-form-expand-macros-p* newnewform newform)
-                              newnewnewform)))
+                          (cond ((eq newnewnewform newnewform)
+                                 (if *walk-form-expand-macros-p* newnewform newform))
+                                (*walk-form-preserve-source*
+                                 `(sb-c::with-source-form ,newform
+                                    ,newnewnewform))
+                                (t newnewnewform))))
                        ((and (symbolp fn)
                              (special-operator-p fn))
                         ;; This shouldn't happen, since this walker is now
@@ -758,23 +766,15 @@
               new-env)))
       (relist* form let walked-bindings walked-body))))
 
-(defun let*-binding-name (binding)
-  (if (symbolp binding)
-      binding
-      (car binding)))
-
-(defun let*-binding-init (binding)
-  (if (or (symbolp binding)
-          (null (cdr binding)))
-      'no-init
-      (cadr binding)))
-
-(defun let*-bindings (bindings &aux names inits (seen (make-hash-table :test #'eq)))
+(defun let*-bindings (bindings &aux names inits (seen (alloc-xset)))
   (dolist (binding (reverse bindings) (values names inits))
-    (let ((name (let*-binding-name binding)))
-      (push (cons name (gethash name seen)) names)
-      (setf (gethash name seen) t)
-      (push (let*-binding-init binding) inits))))
+    (multiple-value-bind (name init)
+        (cond ((atom binding) (values binding 'no-init))
+              ((not (cdr binding)) (values (car binding) 'no-init))
+              (t (values (car binding) (cadr binding))))
+      (push (cons name (xset-member-p name seen)) names)
+      (add-to-xset name seen)
+      (push init inits))))
 
 (defun walk-let* (form context env)
   (walker-environment-bind (new-env env)
@@ -851,55 +851,24 @@
       (relist*
        form locally walked-body))))
 
-(defun walk-multiple-value-setq (form context env)
-  (let ((vars (cadr form)))
-    (if (some (lambda (var)
-                (variable-symbol-macro-p var env))
-              vars)
-        (let* ((temps (mapcar (lambda (var)
-                                (declare (ignore var))
-                                (gensym))
-                              vars))
-               (sets (mapcar (lambda (var temp) `(setq ,var ,temp))
-                             vars
-                             temps))
-               (expanded `(multiple-value-bind ,temps ,(caddr form)
-                             ,@sets))
-               (walked (walk-form-internal expanded context env)))
-          (if (eq walked expanded)
-              form
-              walked))
-        (walk-template form '(nil (repeat (set)) eval) context env))))
-
-(defun walk-multiple-value-bind (form context old-env)
-  (walker-environment-bind (new-env old-env)
-    (let* ((mvb (car form))
-           (bindings (cadr form))
-           (mv-form (walk-template (caddr form) 'eval context old-env))
-           (body (cdddr form))
-           walked-bindings
-           (walked-body
-             (walk-declarations
-               body
-               (lambda (real-body real-env)
-                 (setq walked-bindings
-                       (walk-bindings-1 bindings old-env new-env context))
-                 (walk-repeat-eval real-body real-env))
-               new-env)))
-      (relist* form mvb walked-bindings mv-form walked-body))))
-
 (defun walk-bindings-1 (bindings old-env new-env context)
   (and bindings
        (let ((binding (car bindings)))
          (recons bindings
-                 (if (symbolp binding)
+                 (typecase binding
+                   (symbol
                      (prog1 binding
-                       (note-var-binding binding new-env))
-                     (prog1 (relist binding
-                                    (car binding)
-                                    (walk-form-internal
-                                     (cadr binding) context old-env))
+                       (note-var-binding binding new-env)))
+                   ((cons symbol list)
+                     (prog1 (relist* binding
+                                     (car binding)
+                                     (walk-form-internal
+                                      (cadr binding) context old-env)
+                                     ;; Preserve "trailing junk"
+                                     (cddr binding))
                        (note-var-binding (car binding) new-env)))
+                   (t ; illegal syntax, (let (#(foo))) or (let (a . #*1)) etc
+                    binding))
                  (walk-bindings-1 (cdr bindings) old-env new-env context)))))
 
 (defun walk-lambda (form context old-env)
@@ -928,6 +897,10 @@
                walked-arglist
                walked-body))))
 
+;;; The DEFUN macro does some stuff with the environment, handle it here.
+(defun walk-defun (form context env)
+  (recons form (car form) (walk-lambda (cdr form) context env)))
+
 (defun walk-setq (form context env)
   (if (cdddr form)
       (let* ((expanded (let ((rforms nil)
@@ -941,7 +914,7 @@
             `(progn ,@walked)))
       (let* ((var (cadr form))
              (val (caddr form))
-             (symmac (car (variable-symbol-macro-p var env))))
+             (symmac (and (symbolp var) (car (variable-symbol-macro-p var env)))))
         (if symmac
             (let* ((type (env-var-type var env))
                    (expanded (if (eq t type)

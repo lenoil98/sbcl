@@ -26,8 +26,10 @@
                              lowtag-mask))
     (inst srl bytes n-lowtag-bits)
     (inst sll bytes n-lowtag-bits)
-    (inst addu header rank (fixnumize (1- array-dimensions-offset)))
-    (inst sll header n-widetag-bits)
+    ;; Compute the encoded rank. See ENCODE-ARRAY-RANK.
+    (inst addu header rank (fixnumize -1))
+    (inst and header header (fixnumize array-rank-mask))
+    (inst sll header header array-rank-byte-pos)
     (inst or header type)
     ;; Remove the extraneous fixnum tag bits because TYPE and RANK
     ;; were fixnums
@@ -46,17 +48,19 @@
   array-dimensions-offset other-pointer-lowtag
   (any-reg) positive-fixnum %set-array-dimension)
 
-(define-vop (array-rank-vop)
+(define-vop ()
   (:translate %array-rank)
   (:policy :fast-safe)
   (:args (x :scs (descriptor-reg)))
-  (:temporary (:scs (non-descriptor-reg)) temp)
-  (:results (res :scs (any-reg descriptor-reg)))
+  (:results (res :scs (unsigned-reg)))
+  (:result-types positive-fixnum)
   (:generator 6
-    (loadw temp x 0 other-pointer-lowtag)
-    (inst sra temp n-widetag-bits)
-    (inst subu temp (1- array-dimensions-offset))
-    (inst sll res temp n-fixnum-tag-bits)))
+    ;; ASSUMPTION: n-widetag-bits = 8
+    (inst lbu res x #+little-endian (- 2 other-pointer-lowtag)
+                    #+big-endian    (- 1 other-pointer-lowtag))
+    (inst nop)
+    (inst addu res 1)
+    (inst and res array-rank-mask)))
 
 ;;;; Bounds checking routine.
 (define-vop (check-bound)

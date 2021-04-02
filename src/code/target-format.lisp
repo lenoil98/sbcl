@@ -19,15 +19,13 @@
 ;;; Also note that (DEFTYPE FORMAT-CONTROL) = (OR STRING FUNCTION).
 ;;; And it's possible that we could decide to install a closure as
 ;;; the fin-fun but I don't think that's necessary.
-(sb-kernel::!defstruct-with-alternate-metaclass fmt-control
+(sb-kernel:!defstruct-with-alternate-metaclass fmt-control
   :slot-names (string symbols memo)
   :constructor %make-fmt-control
   :superclass-name function
   :metaclass-name static-classoid
   :metaclass-constructor make-static-classoid
   :dd-type funcallable-structure)
-
-(declaim (freeze-type fmt-control))
 
 (defmethod print-object ((self fmt-control) stream)
   (print-unreadable-object (self stream :type t)
@@ -52,7 +50,7 @@
     f))
 
 (defun unparse-fmt-control (fmt)
-  (with-simple-output-to-string (s)
+  (%with-output-to-string (s)
     (write-char #\" s)
     (let ((symbols (fmt-control-symbols fmt)))
       (dolist (piece (tokenize-control-string (fmt-control-string fmt)))
@@ -100,10 +98,10 @@
            (dynamic-extent format-arguments))
   (etypecase destination
     (null
-     (with-simple-output-to-string (stream)
+     (%with-output-to-string (stream)
        (%format stream control-string format-arguments)))
     (string
-     (with-simple-output-to-string (stream destination)
+     (with-output-to-string (stream destination)
        (%format stream control-string format-arguments)))
     ((member t)
      (%format *standard-output* control-string format-arguments)
@@ -180,8 +178,11 @@
                             char)))
         (directive '.directive) ; expose this var to the lambda. it's easiest
         (directives (if lambda-list (car (last lambda-list)) (sb-xc:gensym "DIRECTIVES"))))
-    `(setf
-       (aref *format-directive-interpreters* (sb-xc:char-code (char-upcase ,char)))
+    `(%svset ;; a cold-loadable form
+       *format-directive-interpreters*
+       ;; Using the host's char-upcase should be fine here.
+       ;; (Do we even need to use it? Why not just spell the source code as desired?)
+       ,(sb-xc:char-code (char-upcase char))
        (named-lambda ,defun-name (stream ,directive ,directives orig-args args)
          (declare (ignorable stream orig-args args))
          ,@(if lambda-list
@@ -1144,7 +1145,7 @@
                      (len (or (sb-impl::line-length stream) 72)))
                     (directive-params first-semi)
                   (setf newline-string
-                        (with-simple-output-to-string (stream)
+                        (%with-output-to-string (stream)
                           (setf args
                                 (interpret-directive-list stream
                                                           (pop segments)
@@ -1153,7 +1154,7 @@
                   (setf extra-space extra)
                   (setf line-len len)))
               (dolist (segment segments)
-                (push (with-simple-output-to-string (stream)
+                (push (%with-output-to-string (stream)
                         (setf args
                               (interpret-directive-list stream segment
                                                         orig-args args)))

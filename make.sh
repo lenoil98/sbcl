@@ -24,7 +24,7 @@ export LANG LC_ALL
 # thing" when run on the target machine, with the minor caveat that
 # any --xc-host parameter should be suitable for the host machine
 # instead of the target.
-sh make-config.sh "$@" || exit $?
+sh make-config.sh "$@" --check-host-lisp || exit $?
 
 . output/prefix.def
 . output/build-config
@@ -82,7 +82,11 @@ maybetime sh make-host-2.sh
 maybetime sh make-target-2.sh
 maybetime sh make-target-contrib.sh
 
-NCONTRIBS=`find contrib -name Makefile -print | wc -l`
+# contrib/Makefile shouldn't be counted in NCONTRIBS.
+# "find contrib/* -name Makefile" would still find contrib/./Makefile.
+# "find contrib/{sb-*,asdf}/Makefile" could work,
+# but as long as we only have 1 directory level, 'ls' should be adequate.
+NCONTRIBS=`ls -1 contrib/*/Makefile | wc -l`
 NPASSED=`find obj/asdf-cache -name test-passed.test-report -print | wc -l`
 echo
 echo "The build seems to have finished successfully, including $NPASSED (out of $NCONTRIBS)"
@@ -98,23 +102,6 @@ echo
 echo "To install SBCL (more information in INSTALL):"
 echo
 echo "  sh install.sh"
-
-# This is probably the best place to ensure people will see this.
-if test -n "$legacy_xc_spec"
-then
-    echo <<EOF
-******************************************************************************
-**
-**  Old-style XC-host specification detected: '$SBCL_XC_HOST'
-**
-**  Since 1.0.41.45 SBCL expects the XC-host to be specified using
-**  the --xc-host='myhost' command line option, not with a positional
-**  argument. The legacy style still works, but will not be supported
-**  indefinitely. Please update your build procedure.
-**
-******************************************************************************
-EOF
-fi
 
 build_finished=`date`
 echo

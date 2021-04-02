@@ -9,7 +9,7 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(in-package "SB-IMPL") ;(SB-IMPL, not SB-IMPL, since we're built in warm load.)
+(in-package "SB-IMPL")
 
 (defparameter *inspect-length* 10)
 
@@ -178,6 +178,11 @@ evaluated expressions.
           t
           (inspected-structure-elements object)))
 
+(defmethod inspected-parts ((object pathname))
+  (values (format nil "The object is a ~S.~%" (type-of object))
+          t
+          (inspected-structure-elements object)))
+
 (defun inspected-standard-object-elements (object)
   (let ((reversed-elements nil)
         (class-slots (sb-pcl::class-slots (class-of object))))
@@ -236,7 +241,7 @@ evaluated expressions.
              (cons "Documentation" (documentation object t))))))
 
 (defmethod inspected-parts ((object vector))
-  (let ((length (min (array-total-size object) *inspect-length*)))
+  (let ((length (min (length object) *inspect-length*)))
     (values (format nil
                     "The object is a ~:[~;displaced ~]VECTOR of length ~W.~%"
                     (and (array-header-p object)

@@ -35,14 +35,7 @@ else
 fi
 if [ -z "$SBCL_BUILDING_RELEASE_FROM" ]
 then
-    if [ "`git rev-list HEAD --not origin/master`" = '' ]
-    then
-        # If origin/master contains all the commits on current
-        # branch, use current head as the root instead.
-        version_root="$version_branchname"
-    else
-        version_root="origin/master"
-    fi
+    version_root=`git merge-base HEAD origin/master`
 else
     version_root="$SBCL_BUILDING_RELEASE_FROM"
 fi
@@ -63,7 +56,7 @@ if git diff HEAD --no-ext-diff --quiet --exit-code
 then
     version_dirty=""
 else
-    version_dirty="-dirty"
+    version_dirty="-WIP"
 fi
 # Now that we have all the pieces, put them together.
 cat >version.lisp-expr <<EOF

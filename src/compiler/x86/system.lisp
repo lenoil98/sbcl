@@ -48,14 +48,35 @@
                                       word-shift)
                                  instance-pointer-lowtag)
                        :base layout)))
-  (define-vop (sb-c::layout-depthoid-gt)
-    (:translate sb-c::layout-depthoid-gt)
+  (define-vop ()
+    (:translate sb-c::layout-depthoid-ge)
     (:policy :fast-safe)
     (:args (layout :scs (descriptor-reg)))
     (:info k)
     (:arg-types * (:constant (unsigned-byte 16)))
-    (:conditional :g)
+    (:conditional :ge)
     (:generator 1 (inst cmp (read-depthoid) (fixnumize k)))))
+
+(define-vop ()
+  (:translate sb-c::%structure-is-a)
+  (:args (x :scs (descriptor-reg)))
+  (:arg-types * (:constant t))
+  (:info test)
+  (:policy :fast-safe)
+  (:conditional :e)
+  (:generator 1
+    (inst cmp
+          (make-ea :dword
+                   :disp (+ (ash (+ (get-dsd-index layout sb-kernel::id-word0)
+                                    instance-slots-offset)
+                                 word-shift)
+                            (ash (- (layout-depthoid test) 2) 2)
+                            (- instance-pointer-lowtag))
+                   :base x)
+          (if (or (typep (layout-id test) '(and (signed-byte 8) (not (eql 0))))
+                  (not (sb-c::producing-fasl-file)))
+              (layout-id test)
+              (make-fixup test :layout-id)))))
 
 (define-vop (%other-pointer-widetag)
   (:translate %other-pointer-widetag)
@@ -77,16 +98,6 @@
   (:generator 6
     (inst movzx result (make-ea :byte :base function
                                       :disp (- fun-pointer-lowtag)))))
-
-(define-vop (fun-header-data)
-  (:translate fun-header-data)
-  (:policy :fast-safe)
-  (:args (x :scs (descriptor-reg)))
-  (:results (res :scs (unsigned-reg)))
-  (:result-types positive-fixnum)
-  (:generator 6
-    (loadw res x 0 fun-pointer-lowtag)
-    (inst shr res n-widetag-bits)))
 
 (define-vop (get-header-data)
   (:translate get-header-data)
@@ -113,6 +124,19 @@
     (load-type al-tn x (- other-pointer-lowtag))
     (storew eax x 0 other-pointer-lowtag)
     (move res x)))
+
+(define-vop (test-header-bit)
+  (:translate test-header-bit)
+  (:policy :fast-safe)
+  (:args (array :scs (descriptor-reg)))
+  (:arg-types t (:constant t))
+  (:info mask)
+  (:conditional :ne)
+  (:generator 1
+    ;; Assert that the mask is in header-data byte index 0
+    ;; which is byte index 1 of the whole header word.
+    (aver (typep mask '(unsigned-byte 8)))
+    (inst test (make-ea :byte :disp (- 1 other-pointer-lowtag) :base array) mask)))
 
 (define-vop (pointer-hash)
   (:translate pointer-hash)
@@ -121,10 +145,7 @@
   (:policy :fast-safe)
   (:generator 1
     (move res ptr)
-    ;; Mask the lowtag, and shift the whole address into a positive
-    ;; fixnum.
-    (inst and res (lognot lowtag-mask))
-    (inst shr res 1)))
+    (inst and res (lognot fixnum-tag-mask))))
 
 ;;;; allocation
 
@@ -235,7 +256,7 @@
     (inst lea eax (make-ea :dword :base res :disp (- list-pointer-lowtag)))
     (emit-optimized-test-inst eax lowtag-mask)
     (inst cmov :e res
-          (make-ea-for-object-slot res cons-cdr-slot list-pointer-lowtag))))
+          (object-slot-ea res cons-cdr-slot list-pointer-lowtag))))
 (define-vop (symbol-plist)
   (:policy :fast-safe)
   (:translate symbol-plist)
@@ -404,7 +425,7 @@ number of CPU cycles elapsed as secondary value. EXPERIMENTAL."
   (:translate %data-dependency-barrier)
   (:generator 3))
 
-(define-vop (pause)
+(define-vop ()
   (:translate spin-loop-hint)
   (:policy :fast-safe)
   (:generator 0

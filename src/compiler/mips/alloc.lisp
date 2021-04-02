@@ -219,27 +219,27 @@
              (inst or result alloc-tn (if (logbitp 0 lowtag) lowtag
                                                              (1- lowtag)))))
       (when type
-        (inst li temp (logior (ash (1- words) n-widetag-bits) type))
+        (inst li temp (logior (ash (1- words) (length-field-shift type)) type))
         (storew temp result 0 lowtag)))))
 
 (define-vop (var-alloc)
   (:args (extra :scs (any-reg)))
   (:arg-types positive-fixnum)
-  (:info name words type lowtag)
-  (:ignore name)
+  (:info name words type lowtag stack-allocate-p)
+  (:ignore name stack-allocate-p)
   (:results (result :scs (descriptor-reg)))
   (:temporary (:scs (any-reg)) bytes)
   (:temporary (:scs (non-descriptor-reg)) header)
   (:temporary (:sc non-descriptor-reg :offset nl4-offset) pa-flag)
   (:generator 6
     (inst addu bytes extra (* (1+ words) n-word-bytes))
-    (inst sll header bytes (- n-widetag-bits n-fixnum-tag-bits))
+    (inst sll header bytes (- (length-field-shift type) n-fixnum-tag-bits))
     ;; The specified EXTRA value is the exact value placed in the header
     ;; as the word count when allocating code.
     (cond ((= type code-header-widetag)
            (inst addu header header type))
           (t
-           (inst addu header header (+ (ash -2 n-widetag-bits) type))
+           (inst addu header header (+ (ash -2 (length-field-shift type)) type))
            (inst srl bytes bytes n-lowtag-bits)
            (inst sll bytes bytes n-lowtag-bits)))
     (pseudo-atomic (pa-flag)

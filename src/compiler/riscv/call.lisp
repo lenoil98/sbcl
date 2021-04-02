@@ -606,8 +606,7 @@
                         (:load-nargs
                          ,@(if variable
                                `((inst sub nargs-pass csp-tn new-fp)
-                                 (unless (zerop (- word-shift n-fixnum-tag-bits))
-                                   (inst srai nargs-pass nargs-pass (- word-shift n-fixnum-tag-bits)))
+                                 (with-word-index-as-fixnum (nargs-pass nargs-pass))
                                  ,@(let ((index -1))
                                      (mapcar (lambda (name)
                                                `(loadw ,name new-fp ,(incf index)))
@@ -645,7 +644,7 @@
                   (insert-step-instrumenting (callable-tn)
                     ;; Conditionally insert a conditional trap:
                     (when step-instrumenting
-                      (load-symbol-value stepping sb-impl::*stepping*)
+                      (load-stepping stepping)
                       ;; If it's not 0, trap.
                       (inst beq stepping zero-tn STEP-DONE-LABEL)
                       ;; CONTEXT-PC will be pointing here when the
@@ -751,7 +750,7 @@
     ;; Clear the number stack if anything is there.
     (clear-number-stack vop)
     ;; And jump to the assembly routine.
-    (invoke-asm-routine 'tail-call-variable t)))
+    (invoke-asm-routine 'tail-call-variable)))
 
 
 ;;;; Unknown values return:
@@ -863,7 +862,7 @@
     (move vals vals-arg)
     (move nvals nvals-arg)
 
-    (invoke-asm-routine 'return-multiple t)))
+    (invoke-asm-routine 'return-multiple)))
 
 
 ;;;; XEP hackery:
@@ -907,11 +906,9 @@
       ;; Compute the end of the MORE arg area (and our overall frame
       ;; allocation) into the stack pointer.
       (cond ((zerop fixed)
-             (cond ((zerop (- word-shift n-fixnum-tag-bits))
-                    (inst add dest result nargs-tn))
-                   (t
-                    (inst slli dest nargs-tn (- word-shift n-fixnum-tag-bits))
-                    (inst add dest result dest)))
+             (let ((nargs nargs-tn))
+               (with-fixnum-as-word-index (nargs dest)
+                 (inst add dest result nargs)))
              (move csp-tn dest)
              (inst beq nargs-tn zero-tn done))
             (t
@@ -921,11 +918,8 @@
                (move csp-tn result)
                (inst j done)
                (emit-label skip))
-             (cond ((zerop (- word-shift n-fixnum-tag-bits))
-                    (inst add dest result count))
-                   (t
-                    (inst slli dest count (- word-shift n-fixnum-tag-bits))
-                    (inst add dest result dest)))
+             (with-fixnum-as-word-index (count dest)
+               (inst add dest result count))
              ;; Don't leave the arguments unprotected when moving below the stack pointer
              (when (>= delta 0)
                (move csp-tn dest))))
@@ -977,7 +971,8 @@
       (emit-label do-regs)
       (when (< fixed register-arg-count)
         ;; Now we have to deposit any more args that showed up in registers.
-        (inst subi count nargs-tn (fixnumize fixed))
+        (when (zerop fixed)
+          (inst subi count nargs-tn (fixnumize fixed)))
         (do ((i fixed (1+ i)))
             ((>= i register-arg-count))
           ;; Don't deposit any more than there are.
@@ -999,7 +994,7 @@
 (define-vop (more-arg-or-nil)
   (:policy :fast-safe)
   (:args (object :scs (descriptor-reg) :to (:result 1))
-         (count :scs (any-reg)))
+         (count :scs (any-reg) :to (:result 1)))
   (:temporary (:scs (any-reg)) index-temp)
   (:info index)
   (:results (value :scs (descriptor-reg any-reg)))
@@ -1010,12 +1005,12 @@
            (inst bge zero-tn count done))
           (t
            (inst li index-temp (fixnumize index))
-           (inst bge index-temp count)))
+           (inst bge index-temp count done)))
     (loadw value object index)
     done))
 
 ;;; Turn more arg (context, count) into a list.
-(define-vop (listify-rest-args)
+(define-vop ()
   (:args (context-arg :target context :scs (descriptor-reg))
          (count-arg :target count :scs (any-reg)))
   (:arg-types * tagged-num)
@@ -1042,27 +1037,25 @@
       ;; We need to do this atomically.
       (pseudo-atomic (pa-flag)
         (inst slli temp count (1+ (- word-shift n-fixnum-tag-bits)))
-        (allocation dst temp list-pointer-lowtag
+        (allocation 'list temp list-pointer-lowtag dst
                     :flag-tn pa-flag
                     :stack-allocate-p dx-p)
         (move result dst)
-
         (inst j enter)
 
         ;; Compute the next cons and store it in the current one.
         (emit-label loop)
-        (inst addi dst dst (* 2 n-word-bytes))
+        (inst addi dst dst (* cons-size n-word-bytes))
         (storew dst dst -1 list-pointer-lowtag)
 
         (emit-label enter)
         ;; Grab one value
         (loadw temp context)
         (inst addi context context n-word-bytes)
-
-        ;; Dec count, and if != zero, go back for more.
-        (inst subi count count (fixnumize 1))
         ;; Store the value into the car of the current cons.
         (storew temp dst 0 list-pointer-lowtag)
+        ;; Dec count, and if != zero, go back for more.
+        (inst subi count count (fixnumize 1))
         (inst bne count zero-tn loop)
 
         ;; NIL out the last cons.
@@ -1079,24 +1072,24 @@
 ;;; supplied - fixed, and return a pointer that many words below the current
 ;;; stack top.
 ;;;
-(define-vop (more-arg-context)
+(define-vop ()
   (:policy :fast-safe)
   (:translate sb-c::%more-arg-context)
-  (:args (supplied :scs (any-reg) :target temp))
+  (:args (supplied :scs (any-reg) .
+         #.(cl:when sb-vm::fixnum-as-word-index-needs-temp
+             '(:target temp))))
   (:arg-types tagged-num (:constant fixnum))
   (:info fixed)
   (:results (context :scs (descriptor-reg))
             (count :scs (any-reg)))
+  #+#.(cl:if sb-vm::fixnum-as-word-index-needs-temp '(and) '(or))
   (:temporary (:sc non-descriptor-reg) temp)
   (:result-types t tagged-num)
   (:note "more-arg-context")
   (:generator 5
     (inst subi count supplied (fixnumize fixed))
-    (cond ((zerop (- word-shift n-fixnum-tag-bits))
-           (inst sub context csp-tn count))
-          (t
-           (inst slli temp count (- word-shift n-fixnum-tag-bits))
-           (inst sub context csp-tn temp)))))
+    (with-fixnum-as-word-index (count temp)
+      (inst sub context csp-tn count))))
 
 (define-vop (verify-arg-count)
   (:policy :fast-safe)
@@ -1130,7 +1123,7 @@
   (:policy :fast-safe)
   (:vop-var vop)
   (:generator 3
-    (load-symbol-value stepping sb-impl::*stepping*)
+    (load-stepping stepping)
     ;; If it's not 0, trap.
     (inst beq stepping zero-tn DONE)
     ;; CONTEXT-PC will be pointing here when the interrupt is handled,

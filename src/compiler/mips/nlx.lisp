@@ -117,19 +117,21 @@
     (store-symbol-value uwp *current-unwind-protect-block*)))
 
 
-(define-vop (unlink-catch-block)
+(define-vop (%catch-breakup)
+  (:args (current-block))
+  (:ignore current-block)
   (:temporary (:scs (any-reg)) block)
   (:policy :fast-safe)
-  (:translate %catch-breakup)
   (:generator 17
     (load-symbol-value block *current-catch-block*)
     (loadw block block catch-block-previous-catch-slot)
     (store-symbol-value block *current-catch-block*)))
 
-(define-vop (unlink-unwind-protect)
+(define-vop (%unwind-protect-breakup)
+  (:args (current-block))
+  (:ignore current-block)
   (:temporary (:scs (any-reg)) block)
   (:policy :fast-safe)
-  (:translate %unwind-protect-breakup)
   (:generator 17
     (load-symbol-value block *current-unwind-protect-block*)
     (loadw block block unwind-block-uwp-slot)
@@ -156,7 +158,7 @@
           ((= nvals 1)
            (let ((no-values (gen-label)))
              (inst beq count no-values)
-             (move (tn-ref-tn values) null-tn t)
+             (inst move (tn-ref-tn values) null-tn)
              (loadw (tn-ref-tn values) start)
              (emit-label no-values)))
           (t

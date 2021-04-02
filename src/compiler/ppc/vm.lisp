@@ -11,6 +11,8 @@
 
 (in-package "SB-VM")
 
+(defconstant-eqx +fixup-kinds+ #(:absolute :absolute64 :layout-id :b :ba :ha :l) #'equalp)
+
 ;;; NUMBER-STACK-DISPLACEMENT
 ;;;
 ;;; The number of bytes reserved above the number stack pointer.  These
@@ -83,7 +85,6 @@
   (defregset descriptor-regs
       fdefn a0 a1 a2 a3  ocfp lra cname lexenv l0 l1 #-sb-thread l2 )
 
-  ;; OAOOM: Same as runtime/ppc-lispregs.h
   (defregset boxed-regs
       fdefn code cname lexenv ocfp lra
       a0 a1 a2 a3
@@ -264,7 +265,7 @@
      zero-sc-number)
     (null
      null-sc-number)
-    ((or (integer #.sb-xc:most-negative-fixnum #.sb-xc:most-positive-fixnum)
+    ((or (integer #.most-negative-fixnum #.most-positive-fixnum)
          character)
      immediate-sc-number)
     (symbol

@@ -13,9 +13,8 @@
 
 ;;;; DYNAMIC-USAGE and friends
 
-#+(and relocatable-heap gencgc)
-(define-alien-variable ("DYNAMIC_SPACE_START" sb-vm:dynamic-space-start) unsigned-long)
-#-sb-fluid
+#+gencgc
+(define-alien-variable ("DYNAMIC_SPACE_START" sb-vm:dynamic-space-start) os-vm-size-t)
 (declaim (inline current-dynamic-space-start))
 (defun current-dynamic-space-start ()
   #+gencgc sb-vm:dynamic-space-start
@@ -27,7 +26,6 @@
   (defun dynamic-space-free-pointer ()
     (extern-alien "dynamic_space_free_pointer" system-area-pointer)))
 
-#-sb-fluid
 (declaim (inline dynamic-usage))
 #+gencgc
 (defun dynamic-usage ()
@@ -43,11 +41,6 @@
 
 (defun read-only-space-usage ()
   (- (sap-int sb-vm:*read-only-space-free-pointer*) sb-vm:read-only-space-start))
-
-;;; Convert the descriptor into a SAP. The bits all stay the same, we just
-;;; change our notion of what we think they are.
-(declaim (inline descriptor-sap))
-(defun descriptor-sap (x) (int-sap (get-lisp-obj-address x)))
 
 (defun control-stack-usage ()
   #-stack-grows-downward-not-upward
@@ -154,7 +147,13 @@ statistics are appended to it."
 
 ;;; For GENCGC all generations < GEN will be GC'ed.
 
-(define-load-time-global *already-in-gc* (sb-thread:make-mutex :name "GC lock"))
+(defmacro try-acquire-gc-lock (&rest forms)
+  #-sb-thread `(progn ,@forms t)
+  #+sb-thread
+  `(when (eql (alien-funcall (extern-alien "try_acquire_gc_lock" (function int))) 1)
+     ,@forms
+     (alien-funcall (extern-alien "release_gc_lock" (function void)))
+     t))
 
 (defun sub-gc (gen)
   (cond (*gc-inhibit*
@@ -200,8 +199,6 @@ statistics are appended to it."
            ;; Let's make sure we're not interrupted and that none of
            ;; the deadline or deadlock detection stuff triggers.
            (without-interrupts
-             (sb-thread::without-thread-waiting-for
-                 (:already-without-interrupts t)
                (let ((sb-impl::*deadline* nil)
                      (epoch *gc-epoch*))
                  (loop
@@ -215,10 +212,9 @@ statistics are appended to it."
                     ;; execute the remainder of the GC: stopping the
                     ;; world with interrupts disabled is the mother of
                     ;; all critical sections.
-                    (cond ((sb-thread:with-mutex (*already-in-gc* :wait-p nil)
+                    (cond ((try-acquire-gc-lock
                              (unsafe-clear-roots gen)
-                             (gc-stop-the-world)
-                             t)
+                             (gc-stop-the-world))
                            ;; Success! GC.
                            (perform-gc)
                            ;; Return, but leave *gc-pending* as is: we
@@ -245,8 +241,19 @@ statistics are appended to it."
                   ;; runtime.
                   (when (and (eql gen 0)
                              (neq epoch *gc-pending*))
-                    (return 0))))))))))
+                    (return 0)))))))))
 
+#+sb-thread
+(defun post-gc ()
+  (sb-impl::finalizer-thread-notify)
+  (alien-funcall (extern-alien "empty_thread_recyclebin" (function void)))
+  ;; Post-GC actions are invoked synchronously by the GCing thread,
+  ;; which is an arbitrary one. If those actions aquire any locks, or are sensitive
+  ;; to the state of *ALLOW-WITH-INTERRUPTS*, any deadlocks of what-have-you
+  ;; are user error. Hooks need to be sufficiently uncomplicated as to be harmless.
+  (call-hooks "after-GC" *after-gc-hooks* :on-error :warn))
+
+#-sb-thread
 (defun post-gc ()
   ;; Outside the mutex, interrupts may be enabled: these may cause
   ;; another GC. FIXME: it can potentially exceed maximum interrupt
@@ -258,33 +265,48 @@ statistics are appended to it."
   ;;
   ;; KLUDGE: Don't run the hooks in GC's if:
   ;;
-  ;; A) this thread is dying, so that user-code never runs with
-  ;;    (thread-alive-p *current-thread*) => nil
+  ;; A) this thread is dying or just born, so that user-code never runs with
+  ;;    (thread-alive-p *current-thread*) => nil.
+  ;;    The just-born case can happen with foreign threads that are unlucky
+  ;;    enough to be elected to perform GC just as they begin executing
+  ;;    ENTER-FOREIGN-CALLBACK. This definitely seems to happen with sb-safepoint.
+  ;;    I'm not sure whether it can happen without sb-safepoint.
   ;;
   ;; B) interrupts are disabled somewhere up the call chain since we
   ;;    don't want to run user code in such a case.
   ;;
+  ;; Condition (A) is tested in the C runtime at can_invoke_post_gc().
+  ;; Condition (B) is tested here.
   ;; The long-term solution will be to keep a separate thread for
   ;; after-gc hooks.
   ;; Finalizers are in a separate thread (usually),
   ;; but it's not permissible to invoke CONDITION-NOTIFY from a
   ;; dying thread, so we still need the guard for that, but not
   ;; the guard for whether interupts are enabled.
-  (when (sb-thread:thread-alive-p sb-thread:*current-thread*)
-    (let ((threadp #+sb-thread (%instancep sb-impl::*finalizer-thread*)))
-      (when threadp
-        ;; It's OK to frob a condition variable regardless of
-        ;; *allow-with-interrupts*, and probably OK to start a thread.
-        ;; For consistency with the previous behavior, we delay finalization
-        ;; if there is no finalizer thread and interrupts are disabled.
-        ;; That's my excuse anyway, not having looked more in-depth.
-        (run-pending-finalizers))
-      (when *allow-with-interrupts*
-        (sb-thread::without-thread-waiting-for ()
-         (with-interrupts
-           (unless threadp
-             (run-pending-finalizers))
-           (call-hooks "after-GC" *after-gc-hooks* :on-error :warn)))))))
+
+    ;; Here's one reason that MAX_INTERRUPTS is as high as it is.
+    ;; If the thread that performed GC runs post-GC hooks which cons enough to
+    ;; cause another GC while in the hooks, then as soon as interrupts are allowed
+    ;; again, a GC can be invoked "recursively" - while there is a maybe_gc() on
+    ;; the C call stack. It's not even true that _this_ thread had to cons a ton -
+    ;; any thread could have, causing this thread to hit the GC trigger which sets the
+    ;; P-A interrupted bit which causes the interrupt instruction at the end of a
+    ;; pseudo-atomic sequence to take a signal hit. So with interrupts eanbled,
+    ;; we get back into the GC, which calls post-GC, which might cons ...
+    ;; See the example at the bottom of src/code/final for a clear picture.
+    ;; Logically, the finalizer existence test belongs in src/code/final,
+    ;; but the flaw in that is we're not going to call that code until unmasking
+    ;; interrupts, which is precisely the thing we need to NOT do if already
+    ;; in post-GC code of any kind (be it finalizer or other).
+  (when (and *allow-with-interrupts*
+               (or (and (sb-impl::hash-table-culled-values
+                         (sb-impl::finalizer-id-map sb-impl::**finalizer-store**))
+                        (not sb-impl::*in-a-finalizer*))
+                   *after-gc-hooks*))
+      (sb-thread::without-thread-waiting-for ()
+        (with-interrupts
+          (run-pending-finalizers)
+          (call-hooks "after-GC" *after-gc-hooks* :on-error :warn)))))
 
 ;;; This is the user-advertised garbage collection function.
 (defun gc (&key (full nil) (gen 0) &allow-other-keys)
@@ -464,6 +486,17 @@ Experimental: interface subject to change."
                                  (function double generation-index-t))
                    generation))
 
+(macrolet ((cases ()
+             `(cond ((< (current-dynamic-space-start) addr
+                        (sap-int (dynamic-space-free-pointer)))
+                     :dynamic)
+                    ((immobile-space-addr-p addr) :immobile)
+                    ((< sb-vm:read-only-space-start addr
+                        (sap-int sb-vm:*read-only-space-free-pointer*))
+                     :read-only)
+                    ((< sb-vm:static-space-start addr
+                        (sap-int sb-vm:*static-space-free-pointer*))
+                     :static))))
 ;;; Return true if X is in any non-stack GC-managed space.
 ;;; (Non-stack implies not TLS nor binding stack)
 ;;; This assumes a single contiguous dynamic space, which is of course a
@@ -477,13 +510,9 @@ Experimental: interface subject to change."
 (defun heap-allocated-p (x)
   (let ((addr (get-lisp-obj-address x)))
     (and (sb-vm:is-lisp-pointer addr)
-         (cond ((< (current-dynamic-space-start) addr
-                   (sap-int (dynamic-space-free-pointer)))
-                :dynamic)
-               ((immobile-space-addr-p addr) :immobile)
-               ((< sb-vm:read-only-space-start addr
-                   (sap-int sb-vm:*read-only-space-free-pointer*))
-                :read-only)
-               ((< sb-vm:static-space-start addr
-                   (sap-int sb-vm:*static-space-free-pointer*))
-                :static)))))
+         (cases))))
+
+;;; Internal use only. FIXME: I think this duplicates code that exists
+;;; somewhere else which I could not find.
+(defun lisp-space-p (sap &aux (addr (sap-int sap))) (cases))
+) ; end MACROLET

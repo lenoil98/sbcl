@@ -1,31 +1,36 @@
 ;;; HASH TABLES
 
-#-sb-thread (sb-ext:exit :code 104)
-(use-package "SB-THREAD")
-(use-package "SB-SYS")
-
-(defvar *table-under-test* nil)
-
-;;; If *table-under-test* is bound to a hash-table, then cause it to have
-;;; half as many buckets as it would ordinarily get after enlarging.
-(sb-int:encapsulate
- 'sb-impl::hash-table-new-vectors
- 'test
- (compile nil
-          '(lambda (fn tbl)
-            (if (eq tbl *table-under-test*)
-                (multiple-value-bind (kv-vect next-vect hash-vect bucket-vect)
-                    (funcall fn tbl)
-                  (values kv-vect next-vect hash-vect
-                          (subseq bucket-vect 0 (/ (length bucket-vect) 2))))
-                (funcall fn tbl)))))
-
 ;;; Keep moving everything that can move during each GC
 #+gencgc (setf (generation-number-of-gcs-before-promotion 0) 1000000)
 
+;;; Check for GC invariant loss during weak table creation.
+;;; This didn't always fail, but might have, and now shouldn't.
+(defglobal *number-of-weak-tables* 0)
+(defun make-weak-key-table () (make-hash-table :weakness :key))
+(defun something-useless (x) (list x))
+(defun weak-table-allocation-test ()
+  (let ((thread
+         (sb-thread:make-thread
+           (lambda ()
+             (loop
+               (sleep .0001)
+               (gc)
+               (sb-thread:barrier (:read))
+               (when (> *number-of-weak-tables* 1000) (return)))))))
+    (loop repeat 1001 do
+      (something-useless (make-weak-key-table))
+      (incf *number-of-weak-tables*)
+      (sb-thread:barrier (:write)))
+    (sb-thread:join-thread thread)))
+;;; Interpreted code is probably too slow to be useful in this test
+(compile 'weak-table-allocation-test)
+
+(with-test (:name :weak-table-gc-invariant :skipped-on (not :sb-thread))
+  (weak-table-allocation-test))
+
 (defun is-address-sensitive (tbl)
   (let ((data (sb-kernel:get-header-data (sb-impl::hash-table-pairs tbl))))
-    (logtest data sb-vm:vector-addr-hashing-subtype)))
+    (logtest data sb-vm:vector-addr-hashing-flag)))
 
 (with-test (:name (hash-table :eql-hash-symbol-not-eq-based))
   ;; If you ask for #'EQ as the test, then everything is address-sensitive,
@@ -50,197 +55,16 @@
       (setf (gethash (make-instance 'ship) ht) 1)
       (assert (not (is-address-sensitive ht))))))
 
-(defvar *errors* nil)
+(defvar *gc-after-rehash-me* nil)
+(defvar *rehash+gc-count* 0)
 
-(defun oops (e)
-  (setf *errors* e)
-  (format t "~&oops: ~A in ~S~%" e *current-thread*)
-  (sb-debug:print-backtrace)
-  (catch 'done))
-
-(with-test (:name (hash-table :unsynchronized)
-                  ;; FIXME: This test occasionally eats out craploads
-                  ;; of heap instead of expected error early. Not 100%
-                  ;; sure if it would finish as expected, but since it
-                  ;; hits swap on my system I'm not likely to find out
-                  ;; soon. Disabling for now. -- nikodemus
-            :broken-on :sbcl)
-  ;; We expect a (probable) error here: parellel readers and writers
-  ;; on a hash-table are not expected to work -- but we also don't
-  ;; expect this to corrupt the image.
-  (let* ((hash (make-hash-table))
-         (*errors* nil)
-         (threads (list (make-kill-thread
-                         (lambda ()
-                           (catch 'done
-                             (handler-bind ((serious-condition 'oops))
-                               (loop
-                                 ;;(princ "1") (force-output)
-                                 (setf (gethash (random 100) hash) 'h)))))
-                         :name "writer")
-                        (make-kill-thread
-                         (lambda ()
-                           (catch 'done
-                             (handler-bind ((serious-condition 'oops))
-                               (loop
-                                 ;;(princ "2") (force-output)
-                                 (remhash (random 100) hash)))))
-                         :name "reader")
-                        (make-kill-thread
-                         (lambda ()
-                           (catch 'done
-                             (handler-bind ((serious-condition 'oops))
-                               (loop
-                                 (sleep (random 1.0))
-                                 (sb-ext:gc)))))
-                         :name "collector"))))
-    (unwind-protect
-         (sleep 10)
-      (mapc #'terminate-thread threads))))
-
-(defmacro with-test-setup ((array (table constructor)) &body body)
-  ;; Using fixnums as hash-table keys does not engender a thorough enough test
-  ;; as they will not cause the table to need rehash due to GC.
-  ;; Using symbols won't work either because they hash stably under EQL
-  ;; (but not under EQ) so let's use a bunch of cons cells.
-  `(let* ((,array (coerce (loop for i from 0 repeat 100 collect (cons i i)) 'vector))
-          (,table ,constructor)
-          (*table-under-test* (if shrinkp ,table nil)))
-     (when shrinkp
-       ;; start with half as many buckets as usual
-       (let ((v (sb-impl::hash-table-index-vector ,table)))
-         (setf (sb-impl::hash-table-index-vector ,table) (subseq v 0 (/ (length v) 2)))))
-     ,@body
-     (format t "~&::: INFO: Rehash count = ~D~%"
-             (sb-impl::hash-table-n-rehash+find ,table))))
-
-;;; Do *NOT* use (gc :full) in the following tests - a full GC causes all objects
-;;; to be promoted into the highest normal generation, which achieves nothing,
-;;; and runs the collector less often (because it's slower) relative to the total
-;;; test time, making the test less usesful. It's fine for everything in gen0
-;;; to stay in gen0, which basically never promotes due to the ludicrously high
-;;; threshold set for number of GCs between promotions.
-
-(defparameter *sleep-delay-max* .025)
-
-(with-test (:name (hash-table :synchronized)
-            :broken-on :win32)
-  (dolist (shrinkp '(nil t))
-   (with-test-setup (keys (hash (make-hash-table :synchronized t)))
-    (let*
-        ((*errors* nil)
-         (threads (list (make-join-thread
-                         (lambda ()
-                           (catch 'done
-                             (handler-bind ((serious-condition 'oops))
-                               (loop
-                                 ;;(princ "1") (force-output)
-                                 (setf (gethash (aref keys (random 100)) hash) 'h)))))
-                         :name "writer")
-                        (make-join-thread
-                         (lambda ()
-                           (catch 'done
-                             (handler-bind ((serious-condition 'oops))
-                               (loop
-                                 ;;(princ "2") (force-output)
-                                 (remhash (aref keys (random 100)) hash)))))
-                         :name "reader")
-                        (make-join-thread
-                         (lambda ()
-                           (catch 'done
-                             (handler-bind ((serious-condition 'oops))
-                               (loop
-                                 (sleep (random *sleep-delay-max*))
-                                 (sb-ext:gc)))))
-                         :name "collector"))))
-      (unwind-protect (sleep 2.5)
-        (mapc #'terminate-thread threads))
-      (assert (not *errors*))))))
-
-(with-test (:name (hash-table :parallel-readers)
-                  :broken-on :win32)
-  (dolist (shrinkp '(nil t))
-    (with-test-setup (keys (hash (make-hash-table)))
-      (let ((*errors* nil)
-            (expected (make-array 100 :initial-element nil))
-            (actions (make-array 3 :element-type 'sb-ext:word :initial-element 0)))
-        (loop repeat 50
-              do (let ((i (random 100)))
-                   (setf (gethash (aref keys i) hash) i)
-                   (setf (aref expected i) t)))
-        (flet ((reader (n)
-                 (catch 'done
-                   (handler-bind ((serious-condition 'oops))
-                     (loop
-                      (let* ((i (random 100))
-                             (x (gethash (aref keys i) hash)))
-                        (atomic-incf (aref actions n))
-                        (cond ((aref expected i) (assert (eq x i)))
-                              (t (assert (not x))))))))))
-          (let ((threads
-              (list (make-kill-thread #'reader :name "reader 1" :arguments 0)
-                    (make-kill-thread #'reader :name "reader 2" :arguments 1)
-                    (make-kill-thread #'reader :name "reader 3" :arguments 2)
-                    (make-kill-thread
-                     (lambda ()
-                       (catch 'done
-                         (handler-bind ((serious-condition 'oops))
-                           (loop (sleep (random *sleep-delay-max*))
-                                 (sb-ext:gc)))))
-                     :name "collector"))))
-            (unwind-protect (sleep 2.5)
-              (mapc #'terminate-thread threads))
-            (format t "~&::: INFO: GETHASH count = ~D = ~D, lsearch=~d~%"
-                    actions
-                    (reduce #'+ actions)
-                 ;; With the GC frequency as high as it is for this test,
-                 ;; we can get more than 1 lookup in 10^5 needing linear scan.
-                 ;; A "normal" amount of GCing often sees this as low as 0.
-                    (sb-impl::hash-table-n-lsearch hash))
-            (assert (not *errors*))))))))
-
-(with-test (:name (hash-table :single-accessor :parallel-gc)
-            :broken-on :win32)
-  (dolist (shrinkp '(nil t))
-    (with-test-setup (keys (hash (make-hash-table)))
-      (let ((*errors* nil))
-        (let ((threads
-               (list (make-kill-thread
-                          (lambda ()
-                            (handler-bind ((serious-condition 'oops))
-                              (loop
-                                (let* ((i (random 100))
-                                       (k (aref keys i))
-                                       (val (gethash k hash)))
-                                  (cond (val
-                                         (assert (eq val i))
-                                         (assert (remhash k hash)))
-                                        (t
-                                         (setf (gethash k hash) i)))))))
-                          :name "accessor")
-                         (make-kill-thread
-                          (lambda ()
-                            (handler-bind ((serious-condition 'oops))
-                              (loop
-                                (sleep (random *sleep-delay-max*))
-                                (sb-ext:gc))))
-                          :name "collector"))))
-          (unwind-protect (sleep 2.5)
-            (mapc #'terminate-thread threads))
-          (assert (not *errors*)))))))
-
-;;; Invoke GC early and often. This would loop infinitely if we rehashed
-;;; the finalizer store after every GC, because post-GC actions include
-;;; invoking GETHASH on the finalizer store, which, being a weak table,
-;;; uses the regular REHASH algorithm which would get here and invoke GC
-;;; again, and so on and so on.
 (sb-int:encapsulate
  'sb-impl::rehash
  'force-gc-after-rehash
- (compile nil '(lambda (f kvv hv iv nv)
-                (prog1 (funcall f kvv hv iv nv)
-                  (unless (eq kvv (sb-impl::hash-table-pairs
-                                   (aref sb-impl::**finalizer-store** 1)))
+ (compile nil '(lambda (f kvv hv iv nv tbl)
+                (prog1 (funcall f kvv hv iv nv tbl)
+                  (when (eq tbl *gc-after-rehash-me*)
+                    (incf *rehash+gc-count*)
                     (sb-ext:gc))))))
 
 ;;; Check that when growing a weak hash-table we don't try to
@@ -252,5 +76,158 @@
 ;;; so use a bunch of cons cells.
 (with-test (:name :gc-while-growing-weak-hash-table)
   (let ((h (make-hash-table :weakness :key)))
-    (dotimes (i 14) (setf (gethash (list (gensym)) h) i))
-    (setf (gethash (cons 1 2) h) 'foolz)))
+    (setq *gc-after-rehash-me* h)
+    (dotimes (i 50) (setf (gethash (list (gensym)) h) i))
+    (setf (gethash (cons 1 2) h) 'foolz))
+  (assert (>= *rehash+gc-count* 10)))
+
+(defstruct this x)
+(defstruct that x)
+(with-test (:name :struct-in-list-equal-hash)
+  (let ((ht (make-hash-table :test 'equal)))
+    (dotimes (i 100)
+      (let ((key (cons (make-this :x i) (make-that :x i))))
+        (setf (gethash key ht)  i)))
+    ;; This used to degenerate the hash table into a linked list,
+    ;; because all instances of THIS hashed to the same random fixnum
+    ;; and all instances of THAT hashed to the same random fixnum
+    ;; (different from THIS, not that it mattered), and the hash
+    ;; of the cons was therefore the same.
+    (let ((bins-used
+            (count-if #'plusp (sb-impl::hash-table-index-vector ht))))
+      ;; It's probably even better spread out than this many bins,
+      ;; but let's not be too sensitive to the exact bin count in use.
+      ;; It's a heck of a lot better than everything in 1 bin.
+      (assert (> bins-used 40)))))
+
+(with-test (:name :rehash-no-spurious-address-sensitivity)
+  (let ((h (make-hash-table :test 'eq)))
+    (dotimes (i 100)
+      (setf (gethash i h) (- i)))
+    (assert (= (sb-kernel:get-header-data (sb-impl::hash-table-pairs h))
+               sb-vm:vector-hashing-flag))))
+
+(defmacro kv-vector-needs-rehash (x) `(svref ,x 1))
+;;; EQL tables no longer get a hash vector, so the GC has to decide
+;;; for itself whether key movement forces rehash.
+;;; Let's make sure that works.
+(with-test (:name :address-insensitive-eql-hash)
+  (let ((tbl (make-hash-table :size 20)))
+    (dotimes (i 5)
+      (let ((key (coerce i 'double-float)))
+        (setf (gethash key tbl) (sb-kernel:get-lisp-obj-address key)))
+      (let ((key (coerce i '(complex single-float))))
+        (setf (gethash key tbl) (sb-kernel:get-lisp-obj-address key)))
+      (let ((key (make-symbol (make-string (1+ i) :initial-element #\a))))
+        (setf (gethash key tbl) (sb-kernel:get-lisp-obj-address key))))
+    (assert (= (sb-kernel:get-header-data (sb-impl::hash-table-pairs tbl))
+               sb-vm:vector-hashing-flag)) ; noo address-based key
+    (let ((foo (cons 0 0)))
+      (setf (gethash foo tbl) foo)
+      (remhash foo tbl))
+    ;; now we've added an address-based key (but removed it)
+    (assert (= (sb-kernel:get-header-data (sb-impl::hash-table-pairs tbl))
+               (+ sb-vm:vector-addr-hashing-flag
+                  sb-vm:vector-hashing-flag)))
+    (gc)
+    (let ((n-keys-moved 0))
+      (maphash (lambda (key value)
+                 (unless (= value (sb-kernel:get-lisp-obj-address key))
+                   (incf n-keys-moved)))
+               tbl)
+      (assert (plusp n-keys-moved))
+      ;; keys were moved, the table is marked as address-based,
+      ;; but no key that moved forced a rehash
+      (assert (zerop (kv-vector-needs-rehash
+                      (sb-impl::hash-table-pairs tbl)))))
+    ;; the vector type is unchanged
+    (assert (= (sb-kernel:get-header-data (sb-impl::hash-table-pairs tbl))
+               (+ sb-vm:vector-addr-hashing-flag
+                  sb-vm:vector-hashing-flag)))
+    (setf (gethash (cons 1 2) tbl) 'one)
+    (setf (gethash (cons 3 4) tbl) 'two)
+    (setf (gethash (cons 5 6) tbl) 'three)
+    (gc)
+    ;; now some key should have moved and forced a rehash
+    (assert (not (zerop (kv-vector-needs-rehash
+                         (sb-impl::hash-table-pairs tbl)))))
+    ;; This next thing is impossible to test without some hacks -
+    ;; we want to see that the addr-hashing flag can be cleared
+    ;; if, on rehash, there is currently no address-sensitive key
+    ;; in the table.
+    ;; This could happen in the real world, but it's actually very
+    ;; difficult to construct an example because it requires controlling
+    ;; the addresses of objects.  But the 'rehash' bit had to first get
+    ;; set, and then any key that could cause the bit to get set
+    ;; has to be removed, which means we had to have successfully found
+    ;; and removed address-sensitive keys despite having obsolete hashes.
+    ;; That could only happen by random chance.
+    ;; However, by stomping on a few keys, we can simulate it.
+    (let ((pairs (sb-impl::hash-table-pairs tbl)))
+      (loop for i from 2 below (length pairs) by 2
+            when (consp (aref pairs i))
+            do (setf (aref pairs i) i))) ; highly illegal!
+    ;; try to find an address-sensitive key
+    (assert (not (gethash '(foo) tbl)))
+    (assert (= (sb-kernel:get-header-data (sb-impl::hash-table-pairs tbl))
+               ;; Table is no longer address-sensitive
+               sb-vm:vector-hashing-flag))))
+
+(defun actually-address-sensitive-p (ht)
+  (let* ((hashfun (sb-impl::hash-table-hash-fun ht))
+         (some-actually-address-sensitive-key))
+    (maphash (lambda (key value)
+               (declare (ignore value))
+               (multiple-value-bind (hash address-sensitive)
+                   (funcall hashfun key)
+                 (declare (ignore hash))
+                 (when address-sensitive
+                   (setf some-actually-address-sensitive-key t))))
+             ht)
+    some-actually-address-sensitive-key))
+
+(with-test (:name :unsynchronized-clrhash-no-lock)
+  (let ((ht (make-hash-table)))
+    (setf (gethash 1 ht) 2)
+    (clrhash ht)
+    (assert (not (sb-impl::hash-table-%lock ht)))))
+
+;;; Prove that our completely assinine API with regard to locking works,
+;;; which is to say, if the user explicitly locks an implicitly locked table,
+;;; there is no "Recursive lock attempt" error.
+;;; In general, we can't discern between a lock that preserves table invariants
+;;; at the implementation level, or the user level. But I guess with "system" locks
+;;; it's sort of OK because reentrance isn't really possible, and internally
+;;; the table considers the lock to be a "system" lock.
+(with-test (:name :weak-hash-table-with-explicit-lock)
+  (let ((h (make-hash-table :weakness :key)))
+    (with-locked-hash-table (h) (setf (gethash 'foo h) 1))))
+
+(with-test (:name :hash-table-iterator-no-notes)
+  (let ((f
+         (checked-compile
+          '(lambda (h)
+            (declare (optimize speed))
+            (let ((n 0))
+              (declare (fixnum n))
+              ;; Silly test - count items, unrolling by 2
+              (with-hash-table-iterator (iter h)
+                (loop
+                  (let ((a (iter)))
+                    (unless a (return)))
+                  (let ((a (iter)))
+                    (unless a
+                      (incf n)
+                      (return)))
+                  (incf n 2)))
+              n))
+          :allow-notes nil)))
+    ;; Test F
+    (maphash (lambda (classoid layout)
+               (declare (ignore layout))
+               (let ((subclasses
+                      (sb-kernel:classoid-subclasses classoid)))
+                 (when (hash-table-p subclasses)
+                   (assert (= (hash-table-count subclasses)
+                              (funcall f subclasses))))))
+             (sb-kernel:classoid-subclasses (sb-kernel:find-classoid 't)))))

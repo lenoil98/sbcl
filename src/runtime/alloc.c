@@ -16,7 +16,7 @@
 #include "sbcl.h"
 #include "alloc.h"
 #include "thread.h"
-#include "pseudo-atomic.h"
+#include "getallocptr.h"
 #include "genesis/code.h"
 
 // Work space for the deterministic allocation profiler.
@@ -30,12 +30,16 @@ boolean alloc_profiling;              // enabled flag
 #ifdef LISP_FEATURE_GENCGC
 #ifdef LISP_FEATURE_SB_THREAD
 /* This lock is used to protect non-thread-local allocation. */
-static pthread_mutex_t allocation_lock = PTHREAD_MUTEX_INITIALIZER;
+#ifdef LISP_FEATURE_WIN32
+CRITICAL_SECTION code_allocator_lock, alloc_profiler_lock;
+#else
+static pthread_mutex_t code_allocator_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t alloc_profiler_lock = PTHREAD_MUTEX_INITIALIZER;
+#endif
 #endif
 lispobj alloc_code_object (unsigned total_words)
 {
-    struct thread *th = arch_os_get_current_thread();
+    struct thread *th = get_sb_vm_thread();
 #if defined(LISP_FEATURE_X86_64) && !defined(LISP_FEATURE_WIN32)
 #  define REQUIRE_GC_INHIBIT 0
 #else
@@ -47,28 +51,31 @@ lispobj alloc_code_object (unsigned total_words)
      * pseudo atomic. Here, we rely on gc being inhibited. */
     if (read_TLS(GC_INHIBIT, th) == NIL)
         lose("alloc_code_object called with GC enabled.");
-    /* Since alloc_code_object is run under WITHOUT-GCING it doesn't
-     * actaully need to be pseudo-atomic, this is just to appease the
-     * assertions in general_alloc() */
-    set_pseudo_atomic_atomic(th);
 #endif
 
     /* Allocations of code are all serialized. We might also acquire
      * free_pages_lock depending on availability of space in the region */
-    int result = thread_mutex_lock(&allocation_lock);
+    int result = thread_mutex_lock(&code_allocator_lock);
     gc_assert(!result);
     struct code *code = (struct code *)
-      lisp_alloc(&gc_alloc_region[CODE_PAGE_TYPE-1], total_words*N_WORD_BYTES,
-                 CODE_PAGE_TYPE, th);
-    result = thread_mutex_unlock(&allocation_lock);
+      lisp_alloc(&code_region, total_words*N_WORD_BYTES, CODE_PAGE_TYPE, th);
+    result = thread_mutex_unlock(&code_allocator_lock);
     gc_assert(!result);
-
-#if REQUIRE_GC_INHIBIT
-    clear_pseudo_atomic_atomic(th);
-#endif
+    THREAD_JIT(0);
 
     code->header = ((uword_t)total_words << CODE_HEADER_SIZE_SHIFT) | CODE_HEADER_WIDETAG;
+    code->boxed_size = 0;
+    code->debug_info = 0;
+    ((lispobj*)code)[total_words-1] = 0; // zeroize the simple-fun table count
+    THREAD_JIT(1);
+
     return make_lispobj(code, OTHER_POINTER_LOWTAG);
+}
+void close_code_region() {
+    __attribute__((unused)) int result = thread_mutex_lock(&code_allocator_lock);
+    gc_assert(!result);
+    ensure_region_closed(&code_region, CODE_PAGE_TYPE);
+    thread_mutex_unlock(&code_allocator_lock);
 }
 #endif
 

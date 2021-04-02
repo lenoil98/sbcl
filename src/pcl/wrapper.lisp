@@ -29,45 +29,23 @@
 (defmacro wrapper-class (wrapper)
   `(classoid-pcl-class (layout-classoid ,wrapper)))
 
-(declaim (inline make-wrapper-internal))
-(defun make-wrapper-internal (&key (bitmap -1) length classoid)
-  (make-layout classoid :length length :invalid nil
-               :flags +pcl-object-layout-flag+ :bitmap bitmap))
-
-;;; With compact-instance-header and immobile-code, the primitive object has
-;;; 2 descriptor slots (fin-fun and CLOS slot vector) and 2 non-desriptor slots
-;;; containing machine instructions, after the self-pointer (trampoline) slot.
-;;; Scavenging the self-pointer is unnecessary though harmless.
-;;; This intricate calculation of #b110 makes it insensitive to the
-;;; index of the trampoline slot.
-#+(and immobile-code compact-instance-header)
-(defconstant +fsc-layout-bitmap+
-  (logxor (1- (ash 1 sb-vm:funcallable-instance-info-offset))
-          (ash 1 (1- sb-vm:funcallable-instance-trampoline-slot))))
-
 ;;; This is called in BRAID when we are making wrappers for classes
 ;;; whose slots are not initialized yet, and which may be built-in
-;;; classes. We pass in the class name in addition to the class.
-(defun !boot-make-wrapper (length name &optional class)
+;;; classes.
+(defun !boot-make-wrapper (length name &optional (bitmap +layout-all-tagged+))
   (let ((found (find-classoid name nil)))
     (cond
      (found
-      (unless (classoid-pcl-class found)
-        (setf (classoid-pcl-class found) class))
-      (aver (eq (classoid-pcl-class found) class))
       (let ((layout (classoid-layout found)))
         (aver layout)
         layout))
      (t
-      (make-wrapper-internal
-       :bitmap (cond #+(and immobile-code compact-instance-header)
-                     ((member name '(generic-function
-                                     standard-generic-function))
-                      +fsc-layout-bitmap+)
-                     (t -1))
-       :length length
-       :classoid (make-standard-classoid
-                  :name name :pcl-class class))))))
+       (make-layout (hash-layout-name name)
+                    (make-standard-classoid :name name)
+                    :length length
+                    :flags +pcl-object-layout-flag+
+                    :bitmap bitmap
+                    :invalid nil)))))
 
 ;;; In SBCL, as in CMU CL, the layouts (a.k.a wrappers) for built-in
 ;;; and structure classes already exist when PCL is initialized, so we
@@ -80,24 +58,22 @@
   (cond
     ((or (typep class 'std-class)
          (typep class 'forward-referenced-class))
-     (make-wrapper-internal
-      :bitmap (cond #+(and immobile-code compact-instance-header)
-                    ((eq (class-of class) *the-class-funcallable-standard-class*)
-                     +fsc-layout-bitmap+)
-                    (t -1))
-      :length length
-      :classoid
-      (let ((owrap (class-wrapper class)))
-        (cond (owrap
-               (layout-classoid owrap))
-              ((or (*subtypep (class-of class) *the-class-standard-class*)
-                   (*subtypep (class-of class) *the-class-funcallable-standard-class*)
-                   (typep class 'forward-referenced-class))
-               (let ((name (slot-value class 'name)))
-                 (make-standard-classoid :pcl-class class
-                                         :name (and (symbolp name) name))))
-              (t
-               (bug "Got to T branch in ~S" 'make-wrapper))))))
+     (let* ((name)
+            (classoid
+             (let ((owrap (class-wrapper class)))
+               (cond (owrap
+                      (layout-classoid owrap))
+                     ((or (*subtypep (class-of class) *the-class-standard-class*)
+                          (*subtypep (class-of class) *the-class-funcallable-standard-class*)
+                          (typep class 'forward-referenced-class))
+                      (setq name (slot-value class 'name))
+                      (make-standard-classoid :pcl-class class
+                                              :name (and (symbolp name) name)))
+                     (t
+                      (bug "Got to T branch in ~S" 'make-wrapper))))))
+        (make-layout (hash-layout-name name) classoid
+                     :bitmap +layout-all-tagged+
+                     :invalid nil :length length :flags +pcl-object-layout-flag+)))
     (t
      (let* ((found (find-classoid (slot-value class 'name)))
             (layout (classoid-layout found)))
@@ -106,23 +82,6 @@
        (aver (eq (classoid-pcl-class found) class))
        (aver layout)
        layout))))
-
-(declaim (inline wrapper-class*))
-(defun wrapper-class* (wrapper)
-  (or (wrapper-class wrapper)
-      ;; FIXME: this branch seems unreachable.
-      ;; It would be nice to eliminate WRAPPER-CLASS* if we can show that it
-      ;; is only a holdover from an earlier way of bootstrapping that resulted
-      ;; in the temporary absence of a PCL-CLASS for some non-standard-class.
-      ;; Certainly no test gets here [changing it to (BUG "got here") worked].
-      ;; Note however that
-      ;;  (CLASSOID-PCL-CLASS (FIND-CLASSOID 'STANDARD-INSTANCE)) => NIL
-      ;; which can be resolved by just ensuring one time that it has a CLASS.
-      ;; And nothing else seems to be problematic.
-      (let ((classoid (layout-classoid wrapper)))
-        (ensure-non-standard-class
-         (classoid-name classoid)
-         classoid))))
 
 ;;; The wrapper cache machinery provides general mechanism for
 ;;; trapping on the next access to any instance of a given class. This
@@ -137,6 +96,15 @@
 ;;; SLOT-VALUE-USING-CLASS check the wrapper validity as well. This is
 ;;; done by calling CHECK-WRAPPER-VALIDITY.
 
+;;; This "simple" function hides a horrible inconsistency: we don't have a single
+;;; canonical atomically checkable validity indicator. We carry around invalid layouts
+;;; with nonzero hashes. Why else would there be so may places that can do:
+;;;   (setf (layout-invalid layout) nil
+;;; whilst the layout in question already has a "valid" hash?
+;;; It's hard to know what the right thing is, but since internal code uses
+;;; this test to decide how to handle layouts that have been invalidated,
+;;; I don't think we can just change it to examine the hash value
+;;; even though logically that *should* be the canonical test.
 (declaim (inline invalid-wrapper-p))
 (defun invalid-wrapper-p (wrapper)
   (not (null (layout-invalid wrapper))))
@@ -188,8 +156,7 @@
 ;;; but also pretty much not correct.
 (defun %invalidate-wrapper (owrapper state nwrapper)
   (aver (member state '(:flush :obsolete)))
-  #+sb-thread (aver (eq (sb-thread:mutex-owner sb-c::**world-lock**)
-                        sb-thread:*current-thread*))
+  #+sb-thread (aver (sb-thread:holding-mutex-p sb-c::**world-lock**))
   (let ((classoid (layout-classoid nwrapper))
         (new-previous ())
         (new-state (cons state nwrapper)))
@@ -218,10 +185,13 @@
 
     ;; FIXME: We are here inside PCL lock, but might someone be
     ;; accessing the wrapper at the same time from outside the lock?
-    (setf (layout-clos-hash owrapper) 0)
-    ;; And shouldn't these assignments be flipped, so that if an observer
-    ;; sees a 0 hash in owrapper, it can find the new layout?
+    ;; Inform readers of the reason for wrapper invalidity before marking
+    ;; the wrapper as invalid.
     (setf (layout-invalid owrapper) new-state)
+    ;; Ensure that the INVALID slot conveying ancillary data describing the
+    ;; invalidity reason is published before causing the invalid layout trap.
+    (sb-thread:barrier (:write))
+    (setf (layout-clos-hash owrapper) 0)
     (push (make-weak-pointer owrapper) new-previous)
     ;; This function is called for effect; return value is arbitrary.
     (setf  (sb-kernel::standard-classoid-old-layouts classoid)
@@ -237,7 +207,7 @@
       (aver (not (eq state :uninitialized)))
       (cond ((not state)
              owrapper)
-            ((not (layout-for-std-class-p owrapper))
+            ((not (layout-for-pcl-obj-p owrapper))
              ;; Obsolete structure trap.
              (%obsolete-instance-trap owrapper nil instance))
             ((eq t state)
@@ -251,7 +221,7 @@
              ;;    previous call to REGISTER-LAYOUT for a superclass of
              ;;    INSTANCE's class.  See also the comment above
              ;;    FORCE-CACHE-FLUSHES.  Paul Dietz has test cases for this.
-             (let ((class (wrapper-class* owrapper)))
+             (let ((class (wrapper-class owrapper)))
                (%force-cache-flushes class)
                ;; KLUDGE: avoid an infinite recursion, it's still better to
                ;; bail out with an error for server softwares. see FIXME above.
@@ -275,17 +245,17 @@
                                                            (class-wrapper class)))))))
              (check-wrapper-validity instance))
             ((consp state)
-             (ecase (car state)
-               (:flush
-                (let ((new (cdr state)))
+             (let ((new (the layout (cdr state))))
+               (ecase (car state)
+                 (:flush
                   (cond ((std-instance-p instance)
                          (setf (%instance-layout instance) new))
                         ((fsc-instance-p instance)
-                         (setf (%funcallable-instance-layout instance) new))
+                         (setf (%fun-layout instance) new))
                         (t
-                         (bug "unrecognized instance type")))))
-               (:obsolete
-                (%obsolete-instance-trap owrapper (cdr state) instance))))))))
+                         (bug "unrecognized instance type"))))
+                 (:obsolete
+                  (%obsolete-instance-trap owrapper new instance)))))))))
 
 (declaim (inline check-obsolete-instance))
 (defun check-obsolete-instance (instance)
@@ -397,7 +367,7 @@
                     (setf (cdr dfun-wrappers-tail) new-dfun-wrappers-tail)
                     (setf dfun-wrappers-tail new-dfun-wrappers-tail))))
            ,@(when wrappers
-               `((setq class (wrapper-class* wrapper))
+               `((setq class (wrapper-class wrapper))
                  (setq type `(class-eq ,class)))))
          ,@(when wrappers
              `((push wrapper wrappers-rev)

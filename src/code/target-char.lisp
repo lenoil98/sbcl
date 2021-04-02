@@ -12,14 +12,13 @@
 (in-package "SB-IMPL")
 
 ;;; We compile some trivial character operations via inline expansion.
-#-sb-fluid
 (declaim (inline standard-char-p graphic-char-p alpha-char-p
                  alphanumericp))
 (declaim (maybe-inline upper-case-p lower-case-p both-case-p
                        digit-char-p))
 
 (deftype char-code ()
-  `(integer 0 (,sb-xc:char-code-limit)))
+  `(integer 0 (,char-code-limit)))
 
 (define-load-time-global **unicode-character-name-huffman-tree** ())
 
@@ -42,7 +41,7 @@
 
 (macrolet ((frob ()
              (flet ((coerce-it (array)
-                      (sb-xc:coerce array '(simple-array (unsigned-byte 8) 1)))
+                      (coerce array '(simple-array (unsigned-byte 8) 1)))
                     (file (name type)
                       (let ((dir (sb-cold:prepend-genfile-path "output/")))
                         (make-pathname :directory (pathname-directory (merge-pathnames dir))
@@ -187,7 +186,11 @@
                           (setf **character-cases** table))
 
                         (setf **character-collations**
-                              (let* ((table (make-hash-table :size 27978
+                              (let* ((n-entries
+                                      ,(let ((n-entries-file (file "n-collation-entries" "lisp-expr")))
+                                         (with-open-file (s n-entries-file)
+                                           (read s))))
+                                     (table (make-hash-table :size n-entries
                                                              #+64-bit :test #+64-bit #'eq))
                                      (index 0)
                                      (info (make-ubn-vector ,collations 4))
@@ -207,9 +210,12 @@
                                         (dotimes (i key-length)
                                           (setf (ldb (byte 32 (* i 32)) key) (aref info index))
                                           (incf index))
+                                        ;; verify the validity of
+                                        ;; :test 'eq on 64-bit
+                                        #+64-bit (aver (typep (apply #'pack-3-codepoints codepoints) 'fixnum))
                                         (setf (gethash (apply #'pack-3-codepoints codepoints) table)
                                               key)))
-                                (assert (= (hash-table-count table) 27978))
+                                (aver (= (hash-table-count table) n-entries))
                                 table))))
 
                     ,(with-open-file
@@ -296,7 +302,6 @@
                                           ',(convert-to-double-vector u1-name->code t))))))))))))))
 
   (frob))
-#+sb-xc-host (!character-name-database-cold-init)
 
 (define-load-time-global *base-char-name-alist*
   ;; Note: The *** markers here indicate character names which are

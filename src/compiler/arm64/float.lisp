@@ -694,7 +694,7 @@
       (complex-single-reg
        (unless (eql (tn-offset r) (tn-offset real))
          (inst s-mov r real))
-       (inst s-ins r 1 imag 0 :s))
+       (inst ins r 1 imag 0 :s))
       (complex-single-stack
        (let ((nfp (current-nfp-tn vop))
              (offset (tn-offset r)))
@@ -725,7 +725,7 @@
       (complex-double-reg
        (unless (eql (tn-offset r) (tn-offset real))
          (inst s-mov r real))
-       (inst s-ins r 1 imag 0 :d))
+       (inst ins r 1 imag 0 :d))
       (complex-double-stack
        (let ((nfp (current-nfp-tn vop))
              (offset (tn-offset r)))
@@ -750,7 +750,7 @@
   (:generator 3
     (sc-case x
       (complex-single-reg
-       (inst s-ins r 0 x (ecase slot
+       (inst ins r 0 x (ecase slot
                            (:real 0)
                            (:imag 1))
              :s))
@@ -785,7 +785,7 @@
   (:generator 3
     (sc-case x
       (complex-double-reg
-       (inst s-ins r 0 x (ecase slot
+       (inst ins r 0 x (ecase slot
                            (:real 0)
                            (:imag 1))
              :d))
@@ -802,3 +802,33 @@
   (:translate imagpart)
   (:note "complex double float imagpart")
   (:variant :imag))
+
+(define-vop ()
+  (:translate round-double)
+  (:policy :fast-safe)
+  (:args (x :scs (double-reg) :target r))
+  (:arg-types double-float (:constant symbol))
+  (:info mode)
+  (:results (r :scs (double-reg)))
+  (:result-types double-float)
+  (:generator 2
+    (ecase mode
+      (:round (inst frintn r x))
+      (:floor (inst frintm r x))
+      (:ceiling (inst frintp r x))
+      (:truncate (inst frintz r x)))))
+
+(define-vop ()
+  (:translate round-single)
+  (:policy :fast-safe)
+  (:args (x :scs (single-reg) :target r))
+  (:arg-types single-float (:constant symbol))
+  (:info mode)
+  (:results (r :scs (single-reg)))
+  (:result-types single-float)
+  (:generator 2
+    (ecase mode
+      (:round (inst frintn r x))
+      (:floor (inst frintm r x))
+      (:ceiling (inst frintp r x))
+      (:truncate (inst frintz r x)))))

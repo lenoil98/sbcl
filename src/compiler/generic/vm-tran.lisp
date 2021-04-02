@@ -84,19 +84,85 @@
                          sb-vm:bignum-digits-offset
                          index offset))
 
-;;; The layout is stored in slot 0.
-;;; *** These next two transforms should be the only code, aside from
-;;;     some parts of the C runtime, with knowledge of the layout index.
+(defun dd-contains-raw-slots-p (dd)
+  (dolist (dsd (dd-slots dd))
+    (unless (eq (dsd-raw-type dsd) t) (return t))))
+
+(deftransform copy-structure ((instance) * * :result result :node node)
+  (let* ((classoid (lvar-type instance))
+         (name (and (structure-classoid-p classoid) (classoid-name classoid)))
+         (layout (and name
+                      (sb-kernel::compiler-layout-ready-p name)
+                      (sb-kernel::compiler-layout-or-lose name)))
+         ;; CLASS-EQ is T if the layout at runtime will be EQ to the
+         ;; layout of the specified type, and not that of a subtype thereof.
+         (class-eq (and name
+                        (eq (classoid-state classoid) :sealed)
+                        (not (classoid-subclasses classoid))))
+         (dd (and class-eq (layout-info layout)))
+         (max-inlined-words 5))
+    (unless (and result ; could be unused result (but entire call wasn't flushed?)
+                 layout
+                 ;; And don't copy if raw slots are present on the precisely GCed backends.
+                 ;; To enable that, we'd want variants for {"all-raw", "all-boxed", "mixed"}
+                 ;; Also note that VAR-ALLOC can not cope with dynamic-extent except where
+                 ;; support has been added (x86oid so far); so requiring an exact type here
+                 ;; causes VAR-ALLOC to become FIXED-ALLOC which works on more architectures.
+                 #-c-stack-is-control-stack (and dd (not (dd-contains-raw-slots-p dd)))
+
+                 ;; Definitely do this if copying to stack
+                 (or (lvar-dynamic-extent result)
+                     ;; Or if it's a small fixed number of words
+                     ;; and speed at least as important as size.
+                     (and class-eq
+                          (<= (dd-length dd) max-inlined-words)
+                          (policy node (>= speed space)))))
+      (give-up-ir1-transform))
+    ;; There are some benefits to using the simple case for a known exact type:
+    ;; - the layout can be wired in which might or might not save 1 instruction
+    ;;   depending on whether layouts are in immobile space.
+    ;; - for a small number of slots, copying them is inlined
+    (cond ((not dd) ; it's going to be some subtype of NAME
+           `(%copy-instance (%make-instance (%instance-length instance)) instance))
+          ((<= (dd-length dd) max-inlined-words)
+           `(let ((copy (%make-structure-instance ,dd nil)))
+              ;; ASSUMPTION: either %INSTANCE-REF is the correct accessor for this word,
+              ;; or the GC will treat random bit patterns as conservative pointers
+              ;; (i.e. not alter them if %INSTANCE-REF is not the correct accessor)
+              (setf ,@(loop for i from sb-vm:instance-data-start below (dd-length dd)
+                            append `((%instance-ref copy ,i) (%instance-ref instance ,i))))
+              copy))
+          (t
+           `(%copy-instance-slots (%make-structure-instance ,dd nil) instance)))))
+
+(defun varying-length-struct-p (classoid)
+  ;; This is a nice feature to have in general, but at present it is only possible
+  ;; to make varying length instances of LAYOUT and nothing else.
+  (eq (classoid-name classoid) 'layout))
+
+(deftransform %instance-length ((instance))
+  (let ((classoid (lvar-type instance)))
+    (if (and (structure-classoid-p classoid)
+             (sb-kernel::compiler-layout-ready-p (classoid-name classoid))
+             (eq (classoid-state classoid) :sealed)
+             (not (varying-length-struct-p classoid))
+             ;; TODO: if sealed with subclasses which add no slots, use the fixed length
+             (not (classoid-subclasses classoid)))
+        (dd-length (layout-dd (sb-kernel::compiler-layout-or-lose (classoid-name classoid))))
+        (give-up-ir1-transform))))
+
+;;; *** These transforms should be the only code, aside from the C runtime
+;;;     with knowledge of the layout index.
+#+compact-instance-header
+(define-source-transform function-with-layout-p (x) `(functionp ,x))
 #-compact-instance-header
 (progn
   (define-source-transform %instance-layout (x)
     `(truly-the layout (%instance-ref ,x 0)))
   (define-source-transform %set-instance-layout (x val)
     `(%instance-set ,x 0 (the layout ,val)))
-  (define-source-transform %funcallable-instance-layout (x)
-    `(truly-the layout (%funcallable-instance-info ,x 0)))
-  (define-source-transform %set-funcallable-instance-layout (x val)
-    `(setf (%funcallable-instance-info ,x 0) (the layout ,val))))
+  (define-source-transform function-with-layout-p (x)
+    `(funcallable-instance-p ,x)))
 
 ;;;; simplifying HAIRY-DATA-VECTOR-REF and HAIRY-DATA-VECTOR-SET
 
@@ -122,7 +188,7 @@
   "avoid runtime dispatch on array element type"
   (let* ((type (lvar-type array))
          (element-ctype (array-type-upgraded-element-type type))
-         (declared-element-ctype (array-type-declared-element-type type)))
+         (declared-element-ctype (declared-array-element-type type)))
     (declare (type ctype element-ctype))
     (when (eq *wild-type* element-ctype)
       (give-up-ir1-transform
@@ -141,8 +207,7 @@
                   ((type= element-ctype declared-element-ctype)
                    bare-form)
                   (t
-                   `(the ,(type-specifier declared-element-ctype)
-                         ,bare-form))))))))
+                   (the-unwild declared-element-ctype bare-form))))))))
 
 ;;; Transform multi-dimensional array to one dimensional data vector
 ;;; access.
@@ -216,7 +281,7 @@
   "avoid runtime dispatch on array element type"
   (let* ((type (lvar-type array))
          (element-ctype (array-type-upgraded-element-type type))
-         (declared-element-ctype (array-type-declared-element-type type)))
+         (declared-element-ctype (declared-array-element-type type)))
     (declare (type ctype element-ctype))
     (when (eq *wild-type* element-ctype)
       (give-up-ir1-transform
@@ -228,10 +293,9 @@
                   (type ,element-type-specifier new-value))
          ,(if (type= element-ctype declared-element-ctype)
               '(data-vector-set array index new-value)
-              `(truly-the ,(type-specifier declared-element-ctype)
-                 (data-vector-set array index
-                  (the ,(type-specifier declared-element-ctype)
-                       new-value))))))))
+              (truly-the-unwild declared-element-ctype
+                 `(data-vector-set array index
+                   ,(the-unwild declared-element-ctype 'new-value))))))))
 
 ;;; Transform multi-dimensional array to one dimensional data vector
 ;;; access.
@@ -323,7 +387,7 @@
                 ,(if (and (integer-type-p index-type)
                           (numeric-type-low index-type))
                      `(integer ,(numeric-type-low index-type)
-                               (,sb-xc:array-dimension-limit))
+                               (,array-dimension-limit))
                      `index))))))
 
 (deftransform %data-vector-and-index ((%array %index)
@@ -443,6 +507,7 @@
                   (word-logical-not (%vector-raw-bits bit-array index))))))))
 
 (deftransform bit-vector-= ((x y) (simple-bit-vector simple-bit-vector))
+  ;; TODO: unroll if length is known and not more than a few words
   `(and (= (length x) (length y))
         (let ((length (length x)))
           (or (= length 0)
@@ -483,6 +548,7 @@
 
 (deftransform count ((item sequence) (bit simple-bit-vector) *
                      :policy (>= speed space))
+  ;; TODO: unroll if length is known and not more than a few words
   `(let ((length (length sequence)))
     (if (zerop length)
         0
@@ -559,23 +625,24 @@
                      (dotimes (i sb-vm:n-word-bytes accum)
                        (setf accum (logior accum (ash code (* 8 i))))))
                    `(let ((code (sb-xc:char-code item)))
-                     (logior ,@(loop for i from 0 below sb-vm:n-word-bytes
-                                     collect `(ash code ,(* 8 i))))))))
+                      (setf code (dpb code (byte 8 8) code))
+                      (setf code (dpb code (byte 16 16) code))
+                      (dpb code (byte 32 32) code)))))
     `(let ((length (length sequence))
            (value ,value))
-      (multiple-value-bind (times rem)
-          (truncate length sb-vm:n-word-bytes)
-        (do ((index 0 (1+ index))
-             (end times))
-            ((>= index end)
-             (let ((place (* times sb-vm:n-word-bytes)))
-               (declare (fixnum place))
-               (dotimes (j rem sequence)
-                 (declare (index j))
-                 (setf (schar sequence (the index (+ place j))) item))))
-          (declare (optimize (speed 3) (safety 0))
-                   (type index index))
-          (setf (%vector-raw-bits sequence index) value))))))
+       (multiple-value-bind (times rem)
+           (truncate length sb-vm:n-word-bytes)
+         (do ((index 0 (1+ index))
+              (end times))
+             ((>= index end)
+              (let ((place (* times sb-vm:n-word-bytes)))
+                (declare (fixnum place))
+                (dotimes (j rem sequence)
+                  (declare (index j))
+                  (setf (schar sequence (the index (+ place j))) item))))
+           (declare (optimize (speed 3) (safety 0))
+                    (type index index))
+           (setf (%vector-raw-bits sequence index) value))))))
 
 ;;;; %BYTE-BLT
 
@@ -624,15 +691,15 @@
      (values)))
 
 ;;;; transforms for EQL of floating point values
-#-(vop-named sb-vm::eql/single-float)
+(unless (vop-existsp :named sb-vm::eql/single-float)
 (deftransform eql ((x y) (single-float single-float))
-  '(= (single-float-bits x) (single-float-bits y)))
+  '(= (single-float-bits x) (single-float-bits y))))
 
-#-(vop-named sb-vm::eql/double-float)
+(unless (vop-existsp :named sb-vm::eql/double-float)
 (deftransform eql ((x y) (double-float double-float))
   #-64-bit '(and (= (double-float-low-bits x) (double-float-low-bits y))
                   (= (double-float-high-bits x) (double-float-high-bits y)))
-  #+64-bit '(= (double-float-bits x) (double-float-bits y)))
+  #+64-bit '(= (double-float-bits x) (double-float-bits y))))
 
 
 ;;;; modular functions
@@ -752,11 +819,11 @@
 ;;; VOP can't handle them.
 
 (deftransform sb-vm::get-lisp-obj-address ((obj) ((constant-arg fixnum)))
-  (ash (lvar-value obj) sb-vm::n-fixnum-tag-bits))
+  (ash (lvar-value obj) sb-vm:n-fixnum-tag-bits))
 
 (deftransform sb-vm::get-lisp-obj-address ((obj) ((constant-arg character)))
-  (logior sb-vm::character-widetag
-          (ash (char-code (lvar-value obj)) sb-vm::n-widetag-bits)))
+  (logior sb-vm:character-widetag
+          (ash (char-code (lvar-value obj)) sb-vm:n-widetag-bits)))
 
 ;; So that the PCL code walker doesn't observe any use of %PRIMITIVE,
 ;; MAKE-UNBOUND-MARKER is an ordinary function, not a macro.

@@ -5,117 +5,78 @@
 
 (in-package "SB-VM")
 
-(macrolet
-    ((def ((name c-name pseudo-atomic &key do-not-preserve (stack-delta 0))
-           move-arg
-           move-result)
-       `(define-assembly-routine
-            (,name (:return-style :none))
-            ()
-          (macrolet ((map-registers (op)
-                       (let ((registers (set-difference
-                                         '(rax-tn rcx-tn rdx-tn rsi-tn rdi-tn
-                                           r8-tn r9-tn r10-tn r11-tn)
-                                         ',do-not-preserve)))
-                         ;; Preserve alignment
-                         (when (oddp (length registers))
-                           (push (car registers) registers))
-                         `(progn
-                            ,@(loop for reg in (if (eq op 'pop)
-                                                   (reverse registers)
-                                                   registers)
-                                    collect
-                                    `(inst ,op ,reg)))))
-                     (map-floats (op)
-                       `(progn
-                          ,@(loop for i by 16
-                                  for float in
-                                  '(float0-tn float1-tn float2-tn float3-tn
-                                    float4-tn float5-tn float6-tn float7-tn
-                                    float8-tn float9-tn float10-tn float11-tn
-                                    float12-tn float13-tn float14-tn float15-tn)
-                                  collect
-                                  (if (eql op 'pop)
-                                      `(inst movaps ,float (ea ,i rsp-tn))
-                                      `(inst movaps (ea ,i rsp-tn) ,float))))))
-            (inst cld)
-            (inst push rbp-tn)
-            (inst mov rbp-tn rsp-tn)
-            (inst and rsp-tn (- (* n-word-bytes 2)))
-            (inst sub rsp-tn (* 16 16))
-            (map-floats push)
-            (map-registers push)
-            ,@move-arg
-            (pseudo-atomic (:elide-if (not ,pseudo-atomic))
-              ;; asm routines can always call foreign code with a relative operand
-              (inst call (make-fixup ,c-name :foreign)))
-            ,@move-result
-            (map-registers pop)
-            (map-floats pop)
-            (inst mov rsp-tn rbp-tn)
-            (inst pop rbp-tn)
-            (inst ret ,stack-delta)))))
+;;; It is arbitrary whether each of the next 4 routines is named ALLOC-something,
+;;; exporting an additional entry named CONS-something, versus being named CONS-something
+;;; and exporting ALLOC-something.  It just depends on which of those you would like
+;;; to have to set and clear the low bit to match ALLOC-DISPATCH.
+;;; Think of "cons" as meaning the generic sense of "consing", not as actually
+;;; allocating conses, because fixed-sized non-cons object allocation may enter
+;;; through the cons entry point. Cons cells *must* use that entry point.
+(define-assembly-routine (alloc->rnn (:export cons->rnn)) ()
+  (inst or :byte (ea 8 rsp-tn) 1)
+  CONS->RNN
+  (with-registers-preserved (c xmm)
+    (inst mov rdi-tn (ea 16 rbp-tn))
+    (inst call (make-fixup 'alloc-dispatch :assembly-routine))
+    (inst mov (ea 16 rbp-tn) rax-tn))) ; result onto stack
 
-  (def (alloc-tramp "alloc" nil)
-    ((inst mov rdi-tn (ea 16 rbp-tn))) ; arg
-    ((inst mov (ea 16 rbp-tn) rax-tn))) ; result
+#+avx2
+(define-assembly-routine (alloc->rnn.avx2 (:export cons->rnn.avx2)) ()
+  (inst or :byte (ea 8 rsp-tn) 1)
+  CONS->RNN.AVX2
+  (with-registers-preserved (c ymm)
+    (inst mov rdi-tn (ea 16 rbp-tn))
+    (inst call (make-fixup 'alloc-dispatch :assembly-routine))
+    (inst mov (ea 16 rbp-tn) rax-tn))) ; result onto stack
 
-  (def (alloc-tramp-r11 "alloc" nil
-                        :do-not-preserve (r11-tn)
-                        :stack-delta 8) ;; remove the size parameter
-    ((inst mov rdi-tn (ea 16 rbp-tn))) ; arg
-    ((inst mov r11-tn rax-tn))) ; result
+(define-assembly-routine (alloc->r11 (:export cons->r11) (:return-style :none)) ()
+  (inst or :byte (ea 8 rsp-tn) 1)
+  CONS->R11
+  (with-registers-preserved (c xmm :except r11-tn)
+    (inst mov rdi-tn (ea 16 rbp-tn))
+    (inst call (make-fixup 'alloc-dispatch :assembly-routine))
+    (inst mov r11-tn rax-tn))
+  (inst ret 8)) ; pop argument
 
-  #+immobile-space
-  (def (alloc-layout "alloc_layout" nil :do-not-preserve (r11-tn))
-    () ; no arg
-    ((inst mov r11-tn rax-tn))) ; result
+#+avx2
+(define-assembly-routine (alloc->r11.avx2 (:export cons->r11.avx2) (:return-style :none)) ()
+  (inst or :byte (ea 8 rsp-tn) 1)
+  CONS->R11.AVX2
+  (with-registers-preserved (c ymm :except r11-tn)
+    (inst mov rdi-tn (ea 16 rbp-tn))
+    (inst call (make-fixup 'alloc-dispatch :assembly-routine))
+    (inst mov r11-tn rax-tn))
+  (inst ret 8)) ; pop argument
 
-  ;; These routines are for the deterministic allocation profiler.
-  ;; The C support routine's argument is the return PC
-  (def (enable-alloc-counter "allocation_tracker_counted" t)
-    ((inst lea rdi-tn (ea 8 rbp-tn))) ; arg
-    ()) ; result
+(define-assembly-routine (alloc-dispatch (:return-style :none)) ()
+  ;; If RDI has a 0 in the low bit, then we're allocating cons cells.
+  ;; A 1 bit signifies anything other than cons cells, and is equivalent
+  ;; to "could this object consume large-object pages" in gencgc.
+  (inst test :byte rdi-tn 1)
+  (inst jmp :z (make-fixup "alloc_list" :foreign))
+  (inst xor :byte rdi-tn 1) ; clear the bit
+  (inst jmp  (make-fixup "alloc" :foreign)))
 
-  (def (enable-sized-alloc-counter "allocation_tracker_sized" t)
-    ((inst lea rdi-tn (ea 8 rbp-tn))) ; arg
-    ())) ; result
+;;; These routines are for the deterministic consing profiler.
+;;; The C support routine's argument is the return PC.
+;;; FIXME: we're missing routines that preserve YMM. I guess nobody cares.
+(define-assembly-routine (enable-alloc-counter) ()
+  (with-registers-preserved (c xmm)
+    (inst lea rdi-tn (ea 8 rbp-tn))
+    (pseudo-atomic () (inst call (make-fixup "allocation_tracker_counted" :foreign)))))
 
-(define-assembly-routine
-    (#+immobile-code undefined-fdefn
-     #-immobile-code undefined-tramp
-     (:return-style :none)
-     #+immobile-code
-     (:export undefined-tramp))
+(define-assembly-routine (enable-sized-alloc-counter) ()
+  (with-registers-preserved (c xmm)
+    (inst lea rdi-tn (ea 8 rbp-tn))
+    (pseudo-atomic () (inst call (make-fixup "allocation_tracker_sized" :foreign)))))
+
+(define-assembly-routine (undefined-tramp (:return-style :none))
     ((:temp rax descriptor-reg rax-offset))
-  #+immobile-code
-  (progn
-    (inst pop rax) ; gets the address of the fdefn (plus some)
-    (inst sub :dword rax
-          ;; Subtract the length of the JMP instruction plus offset to the
-          ;; raw-addr-slot, and add back the lowtag. Voila, a tagged descriptor.
-          (+ 5 (ash fdefn-raw-addr-slot word-shift) (- other-pointer-lowtag))))
-  #+immobile-code
-  UNDEFINED-TRAMP
   (inst pop (ea n-word-bytes rbp-tn))
   (emit-error-break nil cerror-trap (error-number-or-lose 'undefined-fun-error) (list rax))
   (inst push (ea n-word-bytes rbp-tn))
   (inst jmp (ea (- (* closure-fun-slot n-word-bytes) fun-pointer-lowtag) rax)))
 
-#-sb-dynamic-core
-(define-assembly-routine
-    (undefined-alien-tramp (:return-style :none))
-    ()
-  ;; Unlike in the above UNDEFINED-TRAMP, we *should* *not* issue "POP [RBP+8]"
-  ;; because that would overwrite the PC to which the calling function is
-  ;; supposed to return with the address from which this alien call was made
-  ;; (a PC within that same function) since C convention does not arrange
-  ;; for RBP to hold the new frame pointer prior to making a call.
-  ;; This wouldn't matter much because the only restart available is to throw
-  ;; to toplevel, so a lost frame is not hugely important, but it's annoying.
-  (error-call nil 'undefined-alien-fun-error rbx-tn))
-
-#+sb-dynamic-core
 (define-assembly-routine
     (undefined-alien-tramp (:return-style :none))
     ()
@@ -158,10 +119,61 @@
     (closure-tramp (:return-style :none))
     ()
   (loadw rax-tn rax-tn fdefn-fun-slot other-pointer-lowtag)
-  (inst jmp (make-ea-for-object-slot rax-tn closure-fun-slot fun-pointer-lowtag)))
+  (inst jmp (object-slot-ea rax-tn closure-fun-slot fun-pointer-lowtag)))
 
 (define-assembly-routine
     (funcallable-instance-tramp (:return-style :none))
     ()
   (loadw rax-tn rax-tn funcallable-instance-function-slot fun-pointer-lowtag)
-  (inst jmp (make-ea-for-object-slot rax-tn closure-fun-slot fun-pointer-lowtag)))
+  (inst jmp (object-slot-ea rax-tn closure-fun-slot fun-pointer-lowtag)))
+
+(define-assembly-routine (ensure-symbol-hash (:return-style :raw)) ()
+  #+avx2
+  (progn
+    (test-cpu-feature cpu-has-ymm-registers)
+    (inst jmp :z call-preserving-xmm-only)
+    (with-registers-preserved (lisp ymm :except r11-tn)
+      (inst mov rdx-tn (ea 16 rbp-tn)) ; arg
+      (call-static-fun 'ensure-symbol-hash 1)
+      (inst mov (ea 16 rbp-tn) rdx-tn)) ; result to arg passing loc
+    (inst ret))
+  call-preserving-xmm-only
+  (with-registers-preserved (lisp xmm :except r11-tn)
+    (inst mov rdx-tn (ea 16 rbp-tn)) ; arg
+    (call-static-fun 'ensure-symbol-hash 1)
+    (inst mov (ea 16 rbp-tn) rdx-tn))) ; result to arg passing loc
+
+(define-assembly-routine (sb-impl::install-hash-table-lock
+                          (:return-style :raw))
+  ()
+  #+avx2
+  (progn
+    (test-cpu-feature cpu-has-ymm-registers)
+    (inst jmp :z call-preserving-xmm-only)
+    (with-registers-preserved (lisp ymm :except r11-tn)
+      (inst mov rdx-tn (ea 16 rbp-tn)) ; arg
+      (call-static-fun 'sb-impl::install-hash-table-lock 1)
+      (inst mov (ea 16 rbp-tn) rdx-tn)) ; result to arg passing loc
+    (inst ret))
+  call-preserving-xmm-only
+  (with-registers-preserved (lisp xmm :except r11-tn)
+    (inst mov rdx-tn (ea 16 rbp-tn)) ; arg
+    (call-static-fun 'sb-impl::install-hash-table-lock 1)
+    (inst mov (ea 16 rbp-tn) rdx-tn))) ; result to arg passing loc
+
+(define-assembly-routine (invalid-layout-trap (:return-style :none)) ()
+  #+avx2
+  (progn
+    (test-cpu-feature cpu-has-ymm-registers)
+    (inst jmp :z call-preserving-xmm-only)
+    (with-registers-preserved (lisp ymm :except r11-tn)
+      (inst mov rdx-tn (ea 16 rbp-tn)) ; arg
+      (call-static-fun 'update-object-layout 1)
+      (inst mov (ea 16 rbp-tn) rdx-tn)) ; result to arg passing loc
+    (inst ret)) ; Caller pops the result
+  call-preserving-xmm-only
+  (with-registers-preserved (lisp xmm :except r11-tn)
+    (inst mov rdx-tn (ea 16 rbp-tn)) ; arg
+    (call-static-fun 'update-object-layout 1)
+    (inst mov (ea 16 rbp-tn) rdx-tn)) ; result to arg passing loc
+  (inst ret)) ;  Caller pops the result

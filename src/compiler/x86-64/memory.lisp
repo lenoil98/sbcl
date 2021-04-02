@@ -79,8 +79,7 @@
   (:variant-vars offset lowtag)
   (:policy :fast-safe)
   (:generator 4
-    (gen-cell-set (make-ea-for-object-slot object offset lowtag)
-                  value nil)))
+    (gen-cell-set (object-slot-ea object offset lowtag) value nil)))
 
 ;;; X86 special
 (define-vop (cell-xadd)
@@ -92,7 +91,7 @@
   (:policy :fast-safe)
   (:generator 4
     (move result value)
-    (inst xadd (make-ea-for-object-slot object offset lowtag) result :lock)))
+    (inst xadd :lock (object-slot-ea object offset lowtag) result)))
 
 (define-vop (cell-xsub cell-xadd)
   (:args (object)
@@ -104,11 +103,11 @@
     (sc-case value
      (immediate
       (let ((k (tn-value value)))
-        (inst mov result (fixnumize (if (= k sb-xc:most-negative-fixnum) k (- k))))))
+        (inst mov result (fixnumize (if (= k most-negative-fixnum) k (- k))))))
      (t
       (move result value)
       (inst neg result)))
-    (inst xadd (make-ea-for-object-slot object offset lowtag) result :lock)))
+    (inst xadd :lock (object-slot-ea object offset lowtag) result)))
 
 (define-vop (atomic-inc-symbol-global-value cell-xadd)
   (:translate %atomic-inc-symbol-global-value)
@@ -150,7 +149,7 @@
                    (const (if (sc-is delta immediate)
                               (fixnumize ,(if (eq inherit 'cell-xsub)
                                               `(let ((x (tn-value delta)))
-                                                 (if (= x sb-xc:most-negative-fixnum)
+                                                 (if (= x most-negative-fixnum)
                                                      x (- x)))
                                               `(tn-value delta)))))
                    (retry (gen-label)))
@@ -168,12 +167,21 @@
                         `(progn (move newval rax)
                                 (inst sub newval delta))
                         `(inst lea newval (ea rax delta))))
-               (inst cmpxchg
-                     (make-ea-for-object-slot cell ,slot list-pointer-lowtag)
-                     newval :lock)
+               (inst cmpxchg :lock
+                     (object-slot-ea cell ,slot list-pointer-lowtag)
+                     newval)
                (inst jmp :ne retry)
                (inst mov result rax)))))))
   (def-atomic %atomic-inc-car cell-xadd cons-car-slot)
   (def-atomic %atomic-inc-cdr cell-xadd cons-cdr-slot)
   (def-atomic %atomic-dec-car cell-xsub cons-car-slot)
   (def-atomic %atomic-dec-cdr cell-xsub cons-cdr-slot))
+
+;; Atomically set a bit of an instance header word
+(define-vop (set-instance-hashed)
+  (:args (x :scs (descriptor-reg)))
+  (:generator 1
+    (inst or :lock :byte (ea (- 1 instance-pointer-lowtag) x)
+          ;; Bit index is 0-based. Subtract 8 since we're using the EA
+          ;; to select byte 1 of the header word.
+          (ash 1 (- stable-hash-required-flag 8)))))

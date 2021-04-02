@@ -31,7 +31,10 @@
                           (dolist (name (info-vector-name-list symbol))
                             (funcall function name))))))
               ,@(unless (equal situations '(:compile-toplevel))
-                  `((info-maphash (lambda (name data)
+                  `((dovector (obj (car *fdefns*))
+                      (when (fdefn-p obj)
+                        (funcall function (fdefn-name obj))))
+                    (info-maphash (lambda (name data)
                                     (declare (ignore data))
                                     (funcall function name))
                                   *info-environment*))))))))
@@ -41,10 +44,3 @@
   ;; to detect possible inlining failures
   (def :compile-toplevel)
   (def :load-toplevel :execute))
-
-;;; This check is most effective when placed in the final cross-compiled file.
-;;; Parallelized build effectively skips this, but oh well.
-(loop for (object . hash) in '#.sb-c::*sxhash-crosscheck*
-      unless (= (sxhash object) hash)
-      do (error "SB-XC:SXHASH computed wrong answer for ~S. Got ~x should be ~x"
-                object hash (sxhash object)))

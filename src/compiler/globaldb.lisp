@@ -34,7 +34,6 @@
 
 (in-package "SB-IMPL")
 
-#-no-ansi-print-object
 (defmethod print-object ((x meta-info) stream)
   (print-unreadable-object (x stream)
     (format stream "~S ~S, ~D" (meta-info-category x) (meta-info-kind x)
@@ -79,17 +78,14 @@
         ;; The SB-FASL: symbols are poor style, but the lesser evil.
         ;; If exported, then they'll stick around in the target image.
         ;; Perhaps SB-COLD should re-export some of these.
-        (declare (special sb-fasl::*dynamic* sb-fasl::*cold-layouts*))
-        (let ((layout (gethash 'meta-info sb-fasl::*cold-layouts*)))
-          (sb-fasl::cold-svset
-           (sb-fasl::cold-symbol-value '*info-types*)
-           id
-           (sb-fasl::write-slots
-            (sb-fasl::allocate-struct sb-fasl::*dynamic* layout)
-            'meta-info ; give the type name in lieu of layout
-            :category category :kind kind :type-spec type-spec
-            :type-checker checker :validate-function validator
-            :default default :number id)))))
+        (sb-fasl::cold-svset
+         (sb-fasl::cold-symbol-value '*info-types*)
+         id
+         (sb-fasl::write-slots
+          (sb-fasl::allocate-struct-of-type 'meta-info)
+          :category category :kind kind :type-spec type-spec
+          :type-checker checker :validate-function validator
+          :default default :number id))))
 
 ;;;; info types, and type numbers, part II: what's
 ;;;; needed only at compile time, not at run time
@@ -168,6 +164,8 @@
   ;; to be certain that it's not supposed to happen when building the xc.
   #+sb-xc-xhost (error "Strange CLEAR-INFO building the xc: ~S ~S"
                        name info-numbers)
+  (when (pcl-methodfn-name-p name)
+    (error "Can't SET-INFO-VALUE on PCL-internal function"))
   (let (new)
     (with-globaldb-name (key1 key2) name
       :simple
@@ -187,7 +185,7 @@
                   (if old
                       ;; if -REMOVE => nil, then update NEW but return OLD
                       (or (setq new (packed-info-remove
-                                     old +no-auxilliary-key+ info-numbers))
+                                     old +no-auxiliary-key+ info-numbers))
                           old))))
         (info-puthash *info-environment* name #'clear-hairy)))
     (not (null new))))
@@ -199,7 +197,10 @@
   ;; from keyword-pair to object is deferred until cold-init.
   (dovector (x (the simple-vector *info-types*))
     (when x (!register-meta-info x)))
-  #-sb-xc-host (setq *info-environment* (make-info-hashtable)))
+  #-sb-xc-host
+  (let ((h (make-info-hashtable)))
+    (setf (sb-thread:mutex-name (info-env-mutex h)) "globaldb")
+    (setq *info-environment* h)))
 
 ;;;; GET-INFO-VALUE
 
@@ -235,7 +236,7 @@
            ;; but constraint propagation isn't informing the compiler here.
            :simple (values (symbol-info-vector (truly-the symbol key1)) key2)
            :hairy (values (info-gethash name *info-environment*)
-                          +no-auxilliary-key+)))
+                          +no-auxiliary-key+)))
       (when vector
         (let ((index (packed-info-value-index vector aux-key info-number)))
           (when index
@@ -265,7 +266,10 @@
   ;; 19990330
   :default
   #+sb-xc-host nil
-  #-sb-xc-host (lambda (name) (if (fboundp name) :function nil)))
+  #-sb-xc-host (lambda (name)
+                 (if (or (fboundp name) (pcl-methodfn-name-p name))
+                     :function
+                     nil)))
 
 ;;; The deferred mode processor for fasteval special operators.
 ;;; Immediate processors are hung directly off symbols in a dedicated slot.
@@ -276,8 +280,9 @@
 (define-info-type (:function :deprecated)
   :type-spec (or null deprecation-info))
 
-(declaim (ftype (sfunction (t) ctype)
-                specifier-type ctype-of sb-kernel::ctype-of-array))
+;;; Why are these here? It seems like the wrong place.
+(declaim (ftype (sfunction (t &optional t symbol) ctype) specifier-type)
+         (ftype (sfunction (t) ctype) ctype-of sb-kernel::ctype-of-array))
 
 ;;; the ASSUMED-TYPE for this function, if we have to infer the type
 ;;; due to not having a declaration or definition
@@ -360,6 +365,13 @@
 ;;; If a function is "known" to the compiler, then this is a FUN-INFO
 ;;; structure containing the info used to special-case compilation.
 (define-info-type (:function :info) :type-spec (or sb-c::fun-info null))
+
+;;; For PCL code walker
+(define-info-type (:function :walker-template) :type-spec (or list symbol))
+
+;;; The exact type for which this function is the predicate.
+;;; Applicable only for symbols in the CL package.
+(define-info-type (:function :predicate-for) :type-spec t)
 
 ;;; This is a type specifier <t> such that if an argument X to the function
 ;;; does not satisfy (TYPEP x <t>) then the function definitely returns NIL.
@@ -445,7 +457,7 @@
                        ;; The compiler-macro signals an error
                        ;; on forward-referenced info-types.
                        #+sb-xc-host (declare (notinline info))
-                       (when (info :declaration :recognized name)
+                       (when (info :declaration :known name)
                          (error 'declaration-type-conflict-error
                                 :format-arguments (list name)))))
 
@@ -487,8 +499,8 @@
 ;; Therefore maintain a list of recognized declarations. This list makes the
 ;; globaldb storage of same redundant, but oh well.
 (defglobal *recognized-declarations* nil)
-(define-info-type (:declaration :recognized)
-  :type-spec boolean
+(define-info-type (:declaration :known)
+  :type-spec (or function boolean)
   ;; There's no portable way to unproclaim that a symbol is a declaration,
   ;; but at the low-level permit new-value to be NIL.
   :validate-function (lambda (name new-value)
@@ -501,8 +513,6 @@
                              (t
                               (setq *recognized-declarations*
                                     (delete name *recognized-declarations*))))))
-
-(define-info-type (:declaration :handler) :type-spec (or function null))
 
 ;;;; ":ALIEN-TYPE" subsection - Data pertaining to globally known alien-types.
 (define-info-type (:alien-type :kind)
@@ -519,9 +529,7 @@
   :type-spec (or null sb-alien-internals:alien-type))
 
 ;;;; ":SETF" subsection - Data pertaining to expansion of the omnipotent macro.
-(define-info-type (:setf :documentation) :type-spec (or string null))
-(define-info-type (:setf :expander)
-    :type-spec (or symbol function (cons integer function) null))
+(define-info-type (:setf :expander) :type-spec (or function list))
 
 ;;;; ":CAS" subsection - Like SETF but there are no "inverses", just expanders
 (define-info-type (:cas :expander) :type-spec (or function null))

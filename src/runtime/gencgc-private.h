@@ -12,7 +12,7 @@
 #ifndef _GENCGC_PRIVATE_H_
 #define _GENCGC_PRIVATE_H_
 
-void zero_dirty_pages(page_index_t start, page_index_t end);
+void zero_dirty_pages(page_index_t start, page_index_t end, int page_type);
 
 /// There is some additional cleverness that could potentially be had -
 /// the "need_to_zero" bit (a/k/a "page dirty") is obviously 1 if the page
@@ -101,4 +101,7 @@ static inline enum prot_mode protection_mode(page_index_t page) {
 #endif
 }
 
+#ifndef LISP_FEATURE_SB_THREAD
+#define SINGLE_THREAD_BOXED_REGION (struct alloc_region*)(STATIC_SPACE_START + 2*N_WORD_BYTES)
+#endif
 #endif /* _GENCGC_PRIVATE_H_ */

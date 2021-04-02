@@ -1,5 +1,8 @@
 ;;; -*- lisp -*-
 
+#-(or sb-testing-contrib sb-building-contrib)
+(error "Can't build contribs with ASDF")
+
 (defsystem "sb-simple-streams"
   :depends-on ("sb-bsd-sockets" "sb-posix")
   #+sb-building-contrib :pathname
@@ -29,3 +32,7 @@
   #+sb-building-contrib :pathname
   #+sb-building-contrib #p"SYS:CONTRIB;SB-SIMPLE-STREAMS;"
   :components ((:file "simple-stream-tests")))
+
+(defmethod perform ((o test-op) (c (eql (find-system "sb-simple-streams/tests"))))
+  (or (funcall (intern "DO-TESTS" (find-package "SB-RT")))
+      (error "test-op failed")))

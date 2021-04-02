@@ -23,12 +23,11 @@
                   sb-vm:*control-stack-start*
                   sb-vm:*control-stack-end*
                   sb-vm:*binding-stack-start*
-                  #+(or hpux) sb-vm::*c-lra*
                   *allow-with-interrupts*
                   sb-unix::*unblock-deferrables-on-enabling-interrupts-p*
                   *interrupts-enabled*
                   *interrupt-pending*
-                  #+sb-thruption *thruption-pending*
+                  #+sb-safepoint *thruption-pending*
                   #+sb-safepoint *in-safepoint*
                   *free-interrupt-context-index*
                   #-gencgc
@@ -36,7 +35,7 @@
                   sb-vm::*binding-stack-pointer*
                   sb-pcl::*cache-miss-values-stack*
                   sb-pcl::*dfun-miss-gfs-on-stack*))
-(defvar sb-vm:*alloc-signal*) ; initialized by create_thread_struct()
+
 ;;; This is a slot of 'struct thread' if multithreaded,
 ;;; and the symbol-global-value should never be used.
 ;;; (And in any case it is not really a special var)
@@ -71,3 +70,9 @@
 an implementation of EVAL that calls the compiler will be used. If set
 to :INTERPRET, an interpreter will be used.")
 (declaim (always-bound *evaluator-mode*))
+
+(declaim (inline sb-vm:is-lisp-pointer))
+(defun sb-vm:is-lisp-pointer (addr) ; Same as is_lisp_pointer() in C
+  #-64-bit (oddp addr)
+  #+ppc64 (= (logand addr #b101) #b100)
+  #+(and 64-bit (not ppc64)) (not (logtest (logxor addr 3) 3)))

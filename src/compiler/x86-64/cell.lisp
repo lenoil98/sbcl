@@ -54,11 +54,9 @@
                   (inst push object)))
            (invoke-asm-routine 'call 'code-header-set vop))
           ((equal name '(setf %funcallable-instance-fun))
-           (gen-cell-set (make-ea-for-object-slot object offset lowtag)
-                         value nil vop t))
+           (gen-cell-set (object-slot-ea object offset lowtag) value nil vop t))
           (t
-           (gen-cell-set (make-ea-for-object-slot object offset lowtag)
-                         value nil)))))
+           (gen-cell-set (object-slot-ea object offset lowtag) value nil)))))
 
 ;; INIT-SLOT has to know about the :COMPACT-INSTANCE-HEADER feature.
 (define-vop (init-slot set-slot)
@@ -91,11 +89,17 @@
   (:results (result :scs (descriptor-reg any-reg)))
   (:generator 5
      (move rax old)
-     (inst cmpxchg (ea (- (* offset n-word-bytes) lowtag) object)
-           new :lock)
+     (inst cmpxchg :lock (ea (- (* offset n-word-bytes) lowtag) object) new)
      (move result rax)))
 
 ;;;; symbol hacking VOPs
+
+(define-vop (make-unbound-marker)
+  (:args)
+  (:results (result :scs (descriptor-reg any-reg)))
+  (:generator 1
+    (inst mov result (logior (+ sb-vm:static-space-start #x100)
+                             unbound-marker-widetag))))
 
 (define-vop (%set-symbol-global-value)
   (:args (object :scs (descriptor-reg immediate))
@@ -105,7 +109,7 @@
     (gen-cell-set (cond ((sc-is object immediate)
                          (symbol-slot-ea (tn-value object) symbol-value-slot))
                         (t
-                         (make-ea-for-object-slot object symbol-value-slot
+                         (object-slot-ea object symbol-value-slot
                                                   other-pointer-lowtag)))
                   value nil)))
 
@@ -130,7 +134,7 @@
   (:generator 9
     (let ((err-lab (generate-error-code vop 'unbound-symbol-error object)))
       (loadw value object symbol-value-slot other-pointer-lowtag)
-      (inst cmp :dword value unbound-marker-widetag)
+      (inst cmp :byte value unbound-marker-widetag)
       (inst jmp :e err-lab))))
 
 ;; Return the DISP field to use in an EA relative to thread-base-tn
@@ -188,11 +192,11 @@
       (let ((unbound (generate-error-code vop 'unbound-symbol-error symbol)))
         #+sb-thread (progn (compute-virtual-symbol)
                             (move rax old)
-                            (inst cmpxchg (symbol-value-slot-ea cell) new :lock))
+                            (inst cmpxchg :lock (symbol-value-slot-ea cell) new))
         #-sb-thread (progn (move rax old)
                             ;; is the :LOCK is necessary?
-                            (inst cmpxchg (symbol-value-slot-ea symbol) new :lock))
-        (inst cmp :dword rax unbound-marker-widetag)
+                            (inst cmpxchg :lock (symbol-value-slot-ea symbol) new))
+        (inst cmp :byte rax unbound-marker-widetag)
         (inst jmp :e unbound)
         (move result rax))))
 
@@ -207,11 +211,11 @@
     (:policy :fast-safe)
     (:generator 10
       (move rax old)
-      (inst cmpxchg
+      (inst cmpxchg :lock
             (if (sc-is symbol immediate)
                 (symbol-slot-ea (tn-value symbol) symbol-value-slot)
                 (symbol-value-slot-ea symbol))
-            new :lock)
+            new)
       (move result rax)))
 
   #+sb-thread
@@ -235,6 +239,7 @@
         ;; In order from best to worst.
         (cond
           ((symbol-always-has-tls-value-p known-symbol)
+           (setq symbol-reg nil)
            (inst mov value (access-wired-tls-val known-symbol)))
           (t
            (cond
@@ -276,7 +281,7 @@
 
         (when check-boundp
           (assemble ()
-            (inst cmp :dword value unbound-marker-widetag)
+            (inst cmp :byte value unbound-marker-widetag)
             (let* ((immediatep (sc-is symbol immediate))
                    (staticp (and immediatep (static-symbol-p known-symbol)))
                    (*location-context* (make-restart-location RETRY value)))
@@ -290,7 +295,7 @@
                                 (lambda ()
                                   (load-immediate vop symbol symbol-reg)))
                             vop 'unbound-symbol-error
-                            (if (and immediatep (not staticp))
+                            (if (or (not symbol-reg) (and immediatep (not staticp)))
                                 symbol
                                 symbol-reg))))
             RETRY))))
@@ -332,7 +337,7 @@
         (inst mov :dword temp (thread-tls-ea temp))
         (inst cmp :dword temp no-tls-value-marker-widetag)
         (inst cmov :dword :e temp (symbol-value-slot-ea object))
-        (inst cmp :dword temp unbound-marker-widetag))))
+        (inst cmp :byte temp unbound-marker-widetag))))
 
 ) ; END OF MACROLET
 
@@ -349,7 +354,7 @@
     (:args (symbol :scs (descriptor-reg)))
     (:conditional :ne)
     (:generator 9
-      (inst cmp :dword (make-ea-for-object-slot
+      (inst cmp :byte (object-slot-ea
                  symbol symbol-value-slot other-pointer-lowtag)
             unbound-marker-widetag))))
 
@@ -359,12 +364,79 @@
   (:args (symbol :scs (descriptor-reg)))
   (:results (res :scs (any-reg)))
   (:result-types positive-fixnum)
+  (:args-var args)
   (:generator 2
+    (loadw res symbol symbol-hash-slot other-pointer-lowtag)
     ;; The symbol-hash slot of NIL holds NIL because it is also the
-    ;; cdr slot, so we have to zero the fixnum tag bit(s) to make sure
+    ;; car slot, so we have to zero the fixnum tag bit(s) to make sure
     ;; it is a fixnum.  The lowtag selection magic that is required to
     ;; ensure this is explained in the comment in objdef.lisp
+    (unless (not-nil-tn-ref-p args)
+      (inst and res (lognot fixnum-tag-mask)))))
+
+;;; Combine SYMBOL-HASH and the lisp fallback code into one vop.
+(define-vop ()
+  (:policy :fast-safe)
+  (:translate ensure-symbol-hash)
+  (:args (symbol :scs (descriptor-reg)))
+  (:results (res :scs (any-reg)))
+  (:result-types positive-fixnum)
+  (:vop-var vop)
+  (:generator 5
+    (when (location= res symbol) (move temp-reg-tn symbol)) ; save a backup
     (loadw res symbol symbol-hash-slot other-pointer-lowtag)
+    (inst test :dword res res)
+    (inst jmp :ne good)
+    (inst push (if (location= res symbol) temp-reg-tn symbol))
+    (invoke-asm-routine 'call 'ensure-symbol-hash vop)
+    (inst pop res)
+    GOOD
+    (inst and res (lognot fixnum-tag-mask)))) ; redundant (but ok) if asm routine used
+
+(define-vop ()
+  (:policy :fast-safe)
+  (:translate sb-impl::install-hash-table-lock)
+  (:args (arg :scs (descriptor-reg)))
+  (:results (res :scs (descriptor-reg)))
+  (:vop-var vop)
+  (:generator 5
+    (inst push arg)
+    (invoke-asm-routine 'call 'sb-impl::install-hash-table-lock vop)
+    (inst pop res)))
+
+(eval-when (:compile-toplevel)
+  ;; assumption: any object can be read 1 word past its base pointer
+  (assert (= sb-vm:symbol-hash-slot 1)))
+
+(define-vop (symbol-hash*)
+  (:policy :fast-safe)
+  (:translate symbol-hash*)
+  (:args (symbol :scs (descriptor-reg)))
+  (:info satisfies)
+  (:arg-types * (:constant (member symbolp non-null-symbol-p)))
+  (:results (res :scs (any-reg)))
+  (:result-types positive-fixnum)
+  (:generator 2
+    (loadw res symbol symbol-hash-slot other-pointer-lowtag)
+    (when (eq satisfies 'symbolp) ; mask to a fixnum
+      (inst and res (lognot fixnum-tag-mask)))))
+(define-vop (symbol-hash*-random) ; this vop needs a temp; the above doesn't
+  (:policy :fast-safe)
+  (:translate symbol-hash*)
+  (:args (object :scs (descriptor-reg)))
+  (:info satisfies)
+  ;; arg can not target the temp because they both have to be live
+  ;; in order that the tagged pointer not disappear.
+  ;; But temp and output could be in the same register.
+  (:temporary (:sc unsigned-reg :to (:result 0)) base-ptr)
+  (:arg-types * (:constant (eql nil)))
+  (:results (res :scs (any-reg)))
+  (:result-types positive-fixnum)
+  (:ignore satisfies)
+  (:generator 4
+    (inst mov base-ptr object)
+    (inst and base-ptr (lognot lowtag-mask))
+    (inst mov res (ea n-word-bytes base-ptr)) ; 1 word beyond the header
     (inst and res (lognot fixnum-tag-mask))))
 
 ;;;; fdefinition (FDEFN) objects
@@ -406,6 +478,7 @@
     (storew raw fdefn fdefn-raw-addr-slot other-pointer-lowtag)
     (move result function)))
 #+immobile-code
+(progn
 (define-vop (set-fdefn-fun)
   (:args (fdefn :scs (descriptor-reg))
          (function :scs (descriptor-reg))
@@ -418,7 +491,21 @@
       (inst mov (ea (- (ash fdefn-fun-slot word-shift) other-pointer-lowtag) fdefn)
             function)
       (inst mov (ea (- (ash fdefn-raw-addr-slot word-shift) other-pointer-lowtag) fdefn)
-            raw-word))))
+            raw-word)
+      ;; Ensure that the header contains a JMP instruction, not INT3.
+      ;; This store is aligned
+      (inst mov :word (ea (- 2 other-pointer-lowtag) fdefn) #x25FF))))
+(define-vop (set-undefined-fdefn-fun)
+  ;; Do not set the raw-addr slot and do not change the header
+  (:args (fdefn :scs (descriptor-reg))
+         (function :scs (descriptor-reg)))
+  (:vop-var vop)
+  (:generator 38
+    (pseudo-atomic ()
+      (inst push fdefn)
+      (invoke-asm-routine 'call 'touch-gc-card vop)
+      (inst mov (ea (- (ash fdefn-fun-slot word-shift) other-pointer-lowtag) fdefn)
+            function)))))
 
 (define-vop (fdefn-makunbound)
   (:policy :fast-safe)
@@ -426,28 +513,22 @@
   (:args (fdefn :scs (descriptor-reg) :target result))
   (:results (result :scs (descriptor-reg)))
   (:vop-var vop)
-  #+immobile-code (:temporary (:sc unsigned-reg) temp)
   (:generator 38
-    #+immobile-code
-    (let ((tramp (make-fixup 'undefined-fdefn :assembly-routine)))
-     (if (sb-c::code-immobile-p vop)
-         (inst lea temp (ea tramp rip-tn))
-         (inst mov temp tramp))
-     ;; Compute displacement from the call site
-     (inst sub :dword temp fdefn)
-     (inst sub :dword temp
-           (+ (- other-pointer-lowtag) (ash fdefn-raw-addr-slot word-shift) 5))
-     ;; Compute the encoding of a "CALL rel32" instruction
-     (inst shl temp 8)
-     (inst or :byte temp #xE8)
-     ;; Store
-     (storew nil-value fdefn fdefn-fun-slot other-pointer-lowtag)
-     (storew temp fdefn fdefn-raw-addr-slot other-pointer-lowtag))
-    #-immobile-code
-    (progn
-     (storew nil-value fdefn fdefn-fun-slot other-pointer-lowtag)
-     (storew (make-fixup 'undefined-tramp :assembly-routine)
-             fdefn fdefn-raw-addr-slot other-pointer-lowtag))
+    ;; Change the JMP instruction to INT3 so that a trap occurs in the fdefn
+    ;; itself, otherwise we've no way of knowing what function name was invoked.
+    (inst mov :word (ea (- 2 other-pointer-lowtag) fdefn)
+          (logand undefined-fdefn-header #xFFFF))
+    ;; Once the opcode is written, the values in 'fun' and 'raw-addr' become irrelevant.
+    ;; These stores act primarily to clear the reference from a GC perspective.
+    (storew nil-value fdefn fdefn-fun-slot other-pointer-lowtag)
+    ;; With #+immobile-code we never call via the raw-addr slot for undefined
+    ;; functions if the single instruction "call <fdefn>" form is used. The INT3
+    ;; raises sigtrap which we catch, then load RAX with the address of the fdefn
+    ;; and resume at undefined-tramp. However, CALL-SYMBOL jumps via raw-addr if
+    ;; its callable object was not a function. In that case RAX holds a symbol,
+    ;; so we're OK because we can identify the undefined function.
+    (storew (make-fixup 'undefined-tramp :assembly-routine)
+            fdefn fdefn-raw-addr-slot other-pointer-lowtag)
     (move result fdefn)))
 
 ;;;; binding and unbinding
@@ -636,54 +717,18 @@
 
 ;;;; structure hackery
 
-(define-vop (instance-length)
+(define-vop ()
   (:policy :fast-safe)
   (:translate %instance-length)
   (:args (struct :scs (descriptor-reg)))
-  ;; Explicitly fixnumizing admits a 32-bit left-shift which might encode
-  ;; in 1 less byte. (Other backends return an UNSIGNED-REG here.)
   (:results (res :scs (any-reg)))
   (:result-types positive-fixnum)
   (:generator 4
-    (inst movzx '(:word :dword) res (ea (1+ (- instance-pointer-lowtag)) struct))
-    (inst and :dword res short-header-max-words) ; clear special GC bit
-    (inst shl :dword res n-fixnum-tag-bits)))
-
-#+compact-instance-header
-(progn
- (define-vop (%instance-layout)
-   (:translate %instance-layout)
-   (:policy :fast-safe)
-   (:args (object :scs (descriptor-reg)))
-   (:results (res :scs (descriptor-reg)))
-   (:variant-vars lowtag)
-   (:variant instance-pointer-lowtag)
-   (:generator 1
-    (inst mov :dword res (ea (- 4 lowtag) object))))
- (define-vop (%set-instance-layout)
-   (:translate %set-instance-layout)
-   (:policy :fast-safe)
-   (:args (object :scs (descriptor-reg))
-          (value :scs (any-reg descriptor-reg) :target res))
-   (:results (res :scs (any-reg descriptor-reg)))
-   (:variant-vars lowtag)
-   (:variant instance-pointer-lowtag)
-   (:vop-var vop)
-   (:generator 2 ; underestimates cost, but irrelevant as there's no choice
-    (cond ((= lowtag fun-pointer-lowtag)
-           (pseudo-atomic ()
-             (inst push object)
-             (invoke-asm-routine 'call 'touch-gc-card vop)
-             (inst mov :dword (ea (- 4 lowtag) object) value)))
-          (t
-           (inst mov :dword (ea (- 4 lowtag) object) value)))
-    (move res value)))
- (define-vop (%funcallable-instance-layout %instance-layout)
-   (:translate %funcallable-instance-layout)
-   (:variant fun-pointer-lowtag))
- (define-vop (%set-funcallable-instance-layout %set-instance-layout)
-   (:translate %set-funcallable-instance-layout)
-   (:variant fun-pointer-lowtag)))
+    (inst mov :dword res (ea (- instance-pointer-lowtag) struct))
+    ;; Returning fixnum/any-reg elides some REX prefixes due to the shifts
+    ;; being small. Maybe the asm optimizer could figure it out now?
+    (inst shr :dword res (- instance-length-shift n-fixnum-tag-bits))
+    (inst and :dword res (fixnumize instance-length-mask))))
 
 (define-full-reffer instance-index-ref * instance-slots-offset
   instance-pointer-lowtag (any-reg descriptor-reg) * %instance-ref)
@@ -703,7 +748,7 @@
 (define-full-reffer code-header-ref * 0 other-pointer-lowtag
   (any-reg descriptor-reg) * code-header-ref)
 
-;; CODE-HEADER-SET of a constant index is never used, so we specifically
+;; CODE-HEADER-SET of a constant index is seldom used, so we specifically
 ;; ask not to get it defined. (It's not impossible to use, it's just not
 ;; helpful to have - either you want to access CODE-FIXUPS or CODE-DEBUG-INFO,
 ;; which do things their own way, or you want a variable index.)
@@ -724,7 +769,7 @@
                      (- instance-pointer-lowtag))
                   object index (ash 1 (- word-shift n-fixnum-tag-bits)))))))
   (macrolet
-      ((def (suffix result-sc result-type inst &optional (inst/c inst))
+      ((def (suffix result-sc result-type inst &optional (inst/c (list 'quote inst)))
          `(progn
             (define-vop (,(symbolicate "RAW-INSTANCE-REF/" suffix))
               (:translate ,(symbolicate "%RAW-INSTANCE-REF/" suffix))
@@ -748,7 +793,7 @@
               (:results (value :scs (,result-sc)))
               (:result-types ,result-type)
               (:generator 4
-                (inst ,inst/c value (instance-slot-ea object index))))
+                (inst* ,inst/c value (instance-slot-ea object index))))
             (define-vop (,(symbolicate "RAW-INSTANCE-SET/" suffix))
               (:translate ,(symbolicate "%RAW-INSTANCE-SET/" suffix))
               (:policy :fast-safe)
@@ -774,7 +819,7 @@
               (:results (result :scs (,result-sc)))
               (:result-types ,result-type)
               (:generator 4
-                (inst ,inst/c (instance-slot-ea object index) value)
+                (inst* ,inst/c (instance-slot-ea object index) value)
                 (move result value)))
             (define-vop (,(symbolicate "RAW-INSTANCE-INIT/" suffix))
               (:args (object :scs (descriptor-reg))
@@ -782,7 +827,7 @@
               (:arg-types * ,result-type)
               (:info index)
               (:generator 4
-                (inst ,inst/c (instance-slot-ea object index) value))))))
+                (inst* ,inst/c (instance-slot-ea object index) value))))))
     (def word unsigned-reg unsigned-num mov)
     (def signed-word signed-reg signed-num mov)
     (def single single-reg single-float movss)
@@ -801,7 +846,7 @@
     (:results (result :scs (unsigned-reg)))
     (:result-types unsigned-num)
     (:generator 5
-      (inst xadd (instance-slot-ea object index) diff :lock)
+      (inst xadd :lock (instance-slot-ea object index) diff)
       (move result diff)))
 
   (define-vop (raw-instance-atomic-incf-c/word)
@@ -817,7 +862,7 @@
     (:results (result :scs (unsigned-reg)))
     (:result-types unsigned-num)
     (:generator 4
-      (inst xadd (instance-slot-ea object index) diff :lock)
+      (inst xadd :lock (instance-slot-ea object index) diff)
       (move result diff))))
 
 ;;;;
@@ -833,7 +878,7 @@
   (move rdx old-hi)
   (move rbx new-lo)
   (move rcx new-hi)
-  (inst cmpxchg16b memory-operand :lock)
+  (inst cmpxchg16b :lock memory-operand)
   ;; RDX:RAX hold the actual old contents of memory.
   ;; Manually analyze result lifetimes to avoid clobbering.
   (cond ((and (location= result-lo rdx) (location= result-hi rax))
@@ -858,13 +903,13 @@
                  (new-hi :scs (descriptor-reg any-reg) :target ecx))
           (:results (result-lo :scs (descriptor-reg any-reg))
                     (result-hi :scs (descriptor-reg any-reg)))
-          (:temporary (:sc unsigned-reg :offset eax-offset
+          (:temporary (:sc unsigned-reg :offset rax-offset
                        :from (:argument 2) :to (:result 0)) eax)
-          (:temporary (:sc unsigned-reg :offset edx-offset
+          (:temporary (:sc unsigned-reg :offset rdx-offset
                        :from (:argument 3) :to (:result 0)) edx)
-          (:temporary (:sc unsigned-reg :offset ebx-offset
+          (:temporary (:sc unsigned-reg :offset rbx-offset
                        :from (:argument 4) :to (:result 0)) ebx)
-          (:temporary (:sc unsigned-reg :offset ecx-offset
+          (:temporary (:sc unsigned-reg :offset rcx-offset
                        :from (:argument 5) :to (:result 0)) ecx)
           (:generator 7
            (generate-dblcas ,memory-operand

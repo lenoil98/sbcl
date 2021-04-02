@@ -48,33 +48,59 @@
 
 (macrolet ((read-depthoid ()
              `(ea (- (+ 4 (ash (+ instance-slots-offset
-                                  (get-dsd-index layout sb-kernel::%bits))
+                                  (get-dsd-index layout sb-kernel::flags))
                                word-shift))
                      instance-pointer-lowtag)
                   layout)))
-  (define-vop (layout-depthoid)
+  (define-vop ()
     (:translate layout-depthoid)
     (:policy :fast-safe)
     (:args (layout :scs (descriptor-reg)))
     (:results (res :scs (any-reg)))
     (:result-types fixnum)
     (:generator 1 (inst movsx '(:dword :qword) res (read-depthoid))))
-  (define-vop (sb-c::layout-depthoid-gt)
-    (:translate sb-c::layout-depthoid-gt)
+  (define-vop ()
+    (:translate sb-c::layout-depthoid-ge)
     (:policy :fast-safe)
     (:args (layout :scs (descriptor-reg)))
     (:info k)
     (:arg-types * (:constant (unsigned-byte 16)))
-    (:conditional :g)
+    (:conditional :ge)
     (:generator 1 (inst cmp :dword (read-depthoid) (fixnumize k)))))
 
+(define-vop ()
+  (:translate sb-c::%structure-is-a)
+  (:args (x :scs (descriptor-reg)))
+  (:arg-types * (:constant t))
+  (:info test)
+  (:policy :fast-safe)
+  (:conditional :e)
+  (:generator 1
+    (inst cmp :dword
+          (ea (+ (ash (+ (get-dsd-index layout sb-kernel::id-word0)
+                         instance-slots-offset)
+                      word-shift)
+                 (ash (- (layout-depthoid test) 2) 2)
+                 (- instance-pointer-lowtag))
+              x)
+          ;; Small layout-ids can only occur for layouts made in genesis.
+          ;; Therefore if the compile-time value of the ID is small,
+          ;; it is permanently assigned to that type.
+          ;; Otherwise, we allow for the possibility that the compile-time ID
+          ;; is not the same as the load-time ID.
+          ;; I don't think layout-id 0 can get here, but be sure to exclude it.
+          (if (or (typep (layout-id test) '(and (signed-byte 8) (not (eql 0))))
+                  (not (sb-c::producing-fasl-file)))
+              (layout-id test)
+              (make-fixup test :layout-id)))))
+
 #+compact-instance-header
-;; ~20 instructions vs. 35
-(define-vop (layout-of) ; no translation
+(progn
+;; ~17 instructions vs. 35
+(define-vop ()
     (:policy :fast-safe)
     (:translate layout-of)
-    (:args (object :scs (descriptor-reg))
-           #+nil (layouts :scs (constant)))
+    (:args (object :scs (descriptor-reg)))
     (:temporary (:sc unsigned-reg :offset rax-offset) rax)
     (:results (result :scs (descriptor-reg)))
     (:generator 6
@@ -102,13 +128,6 @@
       (inst jmp  :eq NULL)
       (inst movzx '(:byte :dword) rax object)
       LOAD-FROM-VECTOR
-      #+nil ;; old way
-      (progn
-        (inst mov  result layouts)
-        (inst mov  :dword result
-              (ea (+ (ash vector-data-offset word-shift) (- other-pointer-lowtag))
-                  result rax 8)))
-      ;; new way
       (inst mov :dword result
             (ea (make-fixup '**primitive-object-layouts**
                            :symbol-value
@@ -119,6 +138,20 @@
       NULL
       (inst mov  result (make-fixup 'null :layout))
       DONE))
+(define-vop ()
+    (:policy :fast-safe)
+    (:translate %instanceoid-layout)
+    (:args (object :scs (descriptor-reg) :to :save))
+    (:temporary (:sc unsigned-reg) temp)
+    (:results (result :scs (descriptor-reg)))
+    (:generator 6
+      (inst lea temp (ea -3 object))
+      (inst and temp (lognot #b1000))
+      (inst mov :dword result (make-fixup 't :layout))
+      (inst test :byte temp 15)
+      (inst jmp :ne DONE)
+      (inst mov :dword result (ea 4 temp))
+      DONE)))
 
 (macrolet ((load-type (target source lowtag)
              `(inst movzx '(:byte :dword) ,target (ea (- ,lowtag) ,source))))
@@ -136,16 +169,6 @@
   (:results (result :scs (unsigned-reg)))
   (:result-types positive-fixnum)
   (:generator 1 (load-type result function fun-pointer-lowtag))))
-
-(define-vop (fun-header-data)
-  (:translate fun-header-data)
-  (:policy :fast-safe)
-  (:args (x :scs (descriptor-reg)))
-  (:results (res :scs (unsigned-reg)))
-  (:result-types positive-fixnum)
-  (:generator 6
-    (loadw res x 0 fun-pointer-lowtag)
-    (inst shr res n-widetag-bits)))
 
 (define-vop (get-header-data)
   (:translate get-header-data)
@@ -175,6 +198,9 @@
     (inst mov :byte temp (ea (- other-pointer-lowtag) x))
     (storew temp x 0 other-pointer-lowtag)
     (move res x)))
+
+;;; These next 3 vops are for manipulating and reading the flag bits of
+;;; arrays headers, or more generally any OTHER-POINTER object.
 (define-vop (set-header-bits)
   (:translate set-header-bits)
   (:policy :fast-safe)
@@ -193,44 +219,21 @@
   (:info bits)
   (:generator 1
     (if (typep bits '(unsigned-byte 8))
-        (inst and :byte (ea (- 1 other-pointer-lowtag) x) (lognot bits))
+        (inst and :byte (ea (- 1 other-pointer-lowtag) x) (logandc1 bits #xff))
         (inst and :dword (ea (- other-pointer-lowtag) x)
               (lognot (ash bits n-widetag-bits))))))
-
-;;; Set the bit indicating that instances of this type require
-;;; special treatment of slot index 0.
-(define-vop (set-custom-gc-scavenge-bit)
-  (:args (x :scs (descriptor-reg)))
+(define-vop (test-header-bit)
+  (:translate test-header-bit)
+  (:policy :fast-safe)
+  (:args (array :scs (descriptor-reg)))
+  (:arg-types t (:constant t))
+  (:info mask)
+  (:conditional :ne)
   (:generator 1
-    (inst or :byte (ea (- 2 instance-pointer-lowtag) x) #x80)))
-
-(define-vop (get-header-data-high)
-  (:translate get-header-data-high)
-  (:policy :fast-safe)
-  (:args (x :scs (descriptor-reg)))
-  (:results (res :scs (any-reg)))
-  (:result-types positive-fixnum)
-  (:generator 6
-    (inst mov :dword res (ea (- 4 other-pointer-lowtag) x))
-    (inst shl res n-fixnum-tag-bits)))
-
-;;; Swap the high half of the header word of an object
-;;; that has OTHER-POINTER-LOWTAG
-(define-vop (cas-header-data-high)
-  (:args (object :scs (descriptor-reg) :to :eval)
-         (old :scs (unsigned-reg) :target rax)
-         (new :scs (unsigned-reg)))
-  (:policy :fast-safe)
-  (:translate cas-header-data-high)
-  (:temporary (:sc descriptor-reg :offset rax-offset
-               :from (:argument 1) :to :result :target result) rax)
-  (:arg-types * unsigned-num unsigned-num)
-  (:results (result :scs (any-reg)))
-  (:result-types positive-fixnum)
-  (:generator 5
-     (move rax old)
-     (inst cmpxchg :dword (ea (- 4 other-pointer-lowtag) object) new :lock)
-     (inst lea result (ea nil rax (ash 1 n-fixnum-tag-bits)))))
+    ;; Assert that the mask is in header-data byte index 0
+    ;; which is byte index 1 of the whole header word.
+    (aver (typep mask '(unsigned-byte 8)))
+    (inst test :byte (ea (- 1 other-pointer-lowtag) array) mask)))
 
 (define-vop (pointer-hash)
   (:translate pointer-hash)
@@ -239,8 +242,7 @@
   (:policy :fast-safe)
   (:generator 1
     (move res ptr)
-    (inst and res (constantize (dpb -1 (byte (- n-word-bits n-fixnum-tag-bits 1)
-                                             n-fixnum-tag-bits) 0)))))
+    (inst and res (lognot fixnum-tag-mask))))
 
 ;;;; allocation
 
@@ -320,26 +322,24 @@
                result))))
 
 ;;;; symbol frobbing
-(defun load-symbol-info-vector (result symbol temp)
+(defun load-symbol-info-vector (result symbol)
   (loadw result symbol symbol-info-slot other-pointer-lowtag)
   ;; If RES has list-pointer-lowtag, take its CDR. If not, use it as-is.
   ;; This CMOV safely reads from memory when it does not move, because if
   ;; there is an info-vector in the slot, it has at least one element.
   ;; This would compile to almost the same code without a VOP,
   ;; but using a jmp around a mov instead.
-  (inst lea :dword temp (ea (- list-pointer-lowtag) result))
-  (inst test :byte temp lowtag-mask)
+  (aver (= (logior list-pointer-lowtag #b1000) other-pointer-lowtag))
+  (inst test :byte result #b1000)
   (inst cmov :e result
-        (make-ea-for-object-slot result cons-cdr-slot list-pointer-lowtag)))
+        (object-slot-ea result cons-cdr-slot list-pointer-lowtag)))
 
 (define-vop (symbol-info-vector)
   (:policy :fast-safe)
   (:translate symbol-info-vector)
   (:args (x :scs (descriptor-reg)))
   (:results (res :scs (descriptor-reg)))
-  (:temporary (:sc unsigned-reg :offset rax-offset) rax)
-  (:generator 1
-    (load-symbol-info-vector res x rax)))
+  (:generator 1 (load-symbol-info-vector res x)))
 
 (define-vop (symbol-plist)
   (:policy :fast-safe)
@@ -428,10 +428,10 @@
 (define-vop (%read-cycle-counter)
   (:policy :fast-safe)
   (:translate %read-cycle-counter)
-  (:temporary (:sc unsigned-reg :offset eax-offset :target lo) eax)
-  (:temporary (:sc unsigned-reg :offset edx-offset :target hi) edx)
-  (:temporary (:sc unsigned-reg :offset ebx-offset) ebx)
-  (:temporary (:sc unsigned-reg :offset ecx-offset) ecx)
+  (:temporary (:sc unsigned-reg :offset rax-offset :target lo) eax)
+  (:temporary (:sc unsigned-reg :offset rdx-offset :target hi) edx)
+  (:temporary (:sc unsigned-reg :offset rbx-offset) ebx)
+  (:temporary (:sc unsigned-reg :offset rcx-offset) ecx)
   (:ignore ebx ecx)
   (:results (hi :scs (unsigned-reg))
             (lo :scs (unsigned-reg)))
@@ -466,10 +466,17 @@ number of CPU cycles elapsed as secondary value. EXPERIMENTAL."
 
 ;;;; Memory barrier support
 
+;;; Some of these might not really have to inhibit 'instcombine'
+;;; but conservatively it's always the right choice.
+;;; Certainly for redundant move elimination of the reg->reg, reg->reg form
+;;; the barrier is irrelevant, but (a) that won't happen, and (b) we never
+;;; had an instcombine pass so who cares if occasionally it fails to apply?
 (define-vop (%compiler-barrier)
   (:policy :fast-safe)
   (:translate %compiler-barrier)
-  (:generator 3))
+  (:generator 3
+    ;; inhibit instcombine across any barrier
+    (inst .skip 0)))
 
 (define-vop (%memory-barrier)
   (:policy :fast-safe)
@@ -480,19 +487,25 @@ number of CPU cycles elapsed as secondary value. EXPERIMENTAL."
 (define-vop (%read-barrier)
   (:policy :fast-safe)
   (:translate %read-barrier)
-  (:generator 3))
+  (:generator 3
+    ;; inhibit instcombine across any barrier
+    (inst .skip 0)))
 
 (define-vop (%write-barrier)
   (:policy :fast-safe)
   (:translate %write-barrier)
-  (:generator 3))
+  (:generator 3
+    ;; inhibit instcombine across any barrier
+    (inst .skip 0)))
 
 (define-vop (%data-dependency-barrier)
   (:policy :fast-safe)
   (:translate %data-dependency-barrier)
-  (:generator 3))
+  (:generator 3
+    ;; inhibit instcombine across any barrier
+    (inst .skip 0)))
 
-(define-vop (pause)
+(define-vop ()
   (:translate spin-loop-hint)
   (:policy :fast-safe)
   (:generator 0
@@ -516,13 +529,13 @@ number of CPU cycles elapsed as secondary value. EXPERIMENTAL."
             (d :scs (unsigned-reg)))
   (:result-types unsigned-num unsigned-num unsigned-num unsigned-num)
   (:temporary (:sc unsigned-reg :from (:argument 0) :to (:result 0)
-               :offset eax-offset) eax)
+               :offset rax-offset) eax)
   (:temporary (:sc unsigned-reg :from (:argument 1) :to (:result 2)
-               :offset ecx-offset) ecx)
+               :offset rcx-offset) ecx)
   (:temporary (:sc unsigned-reg :from :eval :to (:result 3)
-               :offset edx-offset) edx)
+               :offset rdx-offset) edx)
   (:temporary (:sc unsigned-reg :from :eval :to (:result 1)
-               :offset ebx-offset) ebx)
+               :offset rbx-offset) ebx)
   (:generator 5
    (move eax function)
    (move ecx subfunction)
@@ -536,9 +549,20 @@ number of CPU cycles elapsed as secondary value. EXPERIMENTAL."
   (:args (fdefn :scs (descriptor-reg)))
   (:generator 1
     ;; atomic because the immobile gen# is in the same byte
-    (inst or :byte (ea (- 1 other-pointer-lowtag) fdefn) #x80 :lock)))
+    (inst or :lock :byte (ea (- 1 other-pointer-lowtag) fdefn) #x80)))
 (define-vop (unset-fdefn-has-static-callers)
   (:args (fdefn :scs (descriptor-reg)))
   (:generator 1
     ;; atomic because the immobile gen# is in the same byte
-    (inst and :byte (ea (- 1 other-pointer-lowtag) fdefn) #x7f :lock)))
+    (inst and :lock :byte (ea (- 1 other-pointer-lowtag) fdefn) #x7f)))
+
+(define-vop ()
+  (:translate update-object-layout)
+  (:args (obj :scs (descriptor-reg)))
+  (:results (res :scs (descriptor-reg)))
+  (:policy :fast-safe)
+  (:vop-var vop)
+  (:generator 1
+    (inst push obj)
+    (invoke-asm-routine 'call 'invalid-layout-trap vop)
+    (inst pop res)))

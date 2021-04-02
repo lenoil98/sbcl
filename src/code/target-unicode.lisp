@@ -28,7 +28,7 @@
                       ',bidi-mirroring-list)
                   (defun !unicode-properties-cold-init ()
                     ;;
-                    (let ((hash (make-hash-table :test 'eq))
+                    (let ((hash (make-hash-table)) ; keys are symbols
                           (list ',(sb-cold:read-from-file
                                    "output/misc-properties.lisp-expr")))
                       (setq **proplist-properties** hash)
@@ -41,7 +41,7 @@
                                                   #+sb-unicode :size #+sb-unicode (length data))))
                       (loop for (source . target) in data
                             when (and #-sb-unicode
-                                      (< source sb-xc:char-code-limit))
+                                      (< source char-code-limit))
                             do (flet ((minimize (x)
                                         (case (length x)
                                           (1
@@ -214,7 +214,7 @@ If CHARACTER does not have a known block, returns :NO-BLOCK"
   (let* ((code (char-code character))
          (block-index (ordered-ranges-position
                        code
-                       #.(sb-xc:coerce (sb-cold:read-from-file "output/block-ranges.lisp-expr")
+                       #.(coerce (sb-cold:read-from-file "output/block-ranges.lisp-expr")
                                        '(vector (unsigned-byte 32))))))
     (if block-index
         (aref #.(sb-cold:read-from-file "output/block-names.lisp-expr") block-index)
@@ -347,7 +347,7 @@ disappears when accents are placed on top of it. and NIL otherwise"
 
 (eval-when (:compile-toplevel)
   (sb-xc:defmacro coerce-to-ordered-ranges (array)
-    (sb-xc:coerce array '(vector (unsigned-byte 32)))))
+    (coerce array '(vector (unsigned-byte 32)))))
 
 (defun default-ignorable-p (character)
   "Returns T if CHARACTER is a Default_Ignorable_Code_Point"
@@ -451,22 +451,18 @@ disappears when accents are placed on top of it. and NIL otherwise"
                 for char = (schar string i)
                 do
                 (decompose-char char compatibility calback))))
-      (let ((result (make-string length)))
-        (loop for char in chars
-              for i from (1- length) downto 0
-              do (setf (schar result i) char))
-        result))))
-
-(defun composition-hangul-syllable-type (cp)
-  (cond
-    ((and (<= #x1100 cp) (<= cp #x1112)) :L)
-    ((and (<= #x1161 cp) (<= cp #x1175)) :V)
-    ((and (<= #x11a8 cp) (<= cp #x11c2)) :T)
-    ((and (<= #xac00 cp) (<= cp #.(+ #xac00 11171)))
-     (if (= 0 (rem (- cp #xac00) 28)) :LV :LVT))))
+      (nreverse chars))))
 
 (defun primary-composition (char1 char2)
-  (flet ((maybe (fn x) (when x (funcall fn x))))
+  (flet ((maybe (fn x) (when x (funcall fn x)))
+         (composition-hangul-syllable-type (cp)
+           (cond
+             ((and (<= #x1100 cp) (<= cp #x1112)) :L)
+             ((and (<= #x1161 cp) (<= cp #x1175)) :V)
+             ((and (<= #x11a8 cp) (<= cp #x11c2)) :T)
+             ((and (<= #xac00 cp) (<= cp #.(+ #xac00 11171)))
+              (if (= 0 (rem (- cp #xac00) 28)) :LV :LVT)))))
+    (declare (inline composition-hangul-syllable-type))
     (let ((c1 (char-code char1))
           (c2 (char-code char2)))
       (maybe
@@ -483,100 +479,42 @@ disappears when accents are placed on top of it. and NIL otherwise"
                (eql (composition-hangul-syllable-type c2) :T))
           (+ c1 (- c2 #x11a7))))))))
 
-;;; This implements a sequence data structure, specialized for
-;;; efficient deletion of characters at an index, along with tolerable
-;;; random access.  The purpose is to support the canonical
-;;; composition algorithm from Unicode, which involves replacing (not
-;;; necessarily consecutive) pairs of code points with a single code
-;;; point (e.g. [#\e #\combining_acute_accent] with
-;;; #\latin_small_letter_e_with_acute).  The data structure is a list
-;;; of three-element lists, each denoting a chunk of string data
-;;; starting at the first index and ending at the second.
-;;;
-;;; Actually, the implementation isn't particularly efficient, and
-;;; would probably benefit from being rewritten in terms of displaced
-;;; arrays, which would substantially reduce copying.
-;;;
-;;; (also, generic sequences.  *sigh*.)
-(defun lref (lstring index)
-  (dolist (l lstring)
-    (when (and (<= (first l) index)
-               (< index (second l)))
-      (return (aref (third l) (- index (first l)))))))
-
-(defun (setf lref) (newchar lstring index)
-  (dolist (l lstring)
-    (when (and (<= (first l) index)
-               (< index (second l)))
-      (return (setf (aref (third l) (- index (first l))) newchar)))))
-
-(defun llength (lstring)
-  (second (first (last lstring))))
-
-(defun lstring (lstring)
-  (let ((result (make-string (llength lstring))))
-    (dolist (l lstring result)
-      (replace result (third l) :start1 (first l) :end1 (second l)))))
-
-(defun ldelete (lstring index)
-  (do* ((ls lstring (cdr ls))
-        (l (car ls) (car ls))
-        so-fars)
-       ((and (<= (first l) index)
-             (< index (second l)))
-        (append
-         (nreverse so-fars)
-         (cond
-           ((= (first l) index)
-            (list (list (first l) (1- (second l)) (subseq (third l) 1))))
-           ((= index (1- (second l)))
-            (list (list (first l) (1- (second l)) (subseq (third l) 0 (1- (length (third l)))))))
-           (t
-            (list
-             (list (first l) index
-                   (subseq (third l) 0 (- index (first l))))
-             (list index (1- (second l))
-                   (subseq (third l) (1+ (- index (first l))))))))
-         (mapcar (lambda (x) (list (1- (first x)) (1- (second x)) (third x)))
-                 (cdr ls))))
-    (push l so-fars)))
-
-(defun canonically-compose (string)
-  (let* ((result (list (list 0 (length string) string)))
-         (previous-starter-index (position 0 string :key #'combining-class))
-         (i (and previous-starter-index (1+ previous-starter-index))))
-    (when (or (not i) (= i (length string)))
-      (return-from canonically-compose string))
+(defun canonically-compose (list)
+  (let* ((result list)
+         (combine-with (member 0 result :key #'combining-class))
+         (previous combine-with)
+         (current (cdr combine-with)))
+    (when (null current)
+      (return-from canonically-compose list))
     (tagbody
      again
-       (when (and (>= (- i previous-starter-index) 2)
+       (when (and (neq previous combine-with)
                   ;; test for Blocked (Unicode 3.11 para. D115)
                   ;;
                   ;; (assumes here that string has sorted combiners,
                   ;; so can look back just one step)
-                  (>= (combining-class (lref result (1- i)))
-                      (combining-class (lref result i))))
-         (when (= (combining-class (lref result i)) 0)
-           (setf previous-starter-index i))
-         (incf i)
+                  (>= (combining-class (car previous))
+                      (combining-class (car current))))
+         (when (= (combining-class (car current)) 0)
+           (setf combine-with current))
+         (setf previous current)
+         (pop current)
          (go next))
 
-       (let ((comp (primary-composition (lref result previous-starter-index)
-                                        (lref result i))))
+       (let ((comp (primary-composition (car combine-with) (car current))))
          (cond
            (comp
-            (setf (lref result previous-starter-index) comp)
-            (setf result (ldelete result i)))
+            (setf (car combine-with) comp
+                  (cdr previous) (setf current (cdr current))))
            (t
-            (when (= (combining-class (lref result i)) 0)
-              (setf previous-starter-index i))
-            (incf i))))
+            (when (= (combining-class (car current)) 0)
+              (setf combine-with current))
+            (setf previous current)
+            (pop current))))
      next
-       (unless (= i (llength result))
+       (when current
          (go again)))
-    (if (= i (length string))
-        string
-        (lstring result))))
+    result))
 
 (defun normalize-string (string &optional (form :nfd)
                                           filter)
@@ -598,21 +536,40 @@ only characters for which it returns T are collected."
   (etypecase string
     (base-string string)
     ((array character (*))
-     (ecase form
-       ((:nfc)
-        (canonically-compose (decompose-string string nil filter)))
-       ((:nfd)
-        (decompose-string string nil filter))
-       ((:nfkc)
-        (canonically-compose (decompose-string string t filter)))
-       ((:nfkd)
-        (decompose-string string t filter))))
+     (coerce
+      (ecase form
+        ((:nfc)
+         (canonically-compose (decompose-string string nil filter)))
+        ((:nfd)
+         (decompose-string string nil filter))
+        ((:nfkc)
+         (canonically-compose (decompose-string string t filter)))
+        ((:nfkd)
+         (decompose-string string t filter)))
+      'string))
     ((array nil (*)) string)))
 
 (defun normalized-p (string &optional (form :nfd))
   "Tests if STRING is normalized to FORM"
-  ;; FIXME: can be optimized
-  (string= string (normalize-string string form)))
+  (etypecase string
+    (base-string t)
+    ((array character (*))
+     (flet ((=-to-list (list)
+              (sb-kernel:with-array-data ((string string) (start) (end)
+                                          :check-fill-pointer t)
+                (loop for i from start below end
+                      for char = (schar string i)
+                      always (eql char (pop list))))))
+       (ecase form
+         ((:nfc)
+          (=-to-list (canonically-compose (decompose-string string nil nil))))
+         ((:nfd)
+          (=-to-list (decompose-string string nil nil)))
+         ((:nfkc)
+          (=-to-list (canonically-compose (decompose-string string t nil))))
+         ((:nfkd)
+          (=-to-list (decompose-string string t nil))))))
+    ((array nil (*)) t)))
 
 
 ;;; Unicode case algorithms
@@ -1049,8 +1006,8 @@ word breaking rules specified in UAX #29. Returns a list of strings"
       ((binary-search cp scontinues) :scontinue)
       ((proplist-p char :sterm) :sterm)
       ((and (or (member gc '(:Po :Ps :Pe :Pf :Pi))
-                (eql (line-break-class char) :qu))
-            (not (eql cp #x05F3))) :close)
+                (eql (line-break-class char) :qu)))
+       :close)
       (t nil))))
 
 (defun sentence-prebreak (string)
@@ -1115,7 +1072,7 @@ sentence breaking rules specified in UAX #29"
           ((eql state :nobrk-next) (nobrk) (setf state nil))
           ((member c1 '(:sep :cr :lf)) (brk))
           ((and (eql c1 :aterm) (eql c2 :numeric)) (nobrk))
-          ((and (eql c1 :upper) (eql c2 :aterm)
+          ((and (member c1 '(:lower :upper)) (eql c2 :aterm)
                 (eql c3 :upper)) (nobrk) (setf state :nobrk-next))
           ((or (and (member c1 '(:sterm :aterm)) (member c2 '(:close :sp))
                     (member c3 '(:scontinue :sterm :aterm)))
@@ -1265,12 +1222,16 @@ sentence breaking rules specified in UAX #29"
          (between :qu :any :cant)
          (between :any :cb :can)
          (between :cb :any :can)
+         (when (and (eql t1 :hl) (member t2 '(:hy :ba)))
+           (cmpush :cant) (cmpush second)
+           (setf first second tail (cdr tail))
+           (setf second (car tail))
+           (cmpush (if second :cant :must)) (cmpush second)
+           (setf after-spaces :can) (go tail))
          (between :any '(:ba :hy :ns) :cant)
          (between :bb :any :cant)
-         (when (and (eql t1 :hl) (eql t2 :hy))
-           (cmpush :cant) (cmpush second)
-           (setf after-spaces :can) (go tail))
-         (between '(:al :hl :id :in :nu) :in :cant)
+         (between :sy :hl :cant)
+         (between '(:al :hl :ex :id :in :nu) :in :cant)
          (between :id :po :cant)
          (between '(:al :hl) :nu :cant)
          (between '(:nu :po) '(:al :hl) :cant)
@@ -1423,7 +1384,6 @@ it defaults to 80 characters"
                           new-i index))))
           (loop for index from new-i below len
                 for char = (char str index)
-                for previous-combining-class = combining-class
                 for combining-class = (combining-class char)
                 until (eql combining-class 0)
                 unless (and (>= (- index new-i) 1)

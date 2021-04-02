@@ -224,7 +224,7 @@
                                ,@(unless class-slot-p
                                    `((setq slots
                                            (fsc-instance-slots ,instance))))
-                               (%funcallable-instance-layout ,instance)))))
+                               (%fun-layout ,instance)))))
         (block access
           (when (and wrapper
                      (not (zerop (layout-clos-hash wrapper)))
@@ -304,7 +304,7 @@
 (defun emit-miss (miss-fn args applyp)
   (if applyp
       `(multiple-value-call ,miss-fn ,@args
-                            (sb-c::%more-arg-values .more-context.
+                            (sb-c:%more-arg-values .more-context.
                                                     0
                                                     .more-count.))
       `(funcall ,miss-fn ,@args)))
@@ -386,17 +386,17 @@
        `(cond ((std-instance-p ,argument)
                ,(if slots-var
                     `(let ((,wrapper (%instance-layout ,argument)))
-                       (when (layout-for-std-class-p ,wrapper)
+                       (when (layout-for-pcl-obj-p ,wrapper)
                          (setq ,slots-var (std-instance-slots ,argument)))
                        ,wrapper)
                     `(%instance-layout ,argument)))
               ((fsc-instance-p ,argument)
                ,(if slots-var
-                    `(let ((,wrapper (%funcallable-instance-layout ,argument)))
-                       (when (layout-for-std-class-p ,wrapper)
+                    `(let ((,wrapper (%fun-layout ,argument)))
+                       (when (layout-for-pcl-obj-p ,wrapper)
                          (setq ,slots-var (fsc-instance-slots ,argument)))
                        ,wrapper)
-                    `(%funcallable-instance-layout ,argument)))
+                    `(%fun-layout ,argument)))
                (t (go ,miss-tag)))))
     ;; Sep92 PCL used to distinguish between some of these cases (and
     ;; spuriously exclude others).  Since in SBCL

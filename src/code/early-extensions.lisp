@@ -16,7 +16,7 @@
 ;;; A number that can represent an index into a vector, including
 ;;; one-past-the-end
 (deftype array-range ()
-  `(integer 0 ,sb-xc:array-dimension-limit))
+  `(integer 0 ,array-dimension-limit))
 
 ;;; a type used for indexing into sequences, and for related
 ;;; quantities like lengths of lists and other sequences.
@@ -35,13 +35,13 @@
 ;;; MOST-POSITIVE-FIXNUM lets the system know it can increment a value
 ;;; of type INDEX without having to worry about using a bignum to
 ;;; represent the result.
-(def!type index () `(integer 0 (,sb-xc:array-dimension-limit)))
+(def!type index () `(integer 0 (,array-dimension-limit)))
 
 ;;; like INDEX, but augmented with -1 (useful when using the index
 ;;; to count downwards to 0, e.g. LOOP FOR I FROM N DOWNTO 0, with
 ;;; an implementation which terminates the loop by testing for the
 ;;; index leaving the loop range)
-(def!type index-or-minus-1 () `(integer -1 (,sb-xc:array-dimension-limit)))
+(def!type index-or-minus-1 () `(integer -1 (,array-dimension-limit)))
 
 ;;; The smallest power of two that is equal to or greater than X.
 (declaim (inline power-of-two-ceiling))
@@ -203,49 +203,17 @@
          ,@(if ignores `((declare (ignorable ,@ignores))))
          ,@body))))
 
-;;;; some old-fashioned functions. (They're not just for old-fashioned
-;;;; code, they're also used as optimized forms of the corresponding
-;;;; general functions when the compiler can prove that they're
-;;;; equivalent.)
+;;; Functions for compatibility sake:
 
-;;; like (MEMBER ITEM LIST :TEST #'EQ)
 (defun memq (item list)
   "Return tail of LIST beginning with first element EQ to ITEM."
-  (declare (explicit-check))
-  ;; KLUDGE: These could be and probably should be defined as
-  ;;   (MEMBER ITEM LIST :TEST #'EQ)),
-  ;; but when I try to cross-compile that, I get an error from
-  ;; LTN-ANALYZE-KNOWN-CALL, "Recursive known function definition". The
-  ;; comments for that error say it "is probably a botched interpreter stub".
-  ;; Rather than try to figure that out, I just rewrote this function from
-  ;; scratch. -- WHN 19990512
-  (do ((i list (cdr i)))
-      ((null i))
-    (when (eq (car i) item)
-      (return i))))
+  (declare (inline member))
+  (member item list :test #'eq))
 
-;;; like (ASSOC ITEM ALIST :TEST #'EQ):
-;;;   Return the first pair of ALIST where ITEM is EQ to the key of
-;;;   the pair.
 (defun assq (item alist)
-  (declare (explicit-check))
-  ;; KLUDGE: CMU CL defined this with
-  ;;   (DECLARE (INLINE ASSOC))
-  ;;   (ASSOC ITEM ALIST :TEST #'EQ))
-  ;; which is pretty, but which would have required adding awkward
-  ;; build order constraints on SBCL (or figuring out some way to make
-  ;; inline definitions installable at build-the-cross-compiler time,
-  ;; which was too ambitious for now). Rather than mess with that, we
-  ;; just define ASSQ explicitly in terms of more primitive
-  ;; operations:
-  (dolist (pair alist)
-    ;; though it may look more natural to write this as
-    ;;   (AND PAIR (EQ (CAR PAIR) ITEM))
-    ;; the temptation to do so should be resisted, as pointed out by PFD
-    ;; sbcl-devel 2003-08-16, as NIL elements are rare in association
-    ;; lists.  -- CSR, 2003-08-16
-    (when (and (eq (car pair) item) (not (null pair)))
-      (return pair))))
+  "Return the first pair of alist where item is EQ to the key of pair."
+  (declare (inline assoc))
+  (assoc item alist :test #'eq))
 
 ;;; Delete just one item
 (defun delq1 (item list)
@@ -309,7 +277,7 @@
                        ,result)))
     `(let ((,n-table ,table))
        ,(if locked
-            `(with-locked-system-table (,n-table) ,iter-form)
+            `(with-system-mutex ((hash-table-lock ,n-table)) ,iter-form)
             iter-form))))
 
 ;;; Executes BODY for all entries of PLIST with KEY and VALUE bound to
@@ -317,6 +285,7 @@
 (defmacro doplist ((key val) plist &body body)
   (with-unique-names (tail)
     `(let ((,tail ,plist) ,key ,val)
+       (declare (ignorable ,key ,val))
        (loop (when (null ,tail) (return nil))
              (setq ,key (pop ,tail))
              (when (null ,tail)
@@ -565,7 +534,7 @@ NOTE: This interface is experimental and subject to change."
          (line-type (let ((n (+ nargs nvalues)))
                       (if (<= n 3) 'cons `(simple-vector ,n))))
          (bind-hashval
-          `((,hashval (the (signed-byte #.sb-vm:n-fixnum-bits)
+          `((,hashval (the sb-xc:fixnum
                            (funcall ,hash-function ,@arg-vars)))
             (,cache ,var-name)))
          (probe-it
@@ -574,7 +543,7 @@ NOTE: This interface is experimental and subject to change."
                (let ((,hashval ,hashval) ; gets clobbered in probe loop
                      (,cache (truly-the ,cache-type ,cache)))
                  ;; FIXME: redundant?
-                 (declare (type (signed-byte #.sb-vm:n-fixnum-bits) ,hashval))
+                 (declare (type sb-xc:fixnum ,hashval))
                  (loop repeat 2
                     do (let ((,entry
                               (svref ,cache
@@ -636,7 +605,7 @@ NOTE: This interface is experimental and subject to change."
                  (values ,@result-temps))))))
     `(progn
        (pushnew ',var-name *cache-vector-symbols*)
-       (define-load-time-global ,var-name nil)
+       (!define-load-time-global ,var-name nil)
        ,@(when *profile-hash-cache*
            `((declaim (type (simple-array fixnum (3)) ,statistics-name))
              (defvar ,statistics-name)))
@@ -737,6 +706,23 @@ NOTE: This interface is experimental and subject to change."
 (declaim (inline legal-fun-name-p))
 (defun legal-fun-name-p (name)
   (values (valid-function-name-p name)))
+
+;;; * extended-function-designator: an object that denotes a function and that is one of:
+;;;   a function name (denoting the function it names in the global environment),
+;;;   or a function (denoting itself). The consequences are undefined if a function name
+;;;   is used as an extended function designator but it does not have a global definition
+;;;   as a function, or if it is a symbol that has a global definition as a macro
+;;;   or a special form.
+;;; Release 1.4.6 advertised that (disassemble 'a-macro) works, which entails a choice:
+;;; - if (EXTENDED-FUNCTION-DESIGNATOR-P) is to return NIL, then we have to
+;;;   add (OR (SATISFIES MACRO-FUNCTION) ...) to the signature of DISASSEMBLE.
+;;; - if (EXTENDED-FUNCTION-DESIGNATOR-P) is to return T, then we must avoid
+;;;   using this predicate in contexts that demand a function.
+(defun extended-function-designator-p (x)
+  (or (and (legal-fun-name-p x)
+           (fboundp x)
+           (not (and (symbolp x) (special-operator-p x))))
+      (functionp x)))
 
 (deftype function-name () '(satisfies legal-fun-name-p))
 
@@ -862,19 +848,6 @@ NOTE: This interface is experimental and subject to change."
   (if (consp x)
       (destructuring-bind (result) x result)
       x))
-
-;;; Coerce a numeric type bound to the given type while handling
-;;; exclusive bounds.
-(defun coerce-numeric-bound (bound type)
-  (flet ((c (thing)
-           (case type
-             (rational (rational thing))
-             (t (coerce thing type)))))
-    (when bound
-      (if (consp bound)
-          (list (c (car bound)))
-          (c bound)))))
-
 
 ;;;; utilities for two-VALUES predicates
 
@@ -1067,6 +1040,12 @@ NOTE: This interface is experimental and subject to change."
 (defun print-type (stream type &optional colon at)
   (print-type-specifier stream (type-specifier type) colon at)))
 
+(defun print-lambda-list (stream lambda-list &optional colon at)
+  (declare (ignore colon at))
+  (let ((sb-pretty:*pprint-quote-with-syntactic-sugar* nil)
+        (*package* *cl-package*))
+    (format stream "~:A" lambda-list)))
+
 
 ;;;; Deprecating stuff
 
@@ -1154,7 +1133,7 @@ NOTE: This interface is experimental and subject to change."
     ((or symbol cons)
      (%check-deprecated-type type-specifier))
     (class
-     (let ((name (class-name type-specifier)))
+     (let ((name (cl:class-name type-specifier)))
        (when (and name (symbolp name)
                   (eq type-specifier (find-class name nil)))
          (%check-deprecated-type name))))))
@@ -1244,7 +1223,9 @@ NOTE: This interface is experimental and subject to change."
                                 ((or (listp id) ; must be a type-specifier
                                      (memq id '(special ignorable ignore
                                                 dynamic-extent
-                                                truly-dynamic-extent))
+                                                truly-dynamic-extent
+                                                sb-c::constant-value
+                                                sb-c::no-constraints))
                                      (info :type :kind id))
                                  (cdr decl))))))
            (partition (spec)
@@ -1362,33 +1343,6 @@ NOTE: This interface is experimental and subject to change."
                       (* 100 (/ (count-if-not #'fixnump cache)
                                 (length cache))))
                   short-name))))))
-
-;;; Just like WITH-OUTPUT-TO-STRING but doesn't close the stream,
-;;; producing more compact code.
-(defmacro with-simple-output-to-string
-    ((var &optional string (element-type :default)) &body body)
-  ;; Don't need any fancy type-specifier parsing. Uses of this macro
-  ;; are confined to our own code. So the element-type is literally
-  ;; either :DEFAULT or BASE-CHAR.
-  (aver (member element-type '(base-char :default)))
-  (multiple-value-bind (forms decls) (parse-body body nil)
-    (if string
-        `(let ((,var (make-fill-pointer-output-stream ,string)))
-           ,@decls
-           ,@forms)
-        ;; Why not dxify this stream?
-        `(let ((,var #+sb-xc-host (make-string-output-stream)
-                     #-sb-xc-host
-                     ,(case element-type
-                        ;; Non-unicode doesn't have %MAKE-DEFAULT-STRING-OSTREAM
-                        #+sb-unicode
-                        (:default '(%make-default-string-ostream))
-                        ;; and this macro is never employed to make streams
-                        ;; that can only return CHARACTER string.
-                        (t '(%make-base-string-ostream)))))
-           ,@decls
-           ,@forms
-           (get-output-stream-string ,var)))))
 
 (in-package "SB-KERNEL")
 

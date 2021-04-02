@@ -52,6 +52,7 @@
   ;; which is used for a fixed #\NULL so that when we call out to C
   ;; we don't need to cons a new copy)
   (n-pad-elements (missing-arg) :type index :read-only t))
+(declaim (freeze-type specialized-array-element-type-properties))
 
 (define-load-time-global *specialized-array-element-type-properties*
   (map 'simple-vector
@@ -59,8 +60,7 @@
          (apply #'!make-saetp args))
        `(;; Erm.  Yeah.  There aren't a lot of things that make sense
          ;; for an initial element for (ARRAY NIL). -- CSR, 2002-03-07
-         (nil #:mu 0 simple-array-nil
-              :complex-typecode #.complex-vector-nil-widetag)
+         (nil #:mu 0 simple-array-nil)
          #-sb-unicode
          (character ,(code-char 0) 8 simple-base-string
                     ;; (SIMPLE-BASE-STRINGs are stored with an extra
@@ -77,7 +77,6 @@
                     :complex-typecode #.complex-base-string-widetag)
          #+sb-unicode
          (character ,(code-char 0) 32 simple-character-string
-                    :n-pad-elements 1
                     :complex-typecode #.complex-character-string-widetag)
          (single-float $0.0f0 32 simple-array-single-float)
          (double-float $0.0d0 64 simple-array-double-float)
@@ -180,6 +179,17 @@
   (or (position element-type sb-vm:*specialized-array-element-type-properties*
                 :key #'sb-vm:saetp-specifier :test #'equal)
       (error "No saetp for ~S" element-type)))
+
+(defun vector-n-data-octets (vector saetp)
+  (declare (type (simple-array * (*)) vector))
+  (let* ((length (+ (length vector) (saetp-n-pad-elements saetp)))
+         (n-bits (saetp-n-bits saetp))
+         (alignment-pad (floor 7 n-bits)))
+    ;; This math confuses me. So there's a self-test
+    ;; against the C code which is known good.
+    (if (>= n-bits 8)
+        (* length (ash n-bits -3))
+        (ash (* (+ length alignment-pad) n-bits) -3))))
 
 (in-package "SB-C")
 

@@ -30,37 +30,16 @@
                              lowtag-mask))
     (inst bic ndescr ndescr lowtag-mask)
     (pseudo-atomic (pa-flag)
-      (allocation header ndescr other-pointer-lowtag :flag-tn pa-flag)
+      (allocation nil ndescr other-pointer-lowtag header :flag-tn pa-flag)
       ;; Now that we have the space allocated, compute the header
       ;; value.
-      (inst add ndescr rank (fixnumize (1- array-dimensions-offset)))
-      (inst mov ndescr (lsl ndescr (- n-widetag-bits n-fixnum-tag-bits)))
-      (inst orr ndescr ndescr (lsr type n-fixnum-tag-bits))
+      ;; See ENCODE-ARRAY-RANK.
+      (inst sub ndescr rank (fixnumize 1))
+      (inst and ndescr ndescr (fixnumize array-rank-mask))
+      (inst orr ndescr type (lsl ndescr array-rank-byte-pos))
+      (inst mov ndescr (lsr ndescr n-fixnum-tag-bits))
       ;; And store the header value.
       (storew ndescr header 0 other-pointer-lowtag))
-    (move result header)))
-
-(define-vop (make-array-header/c)
-  (:translate make-array-header)
-  (:policy :fast-safe)
-  (:arg-types (:constant t) (:constant t))
-  (:info type rank)
-  (:temporary (:scs (descriptor-reg) :to (:result 0) :target result) header)
-  (:temporary (:sc non-descriptor-reg :offset ocfp-offset) pa-flag)
-  (:results (result :scs (descriptor-reg)))
-  (:generator 4
-    (let* ((header-size (+ rank
-                           (1- array-dimensions-offset)))
-           (bytes (logandc2 (+ (* (1+ header-size) n-word-bytes)
-                               lowtag-mask)
-                            lowtag-mask))
-           (header-bits (logior (ash header-size
-                                     n-widetag-bits)
-                                type)))
-      (pseudo-atomic (pa-flag)
-        (allocation header bytes other-pointer-lowtag :flag-tn pa-flag)
-        (load-immediate-word pa-flag header-bits)
-        (storew pa-flag header 0 other-pointer-lowtag)))
     (move result header)))
 
 ;;;; Additional accessors and setters for the array header.
@@ -72,17 +51,17 @@
   array-dimensions-offset other-pointer-lowtag
   (any-reg) positive-fixnum sb-kernel:%set-array-dimension)
 
-(define-vop (array-rank-vop)
-  (:translate sb-kernel:%array-rank)
+(define-vop ()
+  (:translate %array-rank)
   (:policy :fast-safe)
   (:args (x :scs (descriptor-reg)))
-  (:temporary (:scs (non-descriptor-reg)) temp)
-  (:results (res :scs (any-reg descriptor-reg)))
+  (:results (res :scs (unsigned-reg)))
+  (:result-types positive-fixnum)
   (:generator 6
-    (loadw temp x 0 other-pointer-lowtag)
-    (inst mov temp (asr temp n-widetag-bits))
-    (inst sub temp temp (1- array-dimensions-offset))
-    (inst mov res (lsl temp n-fixnum-tag-bits))))
+    (inst ldrb res (@ x #+little-endian (- 2 other-pointer-lowtag)
+                        #+big-endian    (- 1 other-pointer-lowtag)))
+    (inst add res res 1)
+    (inst and res res array-rank-mask)))
 
 ;;;; Bounds checking routine.
 (define-vop (check-bound)

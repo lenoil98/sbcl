@@ -25,8 +25,6 @@
 #include "interrupt.h"
 #include "interr.h"
 #include "lispregs.h"
-#include <sys/socket.h>
-#include <sys/utsname.h>
 
 #include <sys/types.h>
 #include <signal.h>
@@ -35,7 +33,6 @@
 #include <unistd.h>
 
 #include "validate.h"
-size_t os_vm_page_size;
 
 #ifdef LISP_FEATURE_SB_THREAD
 #error "Define threading support functions"

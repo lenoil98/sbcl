@@ -140,7 +140,7 @@
              ;;
              ;; If mode is :LOGICAL-BLOCK and assign is false, return true
              ;; to indicate that this object is circular, but don't assign
-             ;; it a number yet. This is neccessary for cases like
+             ;; it a number yet. This is necessary for cases like
              ;; #1=(#2=(#2# . #3=(#1# . #3#))))).
              (:logical-block-circular
               (cond ((and (not assign)
@@ -189,23 +189,27 @@
             (write-char #\= stream)
             t)))))
 
+(define-load-time-global *null-broadcast-stream* (make-broadcast-stream))
+(declaim (type stream *null-broadcast-stream*))
 (defmacro with-circularity-detection ((object stream) &body body)
   (with-unique-names (marker body-name)
     `(labels ((,body-name ()
-               ,@body))
-      (cond ((not *print-circle*) (,body-name))
-            (*circularity-hash-table*
-             (let ((,marker (check-for-circularity ,object t :logical-block)))
-               (if ,marker
-                   (when (handle-circularity ,marker ,stream)
-                    (,body-name))
-                  (,body-name))))
-            (t
-             (let ((*circularity-hash-table* (make-hash-table :test 'eq)))
-               (output-object ,object (make-broadcast-stream))
-               (let ((*circularity-counter* 0))
-                 (let ((,marker (check-for-circularity ,object t
-                                                       :logical-block)))
-                   (when ,marker
-                     (handle-circularity ,marker ,stream)))
-                (,body-name))))))))
+                ,@body))
+       (cond ((or (not *print-circle*)
+                  (uniquely-identified-by-print-p ,object))
+              (,body-name))
+             (*circularity-hash-table*
+              (let ((,marker (check-for-circularity ,object t :logical-block)))
+                (if ,marker
+                    (when (handle-circularity ,marker ,stream)
+                      (,body-name))
+                    (,body-name))))
+             (t
+              (let ((*circularity-hash-table* (make-hash-table :test 'eq)))
+                (output-object ,object *null-broadcast-stream*)
+                (let ((*circularity-counter* 0))
+                  (let ((,marker (check-for-circularity ,object t
+                                                        :logical-block)))
+                    (when ,marker
+                      (handle-circularity ,marker ,stream)))
+                  (,body-name))))))))

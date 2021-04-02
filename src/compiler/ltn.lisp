@@ -95,7 +95,7 @@
     (link-blocks node-block next-block)))
 
 ;;; an annotated lvar's primitive-type
-#-sb-fluid (declaim (inline lvar-ptype))
+(declaim (inline lvar-ptype))
 (defun lvar-ptype (lvar)
   (declare (type lvar lvar))
   (ir2-lvar-primitive-type (lvar-info lvar)))
@@ -161,6 +161,25 @@
   (ltn-annotate-casts lvar)
   (values))
 
+#+call-symbol
+(defoptimizer (%coerce-callable-for-call ltn-annotate) ((fun) node ltn-policy)
+  (declare (ignore ltn-policy))
+  (let ((dest (node-dest node)))
+    (cond ((and (basic-combination-p dest)
+                (eq (basic-combination-kind dest) :full)
+                (eq (lvar-uses (basic-combination-fun dest)) node)
+                ;; Everything else can't handle NIL, just don't
+                ;; bother optimizing it.
+                (not (and (constant-lvar-p fun)
+                          (null (lvar-value fun)))))
+           (setf (basic-combination-fun dest) fun
+                 (basic-combination-args node) '(nil)
+                 (node-lvar node) nil
+                 (lvar-info fun) (make-ir2-lvar (primitive-type (lvar-type fun))))
+           (annotate-1-value-lvar fun))
+          (t
+           (ltn-default-call node)))))
+
 ;;; If TAIL-P is true, then we check to see whether the call can
 ;;; really be a tail call by seeing if this function's return
 ;;; convention is :UNKNOWN. If so, we move the call block successor
@@ -178,6 +197,11 @@
           (t
            (setf (node-tail-p call) nil))))
   (values))
+
+(defun signal-delayed-combination-condition (call)
+  (let ((*compiler-error-context* call)
+        (delayed (combination-info call)))
+    (apply #'funcall delayed)))
 
 ;;; We set the kind to :FULL or :FUNNY, depending on whether there is
 ;;; an IR2-CONVERT method. If a funny function, then we inhibit tail
@@ -206,6 +230,8 @@
        (setf (node-tail-p call) nil))
       (t
        (when (eq kind :error)
+         (when (basic-combination-info call)
+           (signal-delayed-combination-condition call))
          (setf (basic-combination-kind call) :full))
        (setf (basic-combination-info call) :full)
        (rewrite-full-call call))))
@@ -221,12 +247,13 @@
 ;;; of LVAR's DEST, and called in the order that the lvarss are
 ;;; received. Otherwise the IR2-BLOCK-POPPED and
 ;;; IR2-COMPONENT-VALUES-FOO would get all messed up.
-(defun annotate-unknown-values-lvar (lvar &optional unused-count)
+(defun annotate-unknown-values-lvar (lvar &optional unused-count
+                                                    unused-sp)
   (declare (type lvar lvar))
   (aver (not (lvar-dynamic-extent lvar)))
   (let ((2lvar (make-ir2-lvar nil)))
     (setf (ir2-lvar-kind 2lvar) :unknown)
-    (setf (ir2-lvar-locs 2lvar) (make-unknown-values-locations unused-count))
+    (setf (ir2-lvar-locs 2lvar) (make-unknown-values-locations unused-count unused-sp))
     (setf (lvar-info lvar) 2lvar))
 
   ;; The CAST chain with corresponding lvars constitute the same
@@ -350,12 +377,12 @@
               (let ((n-values (nth-value 1 (values-types
                                             (lvar-derived-type arg)))))
                 (loop repeat n-values
-                      for (prim-type . lvar-type) = (pop types)
                       do
-                      (primitive-types (or prim-type
-                                           *backend-t-primitive-type*))
-                      (lvar-types (or lvar-type
-                                      *universal-type*)))
+                      (destructuring-bind (&optional prim-type . lvar-type) (pop types)
+                        (primitive-types (or prim-type
+                                             *backend-t-primitive-type*))
+                        (lvar-types (or lvar-type
+                                        *universal-type*))))
                 (annotate-fixed-values-lvar
                  arg
                  (primitive-types) (lvar-types))))))))
@@ -386,8 +413,10 @@
           (t
            (setf (basic-combination-info call) :full)
            (annotate-fun-lvar (basic-combination-fun call) nil)
-           (dolist (arg (reverse args))
-             (annotate-unknown-values-lvar arg t)))))
+           (loop for (arg . prev) on (reverse args)
+                 do
+                 ;; Only the first argument's CSP is used
+                 (annotate-unknown-values-lvar arg t prev)))))
 
   (values))
 
@@ -450,6 +479,16 @@
       (annotate-unknown-values-lvar value)))
   (values))
 
+(defun ltn-analyze-enclose (node)
+  (declare (type enclose node))
+  (let ((lvar (node-lvar node)))
+    (when lvar ; only DX encloses use lvars.
+      (let ((info (make-ir2-lvar *backend-t-primitive-type*)))
+        (setf (lvar-info lvar) info)
+        (setf (ir2-lvar-kind info) :delayed)
+        (setf (ir2-lvar-stack-pointer info)
+              (make-stack-pointer-tn))))))
+
 ;;; We need a special method for %UNWIND-PROTECT that ignores the
 ;;; cleanup function. We don't annotate either arg, since we don't
 ;;; need them at run-time.
@@ -469,13 +508,21 @@
 ;;; constants :-()
 (defoptimizer (%pop-values ltn-annotate) ((%lvar) node ltn-policy)
   (declare (ignore %lvar node ltn-policy)))
-(defoptimizer (%nip-values ltn-annotate) ((last-nipped last-preserved
-                                                       &rest moved)
-                                          node ltn-policy)
-  (declare (ignore last-nipped last-preserved moved node ltn-policy)))
-(defoptimizer (%dummy-dx-alloc ltn-annotate) ((target source)
-                                              node ltn-policy)
+(defoptimizer (%dummy-dx-alloc ltn-annotate) ((target source) node ltn-policy)
   (declare (ignore target source node ltn-policy)))
+
+(defoptimizer (%nip-values ltn-annotate) ((&rest lvars)
+                                          node ltn-policy)
+  (declare (ignore node ltn-policy))
+  ;; Undo the optimization performed by LTN-ANALYZE-MV-CALL,
+  ;; which only uses the CSP of the first argument.
+  (loop for lvar-lvar in lvars
+        for lvar = (lvar-value lvar-lvar)
+        for locs = (ir2-lvar-locs (lvar-info lvar))
+        when (and locs
+                  (eq (tn-kind (car locs)) :unused))
+        do
+        (setf (car locs) (make-stack-pointer-tn))))
 
 
 ;;;; known call annotation
@@ -592,7 +639,7 @@
   (let* ((guard (template-guard template))
          (lvar (node-lvar call))
          (dtype (node-derived-type call)))
-    (cond ((and guard (not (funcall guard)))
+    (cond ((and guard (not (funcall guard call)))
            (values nil :guard))
           ((not (template-args-ok template call safe-p))
            (values nil
@@ -757,9 +804,9 @@
                             (template-or-lose 'call-named)))
                        *efficiency-note-cost-threshold*)))
       (dolist (try (fun-info-templates (basic-combination-fun-info call)))
-        (when (> (template-cost try) max-cost) (return)) ; FIXME: UNLESS'd be cleaner.
+        (when (> (template-cost try) max-cost) (return))
         (let ((guard (template-guard try)))
-          (when (and (or (not guard) (funcall guard))
+          (when (and (or (not guard) (funcall guard call))
                      (or (not safe-p)
                          (ltn-policy-safe-p (template-ltn-policy try)))
                      (not (and (eq ltn-policy :safe)
@@ -947,6 +994,7 @@
       (exit (ltn-analyze-exit node))
       (cset (ltn-analyze-set node))
       (cast (ltn-analyze-cast node))
+      (enclose (ltn-analyze-enclose node))
       (mv-combination
        (ecase (basic-combination-kind node)
          (:local

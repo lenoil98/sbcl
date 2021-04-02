@@ -15,6 +15,20 @@
   (flet ((try (f) (assert-error (funcall f 'hash-table 3))))
     (mapc #'try '(typexpand-1 typexpand typexpand-all))))
 
+(with-test (:name :stream-layout-bits)
+  (loop for wrapper being each hash-value
+        of (sb-kernel:classoid-subclasses (sb-kernel:find-classoid 't))
+        do (flet ((check-bit (bit ancestor-type)
+                    (let* ((layout #+metaspace (sb-kernel::wrapper-friend wrapper)
+                                   #-metaspace wrapper)
+                           (ancestor (sb-kernel:find-layout ancestor-type)))
+                      (when (or (eq layout ancestor)
+                                (find ancestor (sb-kernel:layout-inherits layout)))
+                        (assert (logtest bit (sb-kernel:layout-flags layout)))))))
+              (check-bit sb-kernel:+stream-layout-flag+ 'stream)
+              (check-bit sb-kernel:+string-stream-layout-flag+ 'string-stream)
+              (check-bit sb-kernel:+file-stream-layout-flag+ 'file-stream))))
+
 (with-test (:name (typep sb-kernel:ctypep))
   (locally
       (declare (notinline mapcar))
@@ -320,6 +334,15 @@
       (assert (eq yes cyes))
       (assert (eq win cwin)))))
 
+(with-test (:name :intelligent-satisfies)
+  (assert (sb-kernel:type= (sb-kernel:specifier-type '(satisfies realp))
+                           (sb-kernel:specifier-type 'real)))
+  ;; Part of an example in https://bugs.launchpad.net/sbcl/+bug/309455
+  (multiple-value-bind (answer certain)
+      (subtypep 'complex '(and number (satisfies realp)))
+    (assert (not answer))
+    (assert certain)))
+
 ;;; CONS type SUBTYPEP could be too enthusiastic about thinking it was
 ;;; certain
 (with-test (:name (subtypep cons satisfies))
@@ -607,6 +630,16 @@
                              (and array (not simple-array))))))
                  (specifier-type 'simple-string))))
 
+(with-test (:name :values-*-illegal)
+  (dolist (x '((values *)
+               (values *)
+               (values * bit)
+               (values bit *)
+               (values bit &optional *)
+               (values bit &rest *)
+               (values bit &rest *)))
+    (assert-error (sb-kernel:values-specifier-type x))))
+
 (with-test (:name :classoids-as-type-specifiers)
   (dolist (classoid (list (find-classoid 'integer)
                           (find-class 'integer)))
@@ -645,9 +678,9 @@
 
 (with-test (:name :unparse-string)
   (assert (equal (type-specifier (specifier-type '(string 10)))
-                 '(string 10)))
+                 '(#+sb-unicode string #-sb-unicode base-string 10)))
   (assert (equal (type-specifier (specifier-type '(simple-string 10)))
-                 '(simple-string 10))))
+                 '(#+sb-unicode simple-string #-sb-unicode simple-base-string 10))))
 
 (with-test (:name :numeric-types-adjacent)
   (dolist (x '(-0s0 0s0))
@@ -666,3 +699,84 @@
 
 (with-test (:name :ctypep-function)
   (assert (not (sb-kernel:ctypep #'+ (eval '(sb-kernel:specifier-type '(function (list))))))))
+
+(with-test (:name :cons-union-loop)
+  (checked-compile-and-assert
+   ()
+   `(lambda (x)
+      (typep x '(or (cons (or fixnum vector (member a "b")))
+                 (cons (or (and (not vector) array) (and (not integer) number)) number))))
+   ((10) nil)
+   (((cons 1 2)) t)))
+
+(with-test (:name :pathnamep-flag-bit)
+  (let ((f (compile nil '(lambda (x) (pathnamep x)))))
+    (assert (not (ctu:find-code-constants f)))))
+
+(with-test (:name :structure-is-a)
+  (dolist (what '(sb-int:sset-element sb-c::leaf sb-c::functional
+                  sb-c::optional-dispatch))
+    (assert (eval `(sb-c::%structure-is-a ,(sb-kernel:find-layout 'sb-c::optional-dispatch)
+                                          ,(sb-kernel:find-layout what))))))
+
+(with-test (:name :type-of-empty-instance)
+  (assert (eq (type-of (eval '(sb-kernel:%make-instance 12)))
+              'sb-kernel:instance)))
+
+(with-test (:name :make-numeric-type-union)
+  (assert (equal (sb-kernel:type-specifier
+                  (sb-kernel:make-numeric-type :low '(-79106810381456307)))
+                 '(or (double-float (-7.91068103814563d16)) (single-float (-7.910681e16))
+                   (rational (-79106810381456307))))))
+
+(with-test (:name (:cons-union :lp1912863))
+  (let ((c (cons 2 4)))
+    (assert (not (typep c '(or (cons (integer 0 8) (integer 5 15))
+                               (cons (integer 3 15) (integer 4 14))))))))
+
+(with-test (:name (:rational-union :equivalent-to-t))
+  (let ((type '(or (integer * -1) (rational -1/2 1/2) (integer 1) (not integer))))
+    (assert-tri-eq t t (subtypep t type))))
+
+(with-test (:name (:rational-union :no-integers-in-rational))
+  (let ((type '(or (integer 1 1) (rational 1/2 1/2))))
+    (assert-tri-eq t t (subtypep type 'rational))
+    (assert-tri-eq nil t (subtypep 'rational type))
+    (assert-tri-eq nil t (subtypep type 'integer))
+    (assert-tri-eq nil t (subtypep 'integer type))
+    (assert (typep 1 type))
+    (assert (typep 1/2 type))
+    (assert (not (typep 3/4 type)))))
+
+(with-test (:name (:rational-union :open-bounds-closed))
+  (let ((t1 '(rational -1 1))
+        (t2 '(or (integer -1 1) (rational (-1) (1)))))
+    (assert-tri-eq t t (subtypep t1 t2))
+    (assert-tri-eq t t (subtypep t2 t1))))
+
+(with-test (:name (:rational-union :lp1912863 :bug039))
+  (flet ((bug039 ()
+           (let ((t1 'cons)
+                 (t2 '(or (not (cons t (real -1 1)))
+                       (not (cons sequence (eql 2))))))
+             (assert-tri-eq t t (subtypep t1 t2))
+             (assert-tri-eq t t (subtypep `(not ,t2) `(not ,t1))))))))
+
+(with-test (:name (:rational-union :lp1912863 :bug041))
+  (flet ((bug041 ()
+           (let ((t1 '(not (cons t integer)))
+                 (t2 '(not (cons (array nil) (eql 0))))
+                 (t3 '(cons simple-array t)))
+             (assert-tri-eq t t (subtypep t1 t2))
+             (assert-tri-eq t t (subtypep `(not (or ,t2 ,t3)) `(not ,t1)))
+             (assert-tri-eq t t (subtypep `(and (not ,t2) (not ,t3)) `(not ,t1))))))))
+
+(with-test (:name (:lp1916040 :answer))
+  (let* ((t1 '(cons sequence short-float))
+         (t2 '(or (cons t atom) (cons function t)))
+         (answer (multiple-value-list (subtypep t1 t2))))
+    (assert (member answer '((nil nil) (t t)) :test 'equal))))
+
+(with-test (:name (:lp1916233))
+  (assert-tri-eq t t (subtypep '(cons (or (simple-array ratio) simple-array) nil) nil))
+  (assert-tri-eq t t (subtypep '(or (array ratio) sequence) t)))

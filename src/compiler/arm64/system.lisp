@@ -70,9 +70,42 @@
             (load-store-offset
              (- (+ #+little-endian 4
                    (ash (+ instance-slots-offset
-                           (get-dsd-index layout sb-kernel::%bits))
+                           (get-dsd-index layout sb-kernel::flags))
                         word-shift))
                 instance-pointer-lowtag))))))
+
+;;; This could be split into two vops to avoid wasting an allocation for 'temp'
+;;; when the immediate form is used.
+(define-vop ()
+  (:translate sb-c::%structure-is-a)
+  (:args (x :scs (descriptor-reg)))
+  (:arg-types * (:constant t))
+  (:policy :fast-safe)
+  (:conditional :eq)
+  (:info test-layout)
+  (:temporary (:sc unsigned-reg) this-id temp)
+  (:generator 4
+    (let ((test-id (layout-id test-layout))
+          (offset (+ (ash (+ (get-dsd-index layout sb-kernel::id-word0)
+                             instance-slots-offset)
+                          word-shift)
+                     (ash (- (layout-depthoid test-layout) 2) 2)
+                     (- instance-pointer-lowtag))))
+      (declare (ignorable test-id))
+      (inst ldr (32-bit-reg this-id) (@ x offset))
+      ;; 8-bit IDs are permanently assigned, so no fixup ever needed for those.
+      (cond ((typep test-id '(and (signed-byte 8) (not (eql 0))))
+             (if (minusp test-id)
+                 (inst cmn (32-bit-reg this-id) (- test-id))
+                 (inst cmp (32-bit-reg this-id) test-id)))
+            (t
+             (destructuring-bind (size . label)
+                 ;; This uses the bogus definition of :dword, the one which
+                 ;; emits 4 bytes. _technically_ dword should be 8 bytes.
+                 (register-inline-constant :dword `(:layout-id ,test-layout))
+               (declare (ignore size))
+               (inst load-from-label (32-bit-reg temp) label))
+             (inst cmp (32-bit-reg this-id) (32-bit-reg temp)))))))
 
 (define-vop (%other-pointer-widetag)
   (:translate %other-pointer-widetag)
@@ -91,16 +124,6 @@
   (:result-types positive-fixnum)
   (:generator 6
     (load-type result function (- fun-pointer-lowtag))))
-
-(define-vop (fun-header-data)
-  (:translate fun-header-data)
-  (:policy :fast-safe)
-  (:args (x :scs (descriptor-reg)))
-  (:results (res :scs (unsigned-reg)))
-  (:result-types positive-fixnum)
-  (:generator 6
-    (loadw res x 0 fun-pointer-lowtag)
-    (inst lsr res res n-widetag-bits)))
 
 (define-vop (get-header-data)
   (:translate get-header-data)
@@ -136,8 +159,7 @@
   (:results (res :scs (any-reg descriptor-reg)))
   (:policy :fast-safe)
   (:generator 1
-    (inst and res ptr (dpb -1 (byte (- n-word-bits n-fixnum-tag-bits 1)
-                                    n-fixnum-tag-bits) 0))))
+    (inst and res ptr (lognot fixnum-tag-mask))))
 
 ;;;; Allocation
 
@@ -248,7 +270,7 @@
     (inst brk halt-trap)))
 
 ;;;; Dummy definition for a spin-loop hint VOP
-(define-vop (spin-loop-hint)
+(define-vop ()
   (:translate spin-loop-hint)
   (:policy :fast-safe)
   (:generator 0))
@@ -308,3 +330,13 @@
   (:policy :fast-safe)
   (:translate %data-dependency-barrier)
   (:generator 3))
+
+(define-vop (sb-c::mark-covered)
+ (:info index)
+ (:temporary (:sc unsigned-reg) tmp)
+  #+darwin-jit
+ (:temporary (:sc descriptor-reg) vector)
+ (:generator 4
+   ;; Can't compute code-tn-relative index until the boxed header length
+   ;; is known. Some vops emit new boxed words via EMIT-CONSTANT.
+   (inst store-coverage-mark index tmp #+darwin-jit vector)))

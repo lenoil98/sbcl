@@ -255,8 +255,7 @@
       (let* ((sym (lvar-value lvar))
              (var (maybe-find-free-var sym))
              (local-type (when var
-                           (let ((*lexenv* (node-lexenv node)))
-                             (lexenv-find var type-restrictions))))
+                           (lexenv-find var type-restrictions :lexenv (node-lexenv node))))
              (global-type (info :variable :type sym)))
         (if local-type
             (type-intersection local-type global-type)
@@ -273,6 +272,11 @@
   (declare (type combination call))
   (let ((lvar (car (last (combination-args call)))))
     (when lvar (lvar-type lvar))))
+
+(defun result-type-nth-arg (n)
+  (lambda (call)
+    (let ((lvar (nth n (combination-args call))))
+      (when lvar (lvar-type lvar)))))
 
 ;;; Derive the result type according to the float contagion rules, but
 ;;; always return a float. This is used for irrational functions that
@@ -409,7 +413,7 @@
         (and (proper-sequence-p value)
              (let ((length (length value)))
                (values length length))))
-      (let ((max 0) (min sb-xc:array-total-size-limit))
+      (let ((max 0) (min array-total-size-limit))
         (block nil
           (labels ((max-dim (type)
                      ;; This can deal with just enough hair to handle type STRING,
@@ -423,12 +427,11 @@
                                        (process-dim (array-type-dimensions type))))
                        (t (return '*))))
                    (process-dim (dim)
-                     (let ((length (car dim)))
-                       (if (and (singleton-p dim)
-                                (integerp length))
+                     (if (typep dim '(cons integer null))
+                         (let ((length (car dim)))
                            (setf max (max max length)
-                                 min (min min length))
-                           (return '*)))))
+                                 min (min min length)))
+                         (return '*))))
             ;; If type derivation were able to notice that non-simple arrays can
             ;; be mutated (changing the type), we could safely use LVAR-TYPE on
             ;; any vector type. But it doesn't notice.

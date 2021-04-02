@@ -68,6 +68,8 @@
    #:md5sum-sequence #:md5sum-string #:md5sum-stream #:md5sum-file))
 
 (in-package sb-md5)
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (setf (sb-int:system-package-p *package*) t))
 
 #+cmu
 (eval-when (:compile-toplevel)
@@ -130,7 +132,7 @@ where a is the intended low-order byte and d the high-order byte."
   #-lw-int32
   `(aref ,vector ,index))
 
-;;; Section 3.4:  Auxilliary functions
+;;; Section 3.4:  Auxiliary functions
 
 (declaim (inline f g h i)
          (ftype (function (ub32 ub32 ub32) ub32) f g h i))

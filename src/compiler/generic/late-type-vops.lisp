@@ -74,19 +74,34 @@
                     target not-p ,type-codes
                     :value-tn-ref args)))))
 
+#-x86-64 ; defined in compiler/x86-64/type-vops for x86-64
+(progn
+(define-type-vop unbound-marker-p (unbound-marker-widetag))
+
+(define-type-vop characterp (character-widetag))
+
+(define-type-vop single-float-p (single-float-widetag))
+
 (define-type-vop fixnump
   #.fixnum-lowtags
-  #+(or x86-64 x86) simple-type-predicate) ;; save a register
+  #+(or x86) simple-type-predicate) ;; save a register
 
 (define-type-vop functionp (fun-pointer-lowtag))
 
 (define-type-vop listp (list-pointer-lowtag))
 
-(define-type-vop non-null-symbol-p (symbol-widetag))
-
 (define-type-vop %instancep (instance-pointer-lowtag))
 
 (define-type-vop %other-pointer-p (other-pointer-lowtag))
+
+(define-type-vop non-null-symbol-p (symbol-widetag))
+
+(define-type-vop closurep (closure-widetag))
+
+(define-type-vop simple-fun-p (simple-fun-widetag))
+
+(define-type-vop funcallable-instance-p (funcallable-instance-widetag))
+) ; end PROGN
 
 (define-type-vop bignump (bignum-widetag))
 
@@ -106,14 +121,13 @@
 
 (define-type-vop complex-double-float-p (complex-double-float-widetag))
 
-(define-type-vop single-float-p (single-float-widetag))
-
 (define-type-vop double-float-p (double-float-widetag))
 
 (define-type-vop simple-string-p
   (#+sb-unicode simple-character-string-widetag
-   simple-base-string-widetag simple-array-nil-widetag))
+   simple-base-string-widetag))
 
+#-x86-64
 (macrolet
     ((define-simple-array-type-vops ()
          `(progn
@@ -133,8 +147,6 @@
                *specialized-array-element-type-properties*))))
   (def)) ; simple-rank-1-array-*-p
 
-(define-type-vop characterp (character-widetag))
-
 (define-type-vop system-area-pointer-p (sap-widetag))
 
 (define-type-vop weak-pointer-p (weak-pointer-widetag))
@@ -145,17 +157,11 @@
 
 (define-type-vop fdefn-p (fdefn-widetag))
 
-(define-type-vop closurep (closure-widetag))
-
-(define-type-vop simple-fun-p (simple-fun-widetag))
-
-(define-type-vop funcallable-instance-p (funcallable-instance-widetag))
-
 (define-type-vop array-header-p
   (simple-array-widetag
    #+sb-unicode complex-character-string-widetag
    complex-base-string-widetag complex-bit-vector-widetag
-   complex-vector-widetag complex-array-widetag complex-vector-nil-widetag))
+   complex-vector-widetag complex-array-widetag))
 
 (define-type-vop simple-array-header-p
   (simple-array-widetag))
@@ -163,17 +169,13 @@
 (define-type-vop stringp
   (#+sb-unicode simple-character-string-widetag
    #+sb-unicode complex-character-string-widetag
-   simple-base-string-widetag complex-base-string-widetag
-   simple-array-nil-widetag complex-vector-nil-widetag))
+   simple-base-string-widetag complex-base-string-widetag))
 
 (define-type-vop base-string-p
   (simple-base-string-widetag complex-base-string-widetag))
 
 (define-type-vop bit-vector-p
   (simple-bit-vector-widetag complex-bit-vector-widetag))
-
-(define-type-vop vector-nil-p
-  (simple-array-nil-widetag complex-vector-nil-widetag))
 
 #+sb-unicode
 (define-type-vop character-string-p
@@ -255,5 +257,14 @@
 #+sb-simd-pack-256
 (define-type-vop simd-pack-256-p (simd-pack-256-widetag))
 
-(define-type-vop unbound-marker-p (unbound-marker-widetag))
-
+;;; Not type vops, but generic over all backends
+(macrolet ((def (name lowtag)
+             `(define-vop ()
+                (:translate ,name)
+                (:policy :fast-safe)
+                (:args (x :scs (descriptor-reg)))
+                (:results (res :scs (unsigned-reg)))
+                (:result-types unsigned-num)
+                (:generator 2 (loadw res x 0 ,lowtag)))))
+  (def function-header-word fun-pointer-lowtag)
+  (def instance-header-word instance-pointer-lowtag))

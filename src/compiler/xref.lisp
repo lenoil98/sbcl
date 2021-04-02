@@ -72,14 +72,14 @@
       (unless (or (eq :deleted (functional-kind functional))
                   ;; If the block came from an inlined global
                   ;; function, ignore it.
-                  (and (functional-inlinep functional)
+                  (and (functional-inline-expanded functional)
                        (symbolp (functional-debug-name functional))))
         (handle-functional functional)))))
 
 (defun record-node-xrefs (node context)
   (declare (type node node))
   (etypecase node
-    ((or creturn cif entry mv-combination cast exit))
+    ((or creturn cif entry mv-combination cast exit enclose))
     (combination
      ;; Record references to globals made using SYMBOL-VALUE.
      (let ((fun (principal-lvar-use (combination-fun node)))
@@ -299,7 +299,7 @@
                 do (dolist (number numbers)
                      (write-var-integer (funcall encoder index number) vector))))
         (setf (aref result 0)
-              (sb-xc:coerce vector '(simple-array (unsigned-byte 8) 1))))
+              (coerce vector '(simple-array (unsigned-byte 8) 1))))
       ;; RESULT is adjustable. Make it simple.
       (coerce result 'simple-vector)))
 

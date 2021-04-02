@@ -169,8 +169,8 @@ fail_on_condition_during_compile sb-ext:compiler-note $tmpfilename
 # test case from Rudi for some CLOS WARNINGness that shouldn't have
 # been there
 cat > $tmpfilename <<EOF
-    #+sb-eval (eval-when (:compile-toplevel)
-                (setf sb-ext:*evaluator-mode* :compile))
+    (eval-when (:compile-toplevel)
+       (setf sb-ext:*evaluator-mode* :compile))
 
     (eval-when (:compile-toplevel :load-toplevel :execute)
       (defstruct buffer-state
@@ -512,6 +512,34 @@ cat > $tmpfilename <<EOF
 (defun bar (x) (foo x))
 EOF
 fail_on_condition_during_compile sb-ext:compiler-note $tmpfilename
+
+cat > $tmpfilename <<EOF
+(in-package :cl-user)
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defclass subclass (superclass) ((zslot2 :initarg :zslot2 :accessor zslot2))))
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defclass superclass () ((c :initarg c :accessor c))))
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (sb-kernel::%invalidate-layout (sb-pcl::class-wrapper (find-class 'subclass))))
+
+;; This test file is weird. It expects to see warnings from a COMPILE inside
+;; a method body that is compiled (and not necessarily invoked).
+;; To force the warnings to happen, we have to force the method to get called,
+;; which we can do by asking a SUBTYPEP question.
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defmethod sb-mop:finalize-inheritance :after (class)
+    (eval '(defmethod z (x) (abcde)))
+    (funcall (compile nil '(lambda () (defun zz (x) (defgh))))))
+  (assert (not (sb-kernel:csubtypep (sb-kernel:specifier-type 'subclass)
+                                    (sb-kernel:specifier-type 'condition)))))
+
+(defun subclass-p (x)
+  (typep x 'subclass))
+EOF
+expect_warned_compile $tmpfilename
 
 # success
 exit $EXIT_TEST_WIN

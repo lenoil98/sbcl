@@ -39,11 +39,10 @@
 #include "align.h"
 
 #include "validate.h"
-size_t os_vm_page_size;
 
 int arch_os_thread_init(struct thread *thread)
 {
-
+#ifndef LISP_FEATURE_OS_THREAD_STACK
     void *cur_stack_end;
     MEMORY_BASIC_INFORMATION stack_memory;
 
@@ -76,8 +75,6 @@ int arch_os_thread_init(struct thread *thread)
 #endif
 
 
-#ifdef LISP_FEATURE_SB_THREAD
-    pthread_setspecific(specials,thread);
 #endif
     return 1;
 }

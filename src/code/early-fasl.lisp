@@ -40,37 +40,7 @@
 ;;; so any flag in this list may or may not be present
 ;;; in the *FEATURES* list of this particular build.
 (defglobal *features-potentially-affecting-fasl-format*
-    (append '(:sb-thread :sb-package-locks :sb-unicode :cheneygc
-              :gencgc :msan :sb-safepoint :sb-safepoint-strictly
-              :sb-dynamic-core)
-            #+(or x86 x86-64) '(:int4-breakpoints :ud2-breakpoints)))
-
-;;; Return a string representing symbols in *FEATURES-POTENTIALLY-AFFECTING-FASL-FORMAT*
-;;; which are present in a particular compilation.
-(defun compute-features-affecting-fasl-format ()
-  (let ((list (sort (copy-list (intersection *features-potentially-affecting-fasl-format*
-                                             sb-xc:*features*))
-                    #'string< :key #'symbol-name)))
-    ;; Stringify the subset of *FEATURES* that affect fasl format.
-    ;; A list would be the natural representation choice for this, but a string
-    ;; is convenient for and a requirement for writing to and reading from fasls
-    ;; at this stage of the loading. WITH-STANDARD-IO-SYNTAX and WRITE-TO-STRING
-    ;; would work, but this is simple enough to do by hand.
-    (with-simple-output-to-string (stream)
-      (let ((delimiter #\())
-        (dolist (symbol list)
-          (write-char delimiter stream)
-          (write-string (string symbol) stream)
-          (setq delimiter #\Space)))
-      (write-char #\) stream))))
-
-#-sb-xc-host
-(eval-when (:compile-toplevel)
-  (let ((string (compute-features-affecting-fasl-format)))
-    (assert (and (> (length string) 2)
-                 (not (find #\newline string))
-                 (not (find #\# string))
-                 (not (search ".." string))))))
+    (append '(:sb-thread :sb-unicode :cheneygc :gencgc :msan :sb-safepoint)))
 
 ;;; the code for a character which terminates a fasl file header
 (defconstant +fasl-header-string-stop-char-code+ 255)

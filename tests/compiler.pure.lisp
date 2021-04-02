@@ -1945,7 +1945,7 @@
      and v-max = (1- (ash 1 n-bits))
      while (<= n-bits sb-vm:n-word-bits)
      do
-       (let* ((n (* 2 (1+ (- sb-vm::n-word-bits n-bits))))
+       (let* ((n (* 2 (1+ (- sb-vm:n-word-bits n-bits))))
               (array1 (make-array n :element-type type))
               (array2 (make-array n :element-type type)))
          (dotimes (i n)
@@ -2880,7 +2880,7 @@
 (with-test (:name (compile :hairy-array-element-type-derivation))
   (checked-compile
    '(lambda (x)
-     (declare (type (and simple-string (satisfies array-has-fill-pointer-p)) x))
+     (declare (type (and simple-string (satisfies eval)) x))
      (array-element-type x))))
 
 (with-test (:name (compile &rest :derive-type 1))
@@ -3281,6 +3281,7 @@
 
 (with-test (:name :float-division-using-exact-reciprocal)
   (flet ((test (lambda-form arg res &key (check-insts t))
+           (declare (ignorable check-insts))
            (let* ((fun (checked-compile lambda-form))
                   (disassembly (with-output-to-string (s)
                                   (disassemble fun :stream s))))
@@ -3329,6 +3330,7 @@
                                   (disassemble fun1 :stream s)))
                   (disassembly2 (with-output-to-string (s)
                                   (disassemble fun2 :stream s))))
+             (declare (ignorable disassembly1 disassembly2))
              ;; Multiplication at runtime should be eliminated only with
              ;; FLOAT-ACCURACY=0. (To catch SNaNs.)
              #+(or x86 x86-64)
@@ -3359,6 +3361,7 @@
                                   (disassemble fun1 :stream s)))
                   (disassembly2 (with-output-to-string (s)
                                   (disassemble fun2 :stream s))))
+             (declare (ignorable disassembly1 disassembly2))
              ;; Let's make sure there is no addition at runtime: for x86 and
              ;; x86-64 that implies an FADD, ADDSS, or ADDSD instruction, so
              ;; look for the ADDs in the disassembly. It's a terrible KLUDGE,
@@ -3382,7 +3385,7 @@
     (test `(lambda (x) (declare (double-float x)) (+ x 0.0)) 543.21d0)
     (test `(lambda (x) (declare (double-float x)) (+ x 0.0d0)) 42.d0)))
 
-(with-test (:name :float-substraction-of-zero)
+(with-test (:name :float-subtraction-of-zero)
   (flet ((test (lambda-form arg &optional (result arg))
            (let* ((fun1 (checked-compile lambda-form))
                   (fun2 (funcall (checked-compile
@@ -3393,6 +3396,7 @@
                                   (disassemble fun1 :stream s)))
                   (disassembly2 (with-output-to-string (s)
                                   (disassemble fun2 :stream s))))
+             (declare (ignorable disassembly1 disassembly2))
              ;; Let's make sure there is no substraction at runtime: for x86
              ;; and x86-64 that implies an FSUB, SUBSS, or SUBSD instruction,
              ;; so look for SUB in the disassembly. It's a terrible KLUDGE,
@@ -3426,6 +3430,7 @@
                                   (disassemble fun1 :stream s)))
                   (disassembly2 (with-output-to-string (s)
                                   (disassemble fun2 :stream s))))
+             (declare (ignorable disassembly1 disassembly2))
              ;; Let's make sure there is no multiplication at runtime: for x86
              ;; and x86-64 that implies an FMUL, MULSS, or MULSD instruction,
              ;; so look for MUL in the disassembly. It's a terrible KLUDGE,
@@ -3716,10 +3721,10 @@
 (with-test (:name :bug-316078)
   (let ((fun (checked-compile
               `(lambda (x)
-                 (declare (type (and simple-bit-vector (satisfies bar)) x)
+                 (declare (type (and simple-bit-vector (satisfies eval)) x)
                           (optimize speed))
                  (elt x 5)))))
-    (assert (not (ctu:find-named-callees fun)))
+    (assert (equal (ctu:find-named-callees fun) (list #'eval)))
     (assert (= 1 (funcall fun #*000001)))
     (assert (= 0 (funcall fun #*000010)))))
 
@@ -3919,7 +3924,9 @@
                                    finally (return result))
                              (loop for result = (checked-compile lambda)
                                    do (incf iterations)
-                                   until (> (get-internal-run-time) (+ start 10))
+                                   until (> (get-internal-run-time) (+ start (* 10
+                                                                                (/ internal-time-units-per-second
+                                                                                   1000))))
                                    finally (return result))))
                     (end (get-internal-run-time))
                     (got (funcall fun)))
@@ -4575,8 +4582,8 @@
 
 (with-test (:name (:bug-1050768 :cause))
   (let ((types `((string string)
-                 ((or (simple-array character 24) (vector t 24))
-                  (or (simple-array character 24) (vector t))))))
+                 ((or (simple-array character 9) (vector t 9))
+                  (or (simple-array character 9) (vector t))))))
     (dolist (pair types)
       (destructuring-bind (orig conservative) pair
         (assert (sb-kernel:type= (sb-kernel:specifier-type conservative)
@@ -4945,59 +4952,6 @@
          (logand (lognand a -6) (* b -502823994)))
     ((-1491588365 -3745511761) 1084329992)))
 
-;; win32 is very specific about the order in which catch blocks
-;; must be allocated on the stack
-;;
-;; This test is on the critical path. When started as the very first test,
-;; it finishes as the last.
-(with-test (:name (compile :bug-1072739) :slow t)
-  (checked-compile-and-assert (:optimize :safe)
-      `(lambda ()
-         (STRING=
-          (LET ((% 23))
-            (WITH-OUTPUT-TO-STRING (G13908)
-              (PRINC
-               (LET ()
-                 (DECLARE (OPTIMIZE (SB-EXT:INHIBIT-WARNINGS 3)))
-                 (HANDLER-CASE
-                     (WITH-OUTPUT-TO-STRING (G13909) (PRINC %A%B% G13909) G13909)
-                   (UNBOUND-VARIABLE NIL
-                     (HANDLER-CASE
-                         (WITH-OUTPUT-TO-STRING (G13914)
-                           (PRINC %A%B% G13914)
-                           (PRINC "" G13914)
-                           G13914)
-                       (UNBOUND-VARIABLE NIL
-                         (HANDLER-CASE
-                             (WITH-OUTPUT-TO-STRING (G13913)
-                               (PRINC %A%B G13913)
-                               (PRINC "%" G13913)
-                               G13913)
-                           (UNBOUND-VARIABLE NIL
-                             (HANDLER-CASE
-                                 (WITH-OUTPUT-TO-STRING (G13912)
-                                   (PRINC %A% G13912)
-                                   (PRINC "b%" G13912)
-                                   G13912)
-                               (UNBOUND-VARIABLE NIL
-                                 (HANDLER-CASE
-                                     (WITH-OUTPUT-TO-STRING (G13911)
-                                       (PRINC %A G13911)
-                                       (PRINC "%b%" G13911)
-                                       G13911)
-                                   (UNBOUND-VARIABLE NIL
-                                     (HANDLER-CASE
-                                         (WITH-OUTPUT-TO-STRING (G13910)
-                                           (PRINC % G13910)
-                                           (PRINC "a%b%" G13910)
-                                           G13910)
-                                       (UNBOUND-VARIABLE NIL
-                                         (ERROR "Interpolation error in \"%a%b%\"
-"))))))))))))))
-               G13908)))
-          "23a%b%"))
-     (() t)))
-
 (with-test (:name (compile equal equalp :transforms))
   (let* ((s "foo")
          (bit-vector #*11001100)
@@ -5029,9 +4983,7 @@
                               y)))
         (((list (string 'list)) (list "LIST")) t)))))
 
-(with-test (:name (compile restart-case optimize speed compiler-note)
-                  ;; Cannot-DX note crashes test driver unless we have this:
-            :skipped-on (not :stack-allocatable-fixed-objects))
+(with-test (:name (compile restart-case optimize speed compiler-note))
   (checked-compile '(lambda ()
                      (declare (optimize speed))
                      (restart-case () (c ()))))
@@ -5043,7 +4995,7 @@
                        x))))
 
 (with-test (:name (compile :copy-more-arg)
-                  :fails-on (or :alpha :hppa :mips :sparc))
+                  :fails-on (or :mips :sparc))
   ;; copy-more-arg might not copy in the right direction
   ;; when there are more fixed args than stack frame slots,
   ;; and thus end up splatting a single argument everywhere.
@@ -5085,8 +5037,7 @@
 ;; quantifiers shouldn't cons themselves.
 (with-test (:name :quantifiers-no-consing
             :serial t
-            :skipped-on (or :interpreter
-                             (not :stack-allocatable-closures)))
+            :skipped-on :interpreter)
   (let ((constantly-t (lambda (x) x t))
         (constantly-nil (lambda (x) x nil))
         (list (make-list 1000 :initial-element nil))
@@ -5230,7 +5181,7 @@
                   (with-output-to-string (s)
                     (disassemble
                      `(lambda (x)
-                        (declare (optimize (sb-c::verify-arg-count 0)))
+                        (declare (optimize (sb-c:verify-arg-count 0)))
                         (typep x ',type-expr))
                      :stream s)))))
     ;; These are fragile, but less bad than the possibility of messing up
@@ -5727,7 +5678,7 @@
   (let ((f (checked-compile '(lambda (x) (oddp x)))))
     (ctu:assert-no-consing (funcall f most-positive-fixnum))))
 (with-test (:name (oddp bignum :no-consing)
-            :serial t :skipped-on :interpreter)
+            :serial t :skipped-on :interpreter :fails-on :ppc)
   (let ((f (checked-compile '(lambda (x) (oddp x))))
         (x (* most-positive-fixnum most-positive-fixnum 3)))
     (ctu:assert-no-consing (funcall f x))))
@@ -5736,7 +5687,7 @@
   (let ((f (checked-compile '(lambda (x) (logtest x most-positive-fixnum)))))
     (ctu:assert-no-consing (funcall f 1))))
 (with-test (:name (logtest bignum :no-consing)
-            :serial t :skipped-on :interpreter)
+            :serial t :skipped-on :interpreter :fails-on :ppc)
   (let ((f (checked-compile '(lambda (x) (logtest x 1))))
         (x (* most-positive-fixnum most-positive-fixnum 3)))
     (ctu:assert-no-consing (funcall f x))))
@@ -5774,12 +5725,10 @@
          (map a 'list (the vector b) #*))
     (('vector #()) #() :test #'equalp)))
 
-(with-test (:name (make-list :large 1))
-  (checked-compile `(lambda ()
-                      (make-list (expt 2 28) :initial-element 0))))
-
-(with-test (:name (make-list :large 2)
+(with-test (:name (make-list :large)
             :skipped-on (not :64-bit))
+  (checked-compile `(lambda ()
+                      (make-list (expt 2 28) :initial-element 0)))
   (checked-compile `(lambda ()
                       (make-list (expt 2 30) :initial-element 0))))
 
@@ -6082,7 +6031,7 @@
                           '(2 4 3))
                  3)))
 
-(with-test (:name :usigned-word-float-conversion)
+(with-test (:name :unsigned-word-float-conversion)
   (assert (= (rational (funcall (checked-compile `(lambda (x)
                                                     (float (the sb-ext:word x) 1d0)))
                                 sb-ext:most-positive-word))
@@ -6456,3 +6405,30 @@
                 (type (eql -1) p2))
        (logandc1 p1 p2))
     ((-3 -1) 2)))
+
+;;; A user reported a potential compiler bug when SBCL consumed all its memory
+;;; while trying to compile a "trivial" wrapper macro similar to this one.
+;;; (because MACROLET is not FLET)
+(with-test (:name :macrolet-infinite-loop-detection)
+  (multiple-value-bind (fun warningsp errorp)
+      (compile nil
+               '(lambda (x)
+                  (macrolet ((complicated-fun (&rest keys)
+                               `(complicated-fun :a 1 ,@keys)))
+                    (complicated-fun :x 9))))
+    (assert (and fun warningsp errorp))))
+
+;;; This SAP+ call overflowed the size of an immediate on MIPS.
+;;; 'bit-vector.impure.lisp' exposed this bug where it computes
+;;;   (sb-sys:sap+ first sb-c:+backend-page-bytes+)
+;;; which is not the ideal place to fail, considering that
+;;; pointer arithmetic is not what's being tested.
+(with-test (:name :sap+-immediate)
+  (compile nil '(lambda (x) (sb-sys:sap+ x 65536))))
+
+(with-test (:name (compile handler-bind :no-note))
+  (checked-compile
+   `(lambda (x)
+      (handler-bind ((error (constantly nil)))
+        (pathname-type x)))
+   :allow-notes nil))

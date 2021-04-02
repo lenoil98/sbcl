@@ -40,25 +40,86 @@
      (when (eq (car flags) 'not)
        (pop flags)
        (setf not-p (not not-p)))
-     (flet ((negate-condition (name)
-              (let ((code (logxor 1 (conditional-opcode name))))
-                (aref +condition-name-vec+ code))))
-       (cond ((null (rest flags))
+     (cond ((null (rest flags))
               (inst jmp
                     (if not-p
                         (negate-condition (first flags))
                         (first flags))
                     dest))
-             (not-p
+           (not-p
               (let ((not-lab (gen-label))
                     (last    (car (last flags))))
                 (dolist (flag (butlast flags))
                   (inst jmp flag not-lab))
                 (inst jmp (negate-condition last) dest)
                 (emit-label not-lab)))
-             (t
+           (t
               (dolist (flag flags)
-                (inst jmp flag dest)))))))
+                (inst jmp flag dest))))))
+
+(define-vop (multiway-branch-if-eq)
+  ;; TODO: also accept signed-reg, unsigned-reg, character-reg
+  ;; also, could probably tighten up the TN lifetime to avoid a move
+  (:args (x :scs (any-reg descriptor-reg)))
+  (:info labels otherwise key-type keys test-vop-name)
+  (:temporary (:sc unsigned-reg) table)
+  (:args-var x-tn-ref)
+  (:generator 10
+    (let* ((key-derived-type (tn-ref-type x-tn-ref))
+           (ea)
+           (min (car keys)) ; keys are sorted
+           (max (car (last keys)))
+           (vector (make-array (1+ (- max min)) :initial-element otherwise))
+           ;; This fixnumize won't overflow because ir2opt won't use
+           ;; a multiway-branch unless all keys are char or fixnum.
+           ;; But what if MIN is MOST-NEGATIVE-FIXNUM ????
+           (-min (fixnumize (- min))))
+      (mapc (lambda (key label) (setf (aref vector (- key min)) label))
+            keys labels)
+      (ecase key-type
+        (fixnum
+           (cond
+             ((and (typep (* min (- sb-vm:n-word-bytes)) '(signed-byte 32))
+                   (typep key-derived-type 'numeric-type)
+                   (csubtypep key-derived-type (specifier-type 'fixnum))
+                   ;; There could be some dead code if the ranges don't line up.
+                   (>= (numeric-type-low key-derived-type) min)
+                   (<= (numeric-type-high key-derived-type) max))
+              (setq ea (ea (* min (- sb-vm:n-word-bytes)) table x 4)))
+             (t
+              ;; First exclude out-of-bounds values because there's no harm
+              ;; in doing that up front regardless of the argument's lisp type.
+              (typecase -min
+                ;; TODO: if min is 0, use X directly, don't move into temp-reg-tn
+                ((eql 0) (move temp-reg-tn x))
+                ((signed-byte 32) (inst lea temp-reg-tn (ea -min x)))
+                (t (inst mov temp-reg-tn x)
+                   (inst add :qword temp-reg-tn (constantize -min))))
+              (inst cmp temp-reg-tn (constantize (fixnumize (- max min))))
+              (inst jmp :a otherwise)
+              ;; We have to check the type here because a chain of EQ tests
+              ;; does not impose a type constraint.
+              ;; If type of X was derived as fixnum, then elide this test.
+              (unless (eq test-vop-name 'sb-vm::fast-if-eq-fixnum/c)
+                (inst test :byte x fixnum-tag-mask)
+                (inst jmp :ne otherwise))
+              (setq ea (ea table temp-reg-tn 4))))
+            (inst lea table (register-inline-constant :jump-table vector))
+            (inst jmp ea))
+        (character
+           ;; Same as above, but test the widetag before shifting it out.
+           (unless (member test-vop-name '(fast-char=/character/c
+                                           fast-if-eq-character/c))
+             (inst cmp :byte x character-widetag)
+             (inst jmp :ne otherwise))
+           (inst mov :dword temp-reg-tn x)
+           (inst shr :dword temp-reg-tn n-widetag-bits)
+           (unless (= min 0)
+             (inst sub :dword temp-reg-tn min))
+           (inst cmp temp-reg-tn (- max min))
+           (inst jmp :a otherwise)
+           (inst lea table (register-inline-constant :jump-table vector))
+           (inst jmp (ea table temp-reg-tn 8)))))))
 
 (define-load-time-global *cmov-ptype-representation-vop*
   (mapcan (lambda (entry)
@@ -96,7 +157,7 @@
 (defun convert-conditional-move-p (node dst-tn x-tn y-tn)
   (declare (ignore node))
   (let* ((ptype (sb-c::tn-primitive-type dst-tn))
-         (name  (sb-c::primitive-type-name ptype))
+         (name  (sb-c:primitive-type-name ptype))
          (param (cdr (or (assoc name *cmov-ptype-representation-vop*)
                          '(t descriptor-reg move-if/t)))))
     (when param
@@ -123,10 +184,7 @@
   (:generator 0
      (let ((not-p (eq (first flags) 'not)))
        (when not-p (pop flags))
-       (flet ((negate-condition (name)
-                (let ((code (logxor 1 (conditional-opcode name))))
-                  (aref +condition-name-vec+ code)))
-              (load-immediate (dst constant-tn
+       (flet ((load-immediate (dst constant-tn
                                &optional (sc (sc-name (tn-sc dst))))
                 ;; Can't use ZEROIZE, since XOR will affect the flags.
                 (inst mov dst
@@ -190,6 +248,80 @@
   #+sb-unicode
   (def-move-if move-if/char character character-reg character-stack)
   (def-move-if move-if/sap system-area-pointer sap-reg sap-stack))
+
+;;; Return a hint about how to calculate the answer from X,Y and flags.
+;;; Return NIL to give up.
+(defun computable-from-flags-p (res x y flags)
+  ;; TODO: handle unsigned-reg
+  (unless (and (singleton-p flags)
+               (sc-is res sb-vm::any-reg sb-vm::descriptor-reg))
+    (return-from computable-from-flags-p nil))
+  ;; There are plenty more algebraic transforms possible,
+  ;; but this picks off some very common cases.
+  (flet ((try-shift (x y)
+           (and (eql x 0)
+                (typep y '(and fixnum unsigned-byte))
+                (= (logcount y) 1)
+                'shl))
+         (try-add (x y) ; commutative
+           ;; (signed-byte 32) is gonna work for sure.
+           ;; Other things might too, but "perfect is the enemy of good".
+           ;; The constant in LEA is pre-fixnumized.
+           ;; Post-fixnumizing instead would open up a few more possibilities.
+           (and (fixnump x)
+                (fixnump y)
+                (typep (fixnumize x) '(signed-byte 32))
+                (typep (fixnumize y) '(signed-byte 32))
+                (member (abs (fixnumize (- x y))) '(2 4 8))
+                'add)))
+    (or #+sb-thread (or (and (eq x t) (eq y nil) 'boolean)
+                        (and (eq x nil) (eq y t) 'boolean))
+        (try-shift x y)
+        (try-shift y x)
+        (try-add x y))))
+
+(define-vop (compute-from-flags)
+  (:args (x-tn :scs (immediate constant))
+         (y-tn :scs (immediate constant)))
+  (:results (res :scs (any-reg descriptor-reg)))
+  (:info flags)
+  (:generator 3
+    (let* ((x (tn-value x-tn))
+           (y (tn-value y-tn))
+           (hint (computable-from-flags-p res x y flags))
+           (flag (car flags)))
+      (ecase hint
+        (boolean
+         ;; FIXNUMP -> {T,NIL} could be special-cased, reducing the instruction count by
+         ;; 1 or 2 depending on whether the argument and result are in the same register.
+         ;; Best case would be "AND :dword res, arg, 1 ; MOV res, [ea]".
+         (when (eql x t)
+           ;; T is at the lower address, so to pick it out we need index=0
+           ;; which makes the condition in (IF BIT T NIL) often flipped.
+           (setq flag (negate-condition flag)))
+         (inst set res flag)
+         (inst movzx '(:byte :dword) res res)
+         (inst mov :dword res
+               (ea (ash thread-t-nil-constants-slot word-shift) thread-base-tn res 4)))
+        (shl
+         (when (eql x 0)
+           (setq flag (negate-condition flag)))
+         (let ((bit (1- (integer-length (fixnumize (logior x y))))))
+           (inst set res flag)
+           (inst movzx '(:byte :dword) res res)
+           (inst shl (if (> bit 31) :qword :dword) res bit)))
+        (add
+         (let* ((x (fixnumize x))
+                (y (fixnumize y))
+                (min (min x y))
+                (delta (abs (- x y)))
+                (ea (ea min nil res delta)))
+           (when (eql x min)
+             (setq flag (negate-condition flag)))
+           (inst set res flag)
+           (inst movzx '(:byte :dword) res res)
+           ;; Retain bit 63... if either is negative
+           (inst lea (if (or (minusp x) (minusp y)) :qword :dword) res ea)))))))
 
 ;;;; conditional VOPs
 
@@ -203,11 +335,27 @@
   (:conditional :e)
   (:policy :fast-safe)
   (:translate eq)
+  (:args-var x-tn-ref)
   (:generator 6
     (cond
       ((sc-is y immediate)
        (let* ((value (encode-value-if-immediate y))
               (immediate (plausible-signed-imm32-operand-p value)))
+         (when (and (null (tn-value y)) (tn-ref-type x-tn-ref))
+           ;; if the complement of X's type with respect to type NULL can't
+           ;; be a cons, then we don't need a 4-byte comparison against NIL.
+           ;; It suffices to test the low byte. Similar logic could pertain to many
+           ;; other type tests, e.g. STRINGP on known (OR INSTANCE STRING)
+           ;; could skip the widetag test.
+           ;; I'm starting to wonder if it would be better to expose the lowtag/widetag
+           ;; tests in IR1 as an AND expression so that type inference can remove what's
+           ;; possible to deduce. The we just need a way to efficiently recombine
+           ;; the AND back to one vop where we can. "selection DAG, anyone?"
+           (when (not (types-equal-or-intersect
+                       (type-difference (tn-ref-type x-tn-ref) (specifier-type 'null))
+                       (specifier-type 'cons)))
+             (inst cmp :byte x (logand nil-value #xff))
+             (return-from if-eq)))
          (cond ((fixup-p value) ; immobile object
                 (inst cmp x value))
                ((and (zerop value) (sc-is x any-reg descriptor-reg))
@@ -261,32 +409,6 @@
                 (ash (+ slot instance-slots-offset) word-shift))
              instance)
          (encode-value-if-immediate x))))
-
-(define-vop (fixnump-instance-ref)
-  (:args (instance :scs (descriptor-reg)))
-  (:arg-types * (:constant (unsigned-byte 16)))
-  (:info slot)
-  (:translate fixnump-instance-ref)
-  (:conditional :e)
-  (:policy :fast-safe)
-  (:generator 1
-   (inst test :byte
-         (ea (+ (- instance-pointer-lowtag)
-                (ash (+ slot instance-slots-offset) word-shift))
-             instance)
-         fixnum-tag-mask)))
-(macrolet ((def-fixnump-cxr (name index)
-             `(define-vop (,name)
-                (:args (x :scs (descriptor-reg)))
-                (:translate ,name)
-                (:conditional :e)
-                (:policy :fast-safe)
-                (:generator 1
-                 (inst test :byte
-                       (ea (- (ash ,index word-shift) list-pointer-lowtag) x)
-                       fixnum-tag-mask)))))
-  (def-fixnump-cxr fixnump-car cons-car-slot)
-  (def-fixnump-cxr fixnump-cdr cons-cdr-slot))
 
 ;;; See comment below about ASSUMPTIONS
 (eval-when (:compile-toplevel)
@@ -351,12 +473,5 @@
     ;; Anything else it needs will be callee-saved.
     (move rdi x) ; load the C call args
     (move rsi y)
-
-    (let ((fixup (make-fixup "generic_eql" :foreign)))
-      (cond ((sb-c::code-immobile-p vop))
-            (t
-             (inst mov temp-reg-tn fixup)
-             (setf fixup temp-reg-tn)))
-      (inst call fixup)) ; result => ZF
-
+    (invoke-asm-routine 'call 'generic-eql vop)
     DONE))

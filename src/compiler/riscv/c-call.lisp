@@ -13,21 +13,24 @@
 
 
 (defconstant-eqx c-saved-registers
-    (list* lr-offset
-           8 9 (loop for i from 18 to 27 collect i))
+    '#.`(,lip-offset 8 9 ,@(loop for i from 18 to 27 collect i))
   #'equal)
 
 (defconstant-eqx c-unsaved-registers
-    (append (list lr-offset)
-            (loop for i from 5 to 7 collect i)
-            (loop for i from 10 to 17 collect i)
-            (loop for i from 28 to 31 collect i))
+    '#.`(,lip-offset
+         ,@(loop for i from 5 to 7 collect i)
+         ,@(loop for i from 10 to 17 collect i)
+         ,@(loop for i from 28 to 31 collect i))
+  #'equal)
+
+(defconstant-eqx c-saved-float-registers
+    '#.`(8 9 ,@(loop for i from 18 to 27 collect i))
   #'equal)
 
 (defconstant-eqx c-unsaved-float-registers
-    (append (loop for i from 0 to 7 collect i)
-            (loop for i from 10 to 17 collect i)
-            (loop for i from 28 to 31 collect i))
+    '#.`(,@(loop for i from 0 to 7 collect i)
+         ,@(loop for i from 10 to 17 collect i)
+         ,@(loop for i from 28 to 31 collect i))
   #'equal)
 
 (defun make-reg-tn (offset &optional (sc 'any-reg))
@@ -159,7 +162,6 @@
   (:generator 2
     (inst li res (make-fixup foreign-symbol :foreign))))
 
-#+linkage-table
 (define-vop (foreign-symbol-dataref-sap)
   (:translate foreign-symbol-dataref-sap)
   (:policy :fast-safe)
@@ -170,7 +172,9 @@
   (:result-types system-area-pointer)
   (:temporary (:scs (non-descriptor-reg)) addr)
   (:generator 2
-    ;; FIXME: can optimize to lui + load.
+    ;; This probably has to be 3 instructions unless we can put some linkage entries
+    ;; near enough to NULL-TN. Would only make a difference when compiling to memory
+    ;; since compiling to file has to assume worst case.
     (inst li addr (make-fixup foreign-symbol :foreign-dataref))
     (loadw res addr)))
 
@@ -189,7 +193,7 @@
       (when cur-nfp
         (store-stack-tn nfp-save cur-nfp))
       (move cfunc function)
-      (invoke-asm-routine 'call-into-c nil)
+      (invoke-asm-routine 'call-into-c)
       (when cur-nfp
         (load-stack-tn cur-nfp nfp-save)))))
 

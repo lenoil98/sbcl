@@ -13,7 +13,6 @@
            sb-vm:instance-widetag sb-vm:instance-pointer-lowtag
            nil)
 
-#+stack-allocatable-fixed-objects
 (defoptimizer (%make-structure-instance stack-allocate-result)
     ((defstruct-description &rest args) node dx)
   (declare (ignore args dx))
@@ -31,9 +30,18 @@
   #+(and :gencgc :c-stack-is-control-stack)
   t)
 
+(defoptimizer (%make-instance stack-allocate-result) ((n) node dx)
+  (declare (ignore n))
+  (eq dx 'truly-dynamic-extent))
+(defoptimizer (%make-funcallable-instance stack-allocate-result) ((n) node dx)
+  (declare (ignore n))
+  (eq dx 'truly-dynamic-extent))
+
 (defoptimizer ir2-convert-reffer ((object) node block name offset lowtag)
   (let* ((lvar (node-lvar node))
-         (locs (lvar-result-tns lvar (list *universal-type*)))
+         (locs (lvar-result-tns lvar (list (if lvar
+                                               (lvar-type lvar)
+                                               *universal-type*))))
          (res (first locs)))
     (vop slot node block (lvar-tn node block object)
          name offset lowtag res)
@@ -67,11 +75,6 @@
          res)
     (move-lvar-result node block locs lvar)))
 
-(eval-when (:compile-toplevel)
-  ;; Assert correctness of build order. (Need not be exhaustive)
-  #+(and x86-64 (not (vop-named sb-vm::raw-instance-init/word)))
-  (error "Expected raw-instance-init vops"))
-
 (defun emit-inits (node block name object lowtag inits args)
   (let ((unbound-marker-tn nil)
         (funcallable-instance-tramp-tn nil)
@@ -99,7 +102,9 @@
                            (zero-init-p arg))
                 (let ((arg-tn (lvar-tn node block arg)))
                   (macrolet
-                      ((make-case (&optional rsd-list)
+                      ((make-case (&aux (rsd-list
+                                         (if (vop-existsp :named sb-vm::raw-instance-init/word)
+                                             sb-kernel::*raw-slot-data*)))
                          `(ecase raw-type
                             ((t)
                              (vop init-slot node block object arg-tn
@@ -109,9 +114,8 @@
                                  `(,(sb-kernel::raw-slot-data-raw-type rsd)
                                    (vop ,(sb-kernel::raw-slot-data-init-vop rsd)
                                         node block object arg-tn slot)))
-                               (symbol-value rsd-list)))))
-                    (make-case #+(vop-named sb-vm::raw-instance-init/word)
-                               sb-kernel::*raw-slot-data*))))))
+                               rsd-list))))
+                    (make-case))))))
            (:dd
             (vop init-slot node block object
                  (emit-constant (sb-kernel::dd-layout-or-lose slot))
@@ -178,8 +182,12 @@
     (if (constant-lvar-p extra)
         (let ((words (+ (lvar-value extra) words)))
           (emit-fixed-alloc node block name words type lowtag result lvar))
-        (vop var-alloc node block (lvar-tn node block extra) name words
-             type lowtag result))
+        (let ((stack-allocate-p (and lvar (lvar-dynamic-extent lvar))))
+          (when stack-allocate-p
+            (vop current-stack-pointer node block
+                 (ir2-lvar-stack-pointer (lvar-info lvar))))
+          (vop var-alloc node block (lvar-tn node block extra) name words
+               type lowtag stack-allocate-p result)))
     (emit-inits node block name result lowtag inits args)
     (move-lvar-result node block locs lvar)))
 
@@ -276,6 +284,7 @@
 ;;; An array header for simple non-unidimensional arrays is a fixed alloc,
 ;;; because the rank has to be known.
 ;;; (There are no compile-time optimizations for unknown rank arrays)
+;;; WIDETAG may have ORed into it 1 bit for +ARRAY-FILL-POINTER-P+
 (defoptimizer (make-array-header* ir2-convert) ((widetag &rest args) node block)
   (let ((n-args (length args)))
     ;; Remove the widetag lvar
@@ -306,12 +315,10 @@
                  node block (list value-tn) (node-lvar node))))))))
 
 ;;; Stack allocation optimizers per platform support
-#+stack-allocatable-vectors
-(progn
-  (defoptimizer (make-array-header* stack-allocate-result) ((&rest args) node dx)
+(defoptimizer (make-array-header* stack-allocate-result) ((&rest args) node dx)
     args dx
     t)
-  (defoptimizer (allocate-vector stack-allocate-result)
+(defoptimizer (allocate-vector stack-allocate-result)
       ((type length words) node dx)
     (declare (ignorable type) (ignore length))
     (and
@@ -331,35 +338,31 @@
                           (specifier-type
                            `(integer 0 ,(- (/ +backend-page-bytes+ sb-vm:n-word-bytes)
                                            sb-vm:vector-data-offset)))))))
-
-  (defoptimizer (allocate-vector ltn-annotate) ((type length words) call ltn-policy)
+(defoptimizer (allocate-vector ltn-annotate) ((type length words) call ltn-policy)
     (declare (ignore type length words))
     (vectorish-ltn-annotate-helper call ltn-policy
                                    'sb-vm::allocate-vector-on-stack
                                    'sb-vm::allocate-vector-on-heap))
 
-  (defun vectorish-ltn-annotate-helper (call ltn-policy dx-template &optional not-dx-template)
+(defun vectorish-ltn-annotate-helper (call ltn-policy dx-template not-dx-template)
     (let* ((args (basic-combination-args call))
            (template-name (if (node-stack-allocate-p call)
                               dx-template
                               not-dx-template))
-           (template (and template-name
-                          (template-or-lose template-name))))
+           (template (template-or-lose template-name)))
       (dolist (arg args)
         (setf (lvar-info arg)
               (make-ir2-lvar (primitive-type (lvar-type arg)))))
-      (unless (and template
-                   (is-ok-template-use template call (ltn-policy-safe-p ltn-policy)))
+      (unless (is-ok-template-use template call (ltn-policy-safe-p ltn-policy))
         (ltn-default-call call)
         (return-from vectorish-ltn-annotate-helper (values)))
       (setf (basic-combination-info call) template)
       (setf (node-tail-p call) nil)
 
       (dolist (arg args)
-        (annotate-1-value-lvar arg)))))
+        (annotate-1-value-lvar arg))))
 
 ;;; ...lists
-#+stack-allocatable-lists
 (progn
   (defoptimizer (list stack-allocate-result) ((&rest args) node dx)
     (declare (ignore dx))
@@ -372,14 +375,12 @@
     t))
 
 ;;; ...conses
-#+stack-allocatable-fixed-objects
-(progn
-  (defoptimizer (cons stack-allocate-result) ((&rest args) node dx)
+(defoptimizer (cons stack-allocate-result) ((&rest args) node dx)
     (declare (ignore args dx))
     t)
-  (defoptimizer (%make-complex stack-allocate-result) ((&rest args) node dx)
+(defoptimizer (%make-complex stack-allocate-result) ((&rest args) node dx)
     (declare (ignore args dx))
-    t))
+    t)
 
 ;;; MAKE-LIST optimizations
 #+x86-64
@@ -399,36 +400,33 @@
   (defoptimizer (%make-list ltn-annotate) ((length element) call ltn-policy)
     (declare (ignore length element))
     (vectorish-ltn-annotate-helper call ltn-policy
-                                   'sb-vm::allocate-list-on-stack)))
+                                   'sb-vm::allocate-list-on-stack
+                                   'sb-vm::allocate-list-on-heap)))
 
 
 (in-package "SB-VM")
 ;;; Return a list of parameters with which to call MAKE-ARRAY-HEADER*
 ;;; given the mandatory slots for a simple array of rank 0 or > 1.
 (defun make-array-header-inits (storage n-elements dimensions)
-  (macrolet ((expand ()
-               `(list* sb-vm:simple-array-widetag
-                       ,@(mapcar (lambda (slot)
-                                   (ecase (slot-name slot)
-                                     (data           'storage)
-                                     (fill-pointer   'n-elements)
-                                     (elements       'n-elements)
-                                     (fill-pointer-p nil)
-                                     (displacement   0)
-                                     (displaced-p    nil)
-                                     (displaced-from nil)))
-                                 (butlast (primitive-object-slots
-                                           (find 'array *primitive-objects*
-                                                 :key 'primitive-object-name))))
-                       dimensions)))
-    (expand)))
+  (let ((primitive-obj (load-time-value (primitive-object 'array) t)))
+    (nconc (loop with slots = (primitive-object-slots primitive-obj)
+                 for i from 0 below (1- (length slots))
+                 collect
+                 (let ((slot (svref slots i)))
+                     (ecase (slot-name slot)
+                       (data           storage)
+                       (fill-pointer   n-elements)
+                       (elements       n-elements)
+                       (displacement   0)
+                       (displaced-p    nil)
+                       (displaced-from nil))))
+           dimensions)))
 
 ;;; This order is used by SB-C::TRANSFORM-MAKE-ARRAY-VECTOR
-(assert (equal (mapcar #'slot-name
-                       (primitive-object-slots
-                        (find 'array *primitive-objects*
-                              :key 'primitive-object-name)))
-               '(fill-pointer fill-pointer-p elements data
+;;; The slot formerly known as FILL-POINTER-P is 1 bit in the header now.
+(assert (equal (map 'list #'slot-name
+                    (primitive-object-slots (primitive-object 'array)))
+               '(fill-pointer elements data
                  displacement displaced-p displaced-from dimensions)))
 
 (defun emit-code-page-write-barrier-p (fun-name)

@@ -9,12 +9,13 @@
 
 (in-package "SB-IMPL")
 
-(defconstant sb-xc:array-rank-limit 65529
+;;; The ANSI-specified minimum is 8.
+(defconstant array-rank-limit 256
   "the exclusive upper bound on the rank of an array")
 
 ;;; - 2 to leave space for the array header
-(defconstant sb-xc:array-dimension-limit (- sb-xc:most-positive-fixnum 2)
+(defconstant array-dimension-limit (- most-positive-fixnum 2)
   "the exclusive upper bound on any given dimension of an array")
 
-(defconstant sb-xc:array-total-size-limit (- sb-xc:most-positive-fixnum 2)
+(defconstant array-total-size-limit (- most-positive-fixnum 2)
   "the exclusive upper bound on the total number of elements in an array")

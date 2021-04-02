@@ -127,7 +127,7 @@
     (flet ((read-varint ()
              (loop for shift :of-type (integer 0 28) from 0 by 7 ; position in integer
                    for octet = (fast-read-byte)
-                   for accum :of-type (mod #.sb-xc:char-code-limit)
+                   for accum :of-type (mod #.char-code-limit)
                      = (logand octet #x7F)
                      then (logior (ash (logand octet #x7F) shift) accum)
                    unless (logbitp 7 octet) return accum)))
@@ -183,7 +183,7 @@
 (define-fop 45 :not-host (fop-layout ((:operands depthoid flags length)
                                        name bitmap inherits))
   (decf depthoid) ; was bumped by 1 since non-stack args can't encode negatives
-  (find-and-init-or-check-layout name depthoid flags length bitmap inherits))
+  (sb-kernel::load-layout name depthoid inherits length bitmap flags))
 
 ;; Allocate a CLOS object. This is used when the compiler detects that
 ;; MAKE-LOAD-FORM returned a simple use of MAKE-LOAD-FORM-SAVING-SLOTS,
@@ -221,8 +221,14 @@
   (error nil :read-only t))
 (declaim (freeze-type undefined-package))
 
-;; Cold load has its own implementation of all symbol fops,
-;; but we have to execute define-fop now to assign their numbers.
+;;; Cold load has its own implementation of all symbol fops,
+;;; but we have to execute define-fop now to assign their numbers.
+;;;
+;;; Any symbols created by the loader must have their SYMBOL-HASH computed.
+;;; This is a requirement for the CASE macro to work. When code is compiled
+;;; to memory, symbols in the expansion are subject to SXHASH, so all is well.
+;;; When loaded, even uninterned symbols need a hash.
+;;; Interned symbols automatically get a precomputed hash.
 (labels #+sb-xc-host ()
         #-sb-xc-host
         ((read-symbol-name (length+flag fasl-input)
@@ -250,17 +256,17 @@
                               (undefined-package-error package)))
                  (push-fop-table (%intern name length package elt-type t)
                                  fasl-input))))
-         ;; Symbol-hash is usually computed lazily and memoized into a symbol.
-         ;; Laziness slightly improves the speed of allocation.
-         ;; But when loading fasls, the time spent in the loader totally swamps
-         ;; any time savings of not precomputing symbol-hash.
-         ;; INTERN hashes everything anyway, so let's be consistent
-         ;; and precompute the hashes of uninterned symbols too.
          (ensure-hashed (symbol)
+           ;; ENSURE-SYMBOL-HASH when vop-translated is flushable since it is
+           ;; conceptually just a slot reader, however its actual effect is to fill in
+           ;; the hash if absent, so it's not quite flushable when called expressly
+           ;; to fill in the slot. In this case we need a full call to ENSURE-SYMBOL-HASH
+           ;; to ensure the side-effect happens.
+           ;; Careful if changing this again. There'a regression test thank goodness.
+           (declare (notinline ensure-symbol-hash))
            (ensure-symbol-hash symbol)
            symbol))
 
-  #-sb-xc-host (declare (inline ensure-hashed))
   (define-fop 77 :not-host (fop-lisp-symbol-save ((:operands length+flag)))
     (aux-fop-intern length+flag *cl-package* (fasl-input)))
   (define-fop 78 :not-host (fop-keyword-symbol-save ((:operands length+flag)))
@@ -310,6 +316,10 @@
 
 (define-fop 36 (fop-integer ((:operands n-bytes)))
   (number-to-core (load-s-integer n-bytes (fasl-input-stream))))
+
+(define-fop 33 :not-host (fop-word-pointer)
+  (with-fast-read-byte ((unsigned-byte 8) (fasl-input-stream))
+    (int-sap (fast-read-u-integer #.sb-vm:n-word-bytes))))
 
 (define-fop 34 (fop-word-integer)
   (with-fast-read-byte ((unsigned-byte 8) (fasl-input-stream))
@@ -512,9 +522,9 @@
 ;;; putting the implementation and version in required fields in the
 ;;; fasl file header.)
 
-;; Cold-load calls COLD-LOAD-CODE instead
 (define-fop 16 :not-host (fop-load-code ((:operands header n-code-bytes n-fixups)))
-  (let* ((n-boxed-words (ash header -1))
+  (let* ((n-named-calls (read-unsigned-byte-32-arg (fasl-input-stream)))
+         (n-boxed-words (ash header -1))
          (n-constants (- n-boxed-words sb-vm:code-constants-offset)))
     ;; stack has (at least) N-CONSTANTS words plus debug-info
     (with-fop-stack ((stack (operand-stack)) ptr (1+ n-constants))
@@ -522,14 +532,39 @@
              (n-boxed-words (+ sb-vm:code-constants-offset n-constants))
              (code (sb-c:allocate-code-object
                     (if (oddp header) :immobile :dynamic)
+                    n-named-calls
                     (align-up n-boxed-words sb-c::code-boxed-words-align)
                     n-code-bytes)))
-        (setf (%code-debug-info code) (svref stack debug-info-index))
-        (loop for i of-type index from sb-vm:code-constants-offset
-              for j of-type index from ptr below debug-info-index
-              do (setf (code-header-ref code i) (svref stack j)))
         (with-pinned-objects (code)
+          ;; * DO * NOT * SEPARATE * THESE * STEPS *
+          ;; For a full explanation, refer to the comment above MAKE-CORE-COMPONENT
+          ;; concerning the corresponding use therein of WITH-PINNED-OBJECTS etc.
+          #-darwin-jit
           (read-n-bytes (fasl-input-stream) (code-instructions code) 0 n-code-bytes)
+          #+darwin-jit
+          (let ((buf (make-array n-code-bytes :element-type '(unsigned-byte 8))))
+            (read-n-bytes (fasl-input-stream) buf 0 n-code-bytes)
+            (with-pinned-objects (buf)
+              (sb-vm::jit-memcpy (code-instructions code) (vector-sap buf) n-code-bytes)))
+          ;; Serial# shares a word with the jump-table word count,
+          ;; so we can't assign serial# until after all raw bytes are copied in.
+          (sb-c::assign-code-serialno code)
+          (sb-thread:barrier (:write))
+          ;; Assign debug-info last. A code object that has no debug-info will never
+          ;; have its fun table accessed in conservative_root_p() or pin_object().
+          (setf (%code-debug-info code) (svref stack debug-info-index))
+          ;; Boxed constants can be assigned only after figuring out where the range
+          ;; of implicitly tagged words is, which requires knowing how many functions
+          ;; are in the code component, which requires reading the code trailer.
+          (let* ((fdefns-start (sb-impl::code-fdefns-start-index code))
+                 (fdefns-end (1- (+ fdefns-start n-named-calls)))) ; inclusive bound
+            (loop for i of-type index from sb-vm:code-constants-offset
+                  for j of-type index from ptr below debug-info-index
+                  do (let ((constant (svref stack j)))
+                       (if (<= fdefns-start i fdefns-end)
+                           (sb-c::set-code-fdefn code i constant)
+                           (setf (code-header-ref code i) constant)))))
+          ;; Now apply fixups. The fixups to perform are popped from the fasl stack.
           (sb-c::apply-fasl-fixups stack code n-fixups))
         #-sb-xc-host
         (when (typep (code-header-ref code (1- n-boxed-words))
@@ -548,6 +583,26 @@
 
 (define-fop 18 :not-host (fop-known-fun (name))
   (%coerce-name-to-fun name))
+
+;; This FOP is only encountered in cross-compiled files for cold-load.
+(define-fop 74 :not-host (fop-fset (name fn) nil)
+  ;; Ordinary, not-for-cold-load code shouldn't need to mess with this
+  ;; at all, since it's only used as part of the conspiracy between
+  ;; the cross-compiler and GENESIS to statically link FDEFINITIONs
+  ;; for cold init.
+  (warn "~@<FOP-FSET seen in ordinary load (not cold load) -- quite
+strange! ~ If you didn't do something strange to cause this, please
+report it as a ~ bug.~:@>")
+  ;; Unlike CMU CL, we don't treat this as a no-op in ordinary code.
+  ;; If the user (or, more likely, developer) is trying to reload
+  ;; compiled-for-cold-load code into a warm SBCL, we'll do a warm
+  ;; assignment. (This is partly for abstract tidiness, since the warm
+  ;; assignment is the closest analogy to what happens at cold load,
+  ;; and partly because otherwise our compiled-for-cold-load code will
+  ;; fail, since in SBCL things like compiled-for-cold-load %DEFUN
+  ;; depend more strongly than in CMU CL on FOP-FSET actually doing
+  ;; something.)
+  (setf (fdefinition name) fn))
 
 ;;; Modify a slot of the code boxed constants.
 (define-fop 19 (fop-alter-code ((:operands index) code value) nil)
@@ -614,16 +669,21 @@
                             `(define-fop ,(car spec)
                                           (,(symbolicate "FOP-LAYOUT-OF-"
                                                          (cadr spec)))
-                                          (find-layout ',(cadr spec))))
+                               ,(find-layout (cadr spec))))
                           specs))))
-  (frob (#x6c t)
-        (#x6d structure-object)
-        (#x6e condition)
-        (#x6f definition-source-location)
-        (#x70 sb-c::debug-fun)
-        (#x71 sb-c::compiled-debug-fun)
-        (#x72 sb-c::debug-info)
-        (#x73 sb-c::compiled-debug-info)
-        (#x74 sb-c::debug-source)
-        (#x75 defstruct-description)
-        (#x76 defstruct-slot-description)))
+  (frob (#x68 t)
+        (#x69 structure-object)
+        (#x6a condition)
+        (#x6b definition-source-location)
+        (#x6c sb-c::debug-info)
+        (#x6d sb-c::compiled-debug-info)
+        (#x6e sb-c::debug-source)
+        (#x6f defstruct-description)
+        (#x70 defstruct-slot-description)
+        (#x71 sb-c::debug-fun)
+        (#x72 sb-c::compiled-debug-fun)
+        (#x73 sb-c::compiled-debug-fun-optional)
+        (#x74 sb-c::compiled-debug-fun-more)
+        (#x75 sb-c::compiled-debug-fun-external)
+        (#x76 sb-c::compiled-debug-fun-toplevel)
+        (#x77 sb-c::compiled-debug-fun-cleanup)))

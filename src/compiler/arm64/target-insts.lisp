@@ -178,6 +178,13 @@
       (princ "NSP" stream)
       (princ (aref *register-names* value) stream)))
 
+(defun print-sized-reg (value stream dstate)
+  (declare (ignore dstate))
+  (destructuring-bind (size reg) value
+    (when (zerop size)
+      (princ "W" stream))
+    (princ (svref *register-names* reg) stream)))
+
 (defun print-reg-float-reg (value stream dstate)
   (let* ((inst (current-instruction dstate))
          (v (ldb (byte 1 26) inst)))
@@ -232,6 +239,47 @@
                 "8B"
                 "16B"))))
 
+(defun print-vbhs (value stream dstate)
+  (declare (ignore dstate))
+  (destructuring-bind (size offset) value
+    (format stream "~a~d"
+            (case size
+              (#b00 "B")
+              (#b01 "H")
+              (#b10 "S"))
+            offset)))
+
+(defun print-vhsd (value stream dstate)
+  (declare (ignore dstate))
+  (destructuring-bind (size offset) value
+    (format stream "~a~d"
+            (case size
+              (#b00 "H")
+              (#b01 "S")
+              (#b10 "D"))
+            offset)))
+
+(defun print-vx.t (value stream dstate)
+  (declare (ignore dstate))
+  (destructuring-bind (q size offset) value
+    (format stream "V~d.~a"
+            offset
+            (cond ((and (= size 0)
+                        (= q 0))
+                   "8B")
+                  ((and (= size 0)
+                        (= q 1))
+                   "16B")
+                  ((and (= size 1)
+                        (= q 0))
+                   "4H")
+                  ((and (= size 1)
+                        (= q 1))
+                   "8H")
+                  ((and (= size 2)
+                        (= q 1))
+                   "4S")))))
+
 (defun lowest-set-bit-index (integer-value)
   (max 0 (1- (integer-length (logand integer-value (- integer-value))))))
 
@@ -251,7 +299,7 @@
 
 (defun print-cond (value stream dstate)
   (declare (ignore dstate))
-  (princ (svref sb-vm::+condition-name-vec+ value) stream))
+  (princ (svref +condition-name-vec+ value) stream))
 
 (defun use-label (value dstate)
   (let* ((value (if (consp value)
@@ -271,16 +319,14 @@
      (note-code-constant offset dstate))
     (#.sb-vm::null-offset
      (let ((offset (+ sb-vm:nil-value offset)))
-       (maybe-note-assembler-routine offset nil dstate)
        (maybe-note-static-symbol (logior offset other-pointer-lowtag)
                                               dstate)))
     #+sb-thread
     (#.sb-vm::thread-offset
      (let* ((thread-slots
              (load-time-value
-              (primitive-object-slots
-               (find 'sb-vm::thread *primitive-objects*
-                     :key #'primitive-object-name)) t))
+              (primitive-object-slots (primitive-object 'sb-vm::thread))
+              t))
             (slot (find (ash offset (- word-shift)) thread-slots
                         :key #'slot-offset)))
        (when slot
@@ -317,6 +363,12 @@
                             value)
                         dstate))))
 
+(defun annotate-ldr-literal (value stream dstate)
+  (declare (ignore stream))
+  (let* ((addr (+ (dstate-cur-addr dstate) (* value 4))))
+    (let ((value (sap-ref-word (int-sap addr) 0)))
+      (maybe-note-assembler-routine value nil dstate))))
+
 ;;;; special magic to support decoding internal-error and related traps
 (defun snarf-error-junk (sap offset trap-number &optional length-only)
   (declare (ignore trap-number))
@@ -327,14 +379,14 @@
     (declare (type sb-sys:system-area-pointer sap)
              (type (unsigned-byte 8) length))
     (cond (length-only
-           (loop repeat length do (sb-c::sap-read-var-integerf sap index))
+           (loop repeat length do (sb-c:sap-read-var-integerf sap index))
            (values 0 (- index offset) nil nil))
           (t
            (collect ((sc+offsets)
                      (lengths))
              (loop repeat length do
                   (let ((old-index index))
-                    (sc+offsets (sb-c::sap-read-var-integerf sap index))
+                    (sc+offsets (sb-c:sap-read-var-integerf sap index))
                     (lengths (- index old-index))))
              (values error-number
                      (- index offset)

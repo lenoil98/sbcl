@@ -43,8 +43,6 @@
 
 ;;;; utilities for reading from fasl files
 
-#-sb-fluid (declaim (inline read-byte))
-
 ;;; This expands into code to read an N-byte unsigned integer using
 ;;; FAST-READ-BYTE.
 (defmacro fast-read-u-integer (n)
@@ -99,13 +97,7 @@
       `(with-fast-read-byte ((unsigned-byte 8) ,fasl-input-stream)
          (fast-read-u-integer ,n))))
 
-;; FIXME: on x86-64, these functions exceed 600, 900, and 1200 bytes of code
-;; respectively. Either don't inline them, or make a "really" fast inline case
-;; that punts if inapplicable. e.g. if the fast-read-byte buffer will not be
-;; refilled, then SAP-REF-WORD could work to read 8 bytes.
-;; But this would only be feasible on machines that are little-endian
-;; and that allow unaligned reads. (like x86)
-(declaim (inline read-byte-arg read-word-arg))
+(declaim (inline read-byte-arg))
 (defun read-byte-arg (stream)
   (declare (optimize (speed 0)))
   (read-arg 1 stream))
@@ -262,6 +254,33 @@
           (when p
             (file-position stream p)))))))
 
+;;; Return a string representing symbols in *FEATURES-POTENTIALLY-AFFECTING-FASL-FORMAT*
+;;; which are present in a particular compilation.
+(defun compute-features-affecting-fasl-format ()
+  (let ((list (sort (copy-list (intersection *features-potentially-affecting-fasl-format*
+                                             sb-xc:*features*))
+                    #'string< :key #'symbol-name)))
+    ;; Stringify the subset of *FEATURES* that affect fasl format.
+    ;; A list would be the natural representation choice for this, but a string
+    ;; is convenient for and a requirement for writing to and reading from fasls
+    ;; at this stage of the loading. WITH-STANDARD-IO-SYNTAX and WRITE-TO-STRING
+    ;; would work, but this is simple enough to do by hand.
+    (%with-output-to-string (stream)
+      (let ((delimiter #\())
+        (dolist (symbol list)
+          (write-char delimiter stream)
+          (write-string (string symbol) stream)
+          (setq delimiter #\Space)))
+      (write-char #\) stream))))
+
+#-sb-xc-host
+(eval-when (:compile-toplevel)
+  (let ((string (compute-features-affecting-fasl-format)))
+    (assert (and (> (length string) 2)
+                 (not (find #\newline string))
+                 (not (find #\# string))
+                 (not (search ".." string))))))
+
 ;;;; LOAD-AS-FASL
 ;;;;
 ;;;; Note: LOAD-AS-FASL is used not only by LOAD, but also (with
@@ -306,7 +325,12 @@
                       (result (make-string length)))
                  (read-string-as-bytes stream result)
                  (push result results)
-                 result)))
+                 result))
+             (unsuffix (s)
+               (if (and (> (length s) 4)
+                        (string= s "-WIP" :start1 (- (length s) 4)))
+                   (subseq s 0 (- (length s) 4))
+                   s)))
         ;; Read and validate implementation and version.
         (let ((implementation (string-from-stream))
               (expected-implementation +backend-fasl-file-implementation+))
@@ -322,9 +346,9 @@
                (sbcl-version (if (<= fasl-version 76)
                                  "1.0.11.18"
                                  (string-from-stream)))
-               (expected-version (sb-xc:lisp-implementation-version)))
+               (expected-version (lisp-implementation-version)))
           (push fasl-version results)
-          (unless (string= expected-version sbcl-version)
+          (unless (string= (unsuffix expected-version) (unsuffix sbcl-version))
             (restart-case
                 (error 'invalid-fasl-version
                        :stream stream
@@ -471,7 +495,6 @@
       (nuke-fop-vector (%fasl-input-stack fasl-input))))
   t)
 
-(declaim (notinline read-byte)) ; Why is it even *declaimed* inline above?
 
 ;;;; stuff for debugging/tuning by collecting statistics on FOPs (?)
 

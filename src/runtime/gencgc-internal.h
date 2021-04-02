@@ -161,9 +161,14 @@ static inline void ensure_region_closed(struct alloc_region *alloc_region,
 
 static inline void gc_set_region_empty(struct alloc_region *region)
 {
+    /* Free-pointer has to be not equal to 0 because it's undefined behavior
+     * to add any value whatsoever to the null pointer.
+     * Annoying, isn't it.  http://c-faq.com/null/machexamp.html */
+    region->free_pointer = region->end_addr = (void*)0x1000;
+    /* Start 0 is the indicator of closed-ness. */
+    region->start_addr = 0;
     /* last_page is not reset. It can be used as a hint where to resume
      * allocating after closing and re-opening the region */
-    region->start_addr = region->free_pointer = region->end_addr = 0;
 }
 
 static inline void gc_init_region(struct alloc_region *region)
@@ -200,7 +205,10 @@ find_page_index(void *addr)
 static inline boolean pinned_p(lispobj obj, page_index_t page)
 {
     extern struct hopscotch_table pinned_objects;
-    gc_dcheck(compacting_p());
+    // FIXME: this gets called if !compacting_p,
+    // but most people don't run with extra debug assertions,
+    // and if you enable them, you'll pretty quickly crash here.
+    // gc_dcheck(compacting_p());
 #if !GENCGC_IS_PRECISE
     return page_has_smallobj_pins(page)
         && hopscotch_containsp(&pinned_objects, obj);
@@ -244,10 +252,8 @@ struct fixedobj_page { // 12 bytes per page
       int packed;
       struct {
         unsigned char flags;
-        /* space per object in Lisp words. Can exceed obj_size
-           to align on a larger boundary */
-        unsigned char obj_align;
-        unsigned char obj_size; /* in Lisp words, incl. header */
+        unsigned char obj_align; // object spacing expressed in lisp words
+        unsigned char unused1;
         /* Which generations have data on this page */
         unsigned char gens_; // a bitmap
       } parts;
@@ -259,7 +265,6 @@ struct fixedobj_page { // 12 bytes per page
 };
 extern struct fixedobj_page *fixedobj_pages;
 #define fixedobj_page_obj_align(i) (fixedobj_pages[i].attr.parts.obj_align<<WORD_SHIFT)
-#define fixedobj_page_obj_size(i) fixedobj_pages[i].attr.parts.obj_size
 #endif
 
 extern page_index_t next_free_page;

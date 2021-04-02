@@ -214,8 +214,11 @@
 ;;; ignore TYPE-CHECK-ERROR because we don't want the possibility of
 ;;; error to bias the result. Notes are suppressed for T-C-E as well,
 ;;; since we don't need to worry about the efficiency of that case.
-(define-load-time-global *ignore-cost-vops* '(set type-check-error))
-(define-load-time-global *suppress-note-vops* '(type-check-error))
+(defconstant-eqx ignore-cost-vops '(set type-check-error) #'equal)
+(defconstant-eqx suppress-note-vops '(type-check-error) #'equal)
+
+#-sb-devel
+(declaim (start-block select-tn-representation))
 
 ;;; We special-case the move VOP, since using this costs for the
 ;;; normal MOVE would spuriously encourage descriptor representations.
@@ -239,7 +242,7 @@
       (let* ((vop (tn-ref-vop ref))
              (info (vop-info vop)))
         (unless (and (neq (tn-kind tn) :constant)
-                     (find (vop-info-name info) *ignore-cost-vops*))
+                     (find (vop-info-name info) ignore-cost-vops))
           (case (vop-info-name info)
             (move
              (let ((rep (tn-sc
@@ -292,7 +295,7 @@
                             t)
 
 
-  (let ((min sb-xc:most-positive-fixnum)
+  (let ((min most-positive-fixnum)
         (min-scn nil)
         (unique nil))
     (dolist (scn scs)
@@ -304,6 +307,8 @@
                (setq min-scn scn)
                (setq unique t)))))
     (values min-scn unique)))
+
+(declaim (end-block))
 
 ;;; Prepare for the possibility of a TN being allocated on the number
 ;;; stack by setting NUMBER-STACK-P in all functions that TN is
@@ -359,7 +364,7 @@
     (cond ((eq (tn-kind op-tn) :constant))
           ((policy op-node (and (<= speed inhibit-warnings)
                                 (<= space inhibit-warnings))))
-          ((member (template-name (vop-info op-vop)) *suppress-note-vops*))
+          ((member (template-name (vop-info op-vop)) suppress-note-vops))
           ((null dest-tn)
            (let* ((op-info (vop-info op-vop))
                   (op-note (or (template-note op-info)
@@ -462,10 +467,12 @@
                        (change-tn-ref-tn op temp)
                        (cond
                          ((not write-p)
-                          (emit-move (or (maybe-move-from-fixnum+-1 op-tn temp
-                                                                    op)
-                                         res)
-                                     op-tn temp))
+                          (or
+                           (coerce-from-constant op temp)
+                           (emit-move (or (maybe-move-from-fixnum+-1 op-tn temp
+                                                                     op)
+                                          res)
+                                      op-tn temp)))
                          ((and (null (tn-reads op-tn))
                                (eq (tn-kind op-tn) :normal)))
                          (t
@@ -570,8 +577,7 @@
                                             pass-tn vop))
                (after
                 (cond ((eq how :local-call)
-                       (aver (eq (vop-info-name (vop-info prev))
-                                 'allocate-frame))
+                       (aver (eq (vop-name prev) 'allocate-frame))
                        prev)
                       (prev (vop-next prev))
                       (t
@@ -587,14 +593,105 @@
     (let ((type (tn-ref-type x-tn-ref)))
       (cond ((not type)
              nil)
+            ((csubtypep type (specifier-type 'fixnum))
+             (template-or-lose 'sb-vm::move-from-word/fixnum))
             ((csubtypep type
-                        (specifier-type `(integer ,sb-xc:most-negative-fixnum
-                                                  ,(1+ sb-xc:most-positive-fixnum))))
+                        (specifier-type `(integer ,most-negative-fixnum
+                                                  ,(1+ most-positive-fixnum))))
              (template-or-lose 'sb-vm::move-from-fixnum+1))
             ((csubtypep type
-                        (specifier-type `(integer ,(1- sb-xc:most-negative-fixnum)
-                                                  ,sb-xc:most-positive-fixnum)))
+                        (specifier-type `(integer ,(1- most-negative-fixnum)
+                                                  ,most-positive-fixnum)))
              (template-or-lose 'sb-vm::move-from-fixnum-1))))))
+
+(defun coerce-from-constant (x-tn-ref y)
+  (when (and (sc-is y sb-vm::descriptor-reg sb-vm::control-stack)
+             (tn-ref-type x-tn-ref))
+    (multiple-value-bind (constantp value) (type-singleton-p (tn-ref-type x-tn-ref))
+      (when constantp
+        (change-tn-ref-tn x-tn-ref
+                          (make-constant-tn (find-constant value) t))
+        t))))
+
+(defun split-ir2-block (vop)
+  (cond ((vop-next vop)
+         (with-ir1-environment-from-node (vop-node vop)
+           (let* ((2block (vop-block vop))
+                  (succ (ir2-block-block 2block))
+                  (start (make-ctran))
+                  (block (ctran-starts-block start))
+                  (no-op-node (make-no-op))
+                  (new-2block (make-ir2-block block))
+                  (vop-next (vop-next vop)))
+             (link-node-to-previous-ctran no-op-node start)
+             (setf (block-info block) new-2block)
+             (add-to-emit-order new-2block (ir2-block-prev 2block))
+             (loop for pred-block in (block-pred succ)
+                   do
+                   (change-block-successor pred-block succ block))
+             (setf (block-last block) no-op-node)
+             (setf (ir2-block-start-vop new-2block) vop
+                   (ir2-block-last-vop new-2block) vop
+                   (ir2-block-start-vop 2block) vop-next)
+
+             (shiftf (ir2-block-%label new-2block)
+                     (ir2-block-%label 2block)
+                     (gen-label))
+             (shiftf (ir2-block-%trampoline-label new-2block)
+                     (ir2-block-%trampoline-label 2block)
+                     nil)
+             (setf (vop-block vop) new-2block
+                   (vop-next vop) nil
+                   (vop-prev vop-next) nil)
+             (link-blocks block succ)
+             2block)))
+        (t
+         (let* ((2block (vop-block vop))
+                (next (ir2-block-next 2block)))
+           (unless (ir2-block-%label next)
+             (setf (ir2-block-%label next) (gen-label)))
+           next))))
+
+;;; If a MOVE about to be coerced is going to another MOVE, the
+;;; result of which is compatible with the original TN, jump directly
+;;; after that move without performing any coercions.
+(defun jump-over-move-coercion (vop x y block)
+  (let* ((reads (tn-reads y))
+         (dest-vop (and reads
+                        (not (tn-ref-next reads))
+                        (tn-ref-vop reads)))
+         branch)
+    (when (and dest-vop
+               (vop-info-move-vop-p (vop-info dest-vop))
+               (eq (ir2-block-start-vop (vop-block dest-vop)) dest-vop)
+               (let ((last (ir2-block-last-vop block))
+                     (dest-block (vop-block dest-vop)))
+                 (or (and (eq last vop)
+                          (eq (ir2-block-next block) dest-block))
+                     (and last
+                          (eq (vop-next vop) last)
+                          (eq (vop-name last) 'branch)
+                          (eq (car (vop-codegen-info last)) (ir2-block-%label dest-block))
+                          (setf branch last)))))
+      (let ((dest (tn-ref-tn (vop-results dest-vop))))
+        (when (and (eq (tn-sc x) (tn-sc dest))
+                   (eq (find-move-vop x nil (tn-sc dest) (tn-primitive-type dest) #'sc-move-vops)
+                       (vop-info vop)))
+          (let ((new-block (split-ir2-block dest-vop))
+                (1block (ir2-block-block block)))
+            (if branch
+                (setf (vop-codegen-info branch) (list (ir2-block-%label new-block)))
+                (emit-and-insert-vop (vop-node vop)
+                                     block
+                                     (template-or-lose 'branch)
+                                     nil
+                                     nil
+                                     nil
+                                     (list (ir2-block-%label new-block))))
+            (change-tn-ref-tn (vop-results vop) dest)
+            (change-block-successor 1block (car (block-succ 1block))
+                                    (ir2-block-block new-block))
+            t))))))
 
 ;;; Scan the IR2 looking for move operations that need to be replaced
 ;;; with special-case VOPs and emitting coercion VOPs for operands of
@@ -607,8 +704,7 @@
             (vop-next vop)))
       ((null vop))
     (let ((info (vop-info vop))
-          (node (vop-node vop))
-          (block (vop-block vop)))
+          (node (vop-node vop)))
       (cond
         ((eq (vop-info-name info) 'move)
          (let* ((args (vop-args vop))
@@ -621,16 +717,18 @@
                        (eq (tn-kind y) :normal))
                   (delete-vop vop))
                  ((eq res info))
+                 ((coerce-from-constant args y))
                  (res
-
-                  (let ((res (or (maybe-move-from-fixnum+-1 x y
-                                                            args)
-                                 res)))
-                    (when (>= (vop-info-cost res)
-                              *efficiency-note-cost-threshold*)
-                      (maybe-emit-coerce-efficiency-note res args y))
-                    (emit-move-template node block res x y vop)
-                    (delete-vop vop)))
+                  (or
+                   (jump-over-move-coercion vop x y block)
+                   (let ((res (or (maybe-move-from-fixnum+-1 x y
+                                                             args)
+                                  res)))
+                     (when (>= (vop-info-cost res)
+                               *efficiency-note-cost-threshold*)
+                       (maybe-emit-coerce-efficiency-note res args y))
+                     (emit-move-template node (vop-block vop) res x y vop)
+                     (delete-vop vop))))
                  (t
                   (coerce-vop-operands vop)))))
         ((vop-info-move-args info)
@@ -641,7 +739,7 @@
 ;;; If TN is in a number stack SC, make all the right annotations.
 ;;; Note that this should be called after TN has been referenced,
 ;;; since it must iterate over the referencing environments.
-#-sb-fluid (declaim (inline note-if-number-stack))
+(declaim (inline note-if-number-stack))
 (defun note-if-number-stack (tn 2comp restricted)
   (declare (type tn tn) (type ir2-component 2comp))
   (when (if restricted
@@ -652,6 +750,59 @@
     (note-number-stack-tn (tn-reads tn))
     (note-number-stack-tn (tn-writes tn)))
   (values))
+
+;;; Arrange boxed constants so that all :NAMED-CALL constants are first,
+;;; then constant leaves, and finally LOAD-TIME-VALUE constants.
+;;; There exist a few reasons for placing all the FDEFNs first:
+;;;  * FDEFNs which are referenced for lisp call - as opposed to referenced
+;;;    in #'FUN syntax - could be stored as untagged pointers which would
+;;;    benefit the PPC64 architecture by removing a few instructions from each
+;;;    use of such fdefn by not having to subtract its lowtag prior to loading
+;;;    from both the fun and raw-fun slots. GC would need to be aware of the
+;;;    untagged pointer convention.
+;;;  * In the current approach for so-called "static" linking of immobile code,
+;;;    we change code instruction bytes so that they call into a simple-fun
+;;;    directly rather than through an fdefn, but the approach is subject to a
+;;;    data race when redefining an fdefn. It's conceivable that the race can be
+;;;    eliminated by substituting placeholders in the code headers of functions
+;;;    that had static linking performed - so that they see a reference to the
+;;;    callee rather than an fdefn - but in order for that to work, we must
+;;;    distinguish between fdefns that are needed for FDEFN-FUN
+;;;    (via IR2-CONVERT-GLOBAL-VAR) versus those which are present to satisfy
+;;;    a GC invariant and are not otherwise actually used.
+;;;  * Even without the preceding change, remove-static-links can avoid
+;;;    scanning code constants that are not FDEFNs.
+(defun sort-boxed-constants (2comp)
+  (let* ((sorted (ir2-component-constants 2comp))
+         (unsorted (subseq sorted 1))
+         (renumbering)) ; alist of (old . new) indices into constant vector
+    (setf (fill-pointer sorted) 0)
+    ;; add in fixed overhead
+    (let ((n-entries (length (ir2-component-entries 2comp))))
+      (dotimes (i (+ (* sb-vm:code-slots-per-simple-fun n-entries)
+                     sb-vm:code-constants-offset))
+        (vector-push-extend nil sorted)))
+    (flet ((scan (pass &aux (old-offset 0))
+             (dovector (constant unsorted)
+               (incf old-offset)
+               (when (eql pass (cond ((constant-p constant) 2)
+                                     ((eq (car constant) :named-call) 1)
+                                     (t 3)))
+                 (let ((new-offset (vector-push-extend constant sorted)))
+                   (push (cons old-offset new-offset) renumbering))))))
+      (scan 1)  ; first all the called fdefinitions
+      (scan 2)  ; then IR1 constants
+      (scan 3)) ; then various flavors of load-time magic
+    ;; Update the TN-OFFSET slot.
+    ;; There can be more than one TN with the same index into the constants
+    ;; because of how MAKE-LOAD-TIME-CONSTANT-TN works.
+    (do ((tn (ir2-component-constant-tns 2comp) (tn-next tn)))
+        ((null tn))
+      (let ((old-offset (tn-offset tn)))
+        (when old-offset
+          (setf (tn-offset tn)
+                (cdr (the (not null) (assoc old-offset renumbering)))))))
+    sorted))
 
 ;;; This is the entry to representation selection. First we select the
 ;;; representation for all normal TNs, setting the TN-SC. After
@@ -665,12 +816,13 @@
 (defun select-representations (component)
   (let ((costs (make-array sb-vm:sc-number-limit))
         (2comp (component-info component)))
+    (sort-boxed-constants 2comp)
     (labels ((set-sc (tn sc)
-               (cond ((not (eq (tn-kind tn) :constant))
+               (cond ((neq (tn-kind tn) :constant)
                       (setf (tn-sc tn)
                             (svref *backend-sc-numbers* sc)))
                      ;; Translate primitive type scs into constant scs
-                     ((= sc sb-vm::descriptor-reg-sc-number)
+                     ((= sc sb-vm:descriptor-reg-sc-number)
                       (setf (tn-sc tn)
                             (svref *backend-sc-numbers* sb-vm:constant-sc-number)
                             (tn-offset tn)
@@ -711,6 +863,9 @@
 
     (do-ir2-blocks (block component)
       (emit-moves-and-coercions block))
+    ;; Give the optimizers a second opportunity to alter newly inserted vops
+    ;; by looking for patterns that have a shorter expression as a single vop.
+    (run-vop-optimizers component)
 
     (macrolet ((frob (slot restricted)
                  `(do ((tn (,slot 2comp) (tn-next tn)))

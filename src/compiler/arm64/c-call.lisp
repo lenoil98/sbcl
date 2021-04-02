@@ -135,8 +135,14 @@
 (defun make-call-out-tns (type)
   (let ((arg-state (make-arg-state)))
     (collect ((arg-tns))
-      (dolist (arg-type (alien-fun-type-arg-types type))
-        (arg-tns (invoke-alien-type-method :arg-tn arg-type arg-state)))
+      (let (#+darwin (variadic (sb-alien::alien-fun-type-varargs type)))
+        (loop for i from 0
+              for arg-type in (alien-fun-type-arg-types type)
+              do
+              #+darwin
+              (when (eql i variadic)
+                (setf (arg-state-num-register-args arg-state) +max-register-args+))
+              (arg-tns (invoke-alien-type-method :arg-tn arg-type arg-state))))
       (values (make-normal-tn *fixnum-primitive-type*)
               (* (arg-state-stack-frame-size arg-state) n-word-bytes)
               (arg-tns)
@@ -156,7 +162,6 @@
   (:generator 2
     (load-inline-constant res `(:fixup ,foreign-symbol :foreign) lip)))
 
-#+linkage-table
 (define-vop (foreign-symbol-dataref-sap)
   (:translate foreign-symbol-dataref-sap)
   (:policy :fast-safe)
@@ -176,10 +181,10 @@
   (:results (results :more t))
   (:ignore args results)
   (:save-p t)
-  (:temporary (:sc any-reg :offset r8-offset
+  (:temporary (:sc any-reg :offset r9-offset
                :from (:argument 0) :to (:result 0)) cfunc)
   (:temporary (:sc control-stack :offset nfp-save-offset) nfp-save)
-  (:temporary (:sc any-reg :offset r9-offset) temp)
+  (:temporary (:sc any-reg :offset r7-offset) temp)
   (:temporary (:scs (interior-reg)) lip)
   (:vop-var vop)
   (:generator 0
@@ -404,10 +409,14 @@
       (finalize-segment segment)
       ;; Now that the segment is done, convert it to a static
       ;; vector we can point foreign code to.
-      (let* ((buffer (sb-assem::segment-buffer segment))
-             (vector (make-static-vector (length buffer)
+      (let* ((buffer (sb-assem:segment-buffer segment))
+             (vector #-darwin-jit
+                     (make-static-vector (length buffer)
                                          :element-type '(unsigned-byte 8)
-                                         :initial-contents buffer))
+                                         :initial-contents buffer)
+                     #+darwin-jit
+                     (make-static-code-vector (length buffer)
+                                              buffer))
              (sap (vector-sap vector)))
         (alien-funcall
          (extern-alien "os_flush_icache"

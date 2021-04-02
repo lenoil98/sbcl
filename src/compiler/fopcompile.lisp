@@ -193,7 +193,8 @@
                   ;; as dumpable literals.
                   (and (eq function 'sb-impl::%defun) (fopcompilable-p (fourth form)))
                   (member function '(sb-pcl::!trivial-defmethod
-                                     sb-kernel::%defstruct))
+                                     sb-kernel::%defstruct
+                                     sb-thread:make-mutex))
                   ;; allow DEF{CONSTANT,PARAMETER} only if the value form is ok
                   (and (member function '(%defconstant sb-impl::%defparameter))
                        (fopcompilable-p (third form)))
@@ -257,12 +258,22 @@
 (defun dumpable-leaflike-p (obj)
   (or (sb-xc:typep obj '(or symbol number character unboxed-array
                             debug-name-marker
+                            system-area-pointer
                             #+sb-simd-pack simd-pack
                             #+sb-simd-pack-256 simd-pack-256))
+      ;; STANDARD-OBJECT layouts use MAKE-LOAD-FORM, but all other layouts
+      ;; have the same status as symbols - composite objects but leaflike.
+      (and (typep obj 'layout) (not (layout-for-pcl-obj-p obj)))
       ;; The cross-compiler wants to dump CTYPE instances as leaves,
       ;; but CLASSOIDs are excluded since they have a MAKE-LOAD-FORM method.
       #+sb-xc-host (cl:typep obj '(and ctype (not classoid)))
-      (sb-fasl:dumpable-layout-p obj)))
+      ;; FIXME: The target compiler wants to dump NAMED-TYPE instances,
+      ;; or maybe it doesn't, but we're forgetting to OPAQUELY-QUOTE them.
+      ;; For the moment I've worked around this with a backward-compatibility
+      ;; hack in FIND-CONSTANT which causes anonymous uses of #<named-type t>
+      ;; to be dumped as *UNIVERSAL-TYPE*.
+      ;; #+sb-xc (named-type-p obj)
+      ))
 
 ;;; Check that a literal form is fopcompilable. It would not be, for example,
 ;;; when the form contains structures with funny MAKE-LOAD-FORMS.
@@ -357,19 +368,20 @@
                        (fopcompile `(symbol-global-value ',form) path for-value-p))
                       (t
                        ;; Lexical
-                       (let* ((lambda-var (cdr (assoc form (lexenv-vars *lexenv*))))
-                              (handle (when lambda-var
-                                        (lambda-var-fop-value lambda-var))))
+                       (let* ((var (cdr (assoc form (lexenv-vars *lexenv*))))
+                              (handle (and (lambda-var-p var)
+                                           (lambda-var-fop-value var))))
                          (cond (handle
-                                (setf (lambda-var-ever-used lambda-var) t)
+                                (setf (lambda-var-ever-used var) t)
                                 (when for-value-p
                                   (sb-fasl::dump-push handle fasl)))
                                (t
-                                ;; Undefined variable. Signal a warning, and
-                                ;; treat it as a special variable reference, like
-                                ;; the real compiler does -- do not elide even if
-                                ;; the value is unused.
-                                (note-undefined-reference form :variable)
+                                (unless var
+                                  ;; Undefined variable. Signal a warning, and
+                                  ;; treat it as a special variable reference, like
+                                  ;; the real compiler does -- do not elide even if
+                                  ;; the value is unused.
+                                  (note-undefined-reference form :variable))
                                 (fopcompile `(symbol-value ',form)
                                             path
                                             for-value-p))))))))))
@@ -417,7 +429,7 @@
                            (loop for (arg . next) on args
                              do (fopcompile arg path
                                             (if next nil for-value-p)))))
-                      ((setq #+sb-xc-host sb-fasl::setq-no-questions-asked)
+                      ((setq)
                        (if (and for-value-p (endp args))
                            (fopcompile nil path t)
                            (loop for (name value . next) on args by #'cddr
@@ -466,7 +478,8 @@
                                      :file-position
                                      (nth-value 1 (find-source-root tlf *source-info*))
                                      :original-source-path (source-path-original-source path)
-                                     :lexenv *lexenv*)))
+                                     :handled-conditions
+                                     (lexenv-handled-conditions *lexenv*))))
                              (note-unreferenced-vars vars *policy*)))))
                       ;; Otherwise it must be an ordinary funcall.
                       (otherwise

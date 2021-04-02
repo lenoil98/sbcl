@@ -31,9 +31,8 @@
   ;; constraint on the high end is that it must not exceed
   ;; WORD-SHIFT (defined below) due to the use of unboxed
   ;; word-aligned byte pointers as boxed values in various
-  ;; places.  FIXME: This should possibly be exposed for
-  ;; configuration via customize-target-features.
-  #+64-bit 1
+  ;; places.
+  #+64-bit (or #+ppc64 3 #-ppc64 1)
   ;; On 32-bit targets, this may be as low as 2 (for 30-bit
   ;; fixnums) and as high as 2 (for 30-bit fixnums).  The
   ;; constraint on the low end is simple overcrowding of the
@@ -62,10 +61,10 @@
 ;;; a mask to extract the type from a data block header word
 (defconstant widetag-mask (1- (ash 1 n-widetag-bits)))
 
-(defconstant sb-xc:most-positive-fixnum
+(defconstant most-positive-fixnum
     (1- (ash 1 n-positive-fixnum-bits))
   "the fixnum closest in value to positive infinity")
-(defconstant sb-xc:most-negative-fixnum
+(defconstant most-negative-fixnum
     (ash -1 n-positive-fixnum-bits)
   "the fixnum closest in value to negative infinity")
 
@@ -77,7 +76,7 @@
   ;; leaving one bit for a GC mark bit.
   (ldb (byte (- n-word-bits n-widetag-bits 1) 0) -1))
 
-(defconstant sb-xc:char-code-limit #-sb-unicode 256 #+sb-unicode #x110000
+(defconstant char-code-limit #-sb-unicode 256 #+sb-unicode #x110000
   "the upper exclusive bound on values produced by CHAR-CODE")
 
 (defconstant base-char-code-limit #-sb-unicode 256 #+sb-unicode 128)
@@ -95,13 +94,13 @@
 (defconstant sb-kernel::internal-time-bits 61)
 
 (defconstant most-positive-exactly-single-float-fixnum
-  (min (expt 2 single-float-digits) sb-xc:most-positive-fixnum))
+  (min (expt 2 single-float-digits) most-positive-fixnum))
 (defconstant most-negative-exactly-single-float-fixnum
-  (max (- (expt 2 single-float-digits)) sb-xc:most-negative-fixnum))
+  (max (- (expt 2 single-float-digits)) most-negative-fixnum))
 (defconstant most-positive-exactly-double-float-fixnum
-  (min (expt 2 double-float-digits) sb-xc:most-positive-fixnum))
+  (min (expt 2 double-float-digits) most-positive-fixnum))
 (defconstant most-negative-exactly-double-float-fixnum
-  (max (- (expt 2 double-float-digits)) sb-xc:most-negative-fixnum))
+  (max (- (expt 2 double-float-digits)) most-negative-fixnum))
 
 ;;;; Point where continuous area starting at dynamic-space-start bumps into
 ;;;; next space. Computed for genesis/constants.h, not used in Lisp.
@@ -110,7 +109,6 @@
     (let ((stop (1- (ash 1 n-word-bits)))
           (start dynamic-space-start))
       (dolist (other-start (list read-only-space-start static-space-start
-                                 #+linkage-table
                                  linkage-table-space-start))
         (declare (notinline <)) ; avoid dead code note
         (when (< start other-start)
@@ -122,45 +120,56 @@
 ;; To get a layout, you must call %INSTANCE-LAYOUT - don't assume index 0.
 (defconstant instance-data-start (+ #-compact-instance-header 1))
 
-;; The largest number that may appear in the header-data for an instance,
-;; and some other mostly-boxed objects, such as FDEFNs.
-;; This constraint exists because for objects managed by the immobile GC,
-;; their generation number is stored in the header, so we have to know
-;; how much to mask off to obtain the payload size.
-;; Objects whose payload gets capped to this limit are considered
-;; "short_boxed" objects in the sizetab[] array in 'gc-common'.
-;; Additionally there are "tiny_boxed" objects, the payload length of
-;; which can be expressed in 8 bits.
+;;; The largest number that may appear in the header-data for closures
+;;; and funcallable instances.
+;;; This constraint exists because for objects managed by the immobile GC,
+;;; their generation number is stored in the header, so we have to know
+;;; how much to mask off to obtain the payload size.
+;;; Objects whose payload gets capped to this limit are considered
+;;; "short_boxed" objects in the sizetab[] array in 'gc-common'.
+;;; Additionally there are "tiny_boxed" objects, the payload length of
+;;; which can be expressed in 8 bits.
 (defconstant short-header-max-words #x7fff)
+
+;;; Amount to righ-shift an instance header to get the length.
+;;; Similar consideration as above with regard to use of generation# byte.
+(defconstant instance-length-shift 10)
+(defconstant instance-length-mask #x3FFF)
 
 ;;; Is X a fixnum in the target Lisp?
 #+sb-xc-host
 (defun fixnump (x)
   (and (integerp x)
-       (<= sb-xc:most-negative-fixnum x sb-xc:most-positive-fixnum)))
+       (<= most-negative-fixnum x most-positive-fixnum)))
 
-;;; Helper macro for defining FIXUP-CODE-OBJECT so that its body
-;;; can be the same between the host and target.
-;;; In the target, the byte offset supplied is relative to CODE-INSTRUCTIONS.
-;;; Genesis works differently - it adjusts the offset so that it is relative
-;;; to the containing gspace since that's what bvref requires.
-(defmacro !with-bigvec-or-sap (&body body)
-  `(macrolet #-sb-xc-host ()
-             #+sb-xc-host
-             ((code-instructions (code) `(sb-fasl::descriptor-mem ,code))
-              (sap-int (sap)
-                ;; KLUDGE: SAP is a bigvec; it doesn't know its address.
-                ;; Note that this shadows the uncallable stub function for SAP-INT
-                ;; that placates the host when compiling 'compiler/*/move.lisp'.
-                (declare (ignore sap))
-                `(locally
-                     (declare (notinline sb-fasl::descriptor-gspace)) ; fwd ref
-                   (sb-fasl::gspace-byte-address
-                    (sb-fasl::descriptor-gspace code)))) ; use CODE, not SAP
-              (sap-ref-8 (sap offset) `(sb-fasl::bvref-8 ,sap ,offset))
-              (sap-ref-32 (sap offset) `(sb-fasl::bvref-32 ,sap ,offset))
-              (sap-ref-word (sap offset) `(sb-fasl::bvref-word ,sap ,offset)))
-     ,@body))
+;;; Helper macro for defining FIXUP-CODE-OBJECT with emulation of SAP
+;;; accessors so that the host and target can use the same fixup logic.
+#+(or x86 x86-64)
+(defmacro with-code-instructions ((sap-var code-var) &body body)
+  #+sb-xc-host
+  `(macrolet ((self-referential-code-fixup-p (value self)
+                `(let* ((base (sb-fasl::descriptor-base-address ,self))
+                        (limit (+ base (1- (code-object-size ,self)))))
+                   (<= base ,value limit)))
+              (containing-memory-space (code)
+                `(sb-fasl::descriptor-gspace-name ,code)))
+     (let ((,sap-var (code-instructions ,code-var)))
+       ,@body))
+  #-sb-xc-host
+  `(macrolet ((self-referential-code-fixup-p (value self)
+                ;; Using SAPs keeps all the arithmetic machine-word-sized.
+                ;; Otherwise it would potentially involve bignums on 32-bit
+                ;; if code starts at #x20000000 and up.
+                `(let* ((base (sap+ (int-sap (get-lisp-obj-address ,self))
+                                    (- sb-vm:lowtag-mask)))
+                        (limit (sap+ base (1- (code-object-size ,self))))
+                        (value-sap (int-sap ,value)))
+                   (and (sap>= value-sap base) (sap<= value-sap limit))))
+              (containing-memory-space (code)
+                (declare (ignore code))
+                :dynamic))
+    (let ((,sap-var (code-instructions ,code-var)))
+      ,@body)))
 
 #+sb-safepoint
 ;;; The offset from the fault address reported to the runtime to the
@@ -168,3 +177,30 @@
 (defconstant gc-safepoint-trap-offset n-word-bytes)
 
 #+sb-xc-host (deftype sb-xc:fixnum () `(signed-byte ,n-fixnum-bits))
+
+#-darwin-jit
+(progn
+  (declaim (inline (setf sap-ref-word-jit)
+                   (setf signed-sap-ref-32-jit)
+                   signed-sap-ref-32-jit
+                   (setf sap-ref-32-jit)
+                   sap-ref-32-jit
+                   (setf sap-ref-8-jit)))
+  (defun (setf sap-ref-word-jit) (value sap offset)
+    (setf (sap-ref-word sap offset) value))
+
+  (defun (setf signed-sap-ref-32-jit) (value sap offset)
+    (setf (signed-sap-ref-32 sap offset) value))
+
+  (defun signed-sap-ref-32-jit (sap offset)
+    (signed-sap-ref-32 sap offset))
+
+  (defun (setf sap-ref-32-jit) (value sap offset)
+    (setf (sap-ref-32 sap offset) value))
+
+  (defun sap-ref-32-jit (sap offset)
+    (sap-ref-32 sap offset))
+
+  #-sb-xc-host
+  (defun (setf sap-ref-8-jit) (value sap offset)
+    (setf (sap-ref-8 sap offset) value)))

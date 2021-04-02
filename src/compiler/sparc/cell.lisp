@@ -89,13 +89,15 @@
   (:args (symbol :scs (descriptor-reg)))
   (:results (res :scs (any-reg)))
   (:result-types positive-fixnum)
+  (:args-var args)
   (:generator 2
     ;; The symbol-hash slot of NIL holds NIL because it is also the
     ;; cdr slot, so we have to strip off the two low bits to make sure
     ;; it is a fixnum.  The lowtag selection magic that is required to
     ;; ensure this is explained in the comment in objdef.lisp
     (loadw res symbol symbol-hash-slot other-pointer-lowtag)
-    (inst andn res res fixnum-tag-mask)))
+    (unless (not-nil-tn-ref-p args)
+      (inst andn res res fixnum-tag-mask))))
 
 ;;; On unithreaded builds these are just copies of the non-global versions.
 (define-vop (%set-symbol-global-value set))
@@ -261,16 +263,15 @@
 
 ;;;; instance hackery:
 
-(define-vop (instance-length)
+(define-vop ()
   (:policy :fast-safe)
   (:translate %instance-length)
   (:args (struct :scs (descriptor-reg)))
-  (:temporary (:scs (non-descriptor-reg)) temp)
   (:results (res :scs (unsigned-reg)))
   (:result-types positive-fixnum)
   (:generator 4
-    (loadw temp struct 0 instance-pointer-lowtag)
-    (inst srl res temp n-widetag-bits)))
+    (loadw res struct 0 instance-pointer-lowtag)
+    (inst srl res res instance-length-shift)))
 
 (define-vop (instance-index-ref word-index-ref)
   (:policy :fast-safe)
@@ -300,35 +301,39 @@
 
 ;;;; raw instance slot accessors
 
-(define-vop (raw-instance-ref/word)
-  (:translate %raw-instance-ref/word)
-  (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg))
-         (index :scs (any-reg)))
-  (:arg-types * positive-fixnum)
-  (:results (value :scs (unsigned-reg)))
-  (:temporary (:scs (non-descriptor-reg)) offset)
-  (:result-types unsigned-num)
-  (:generator 5
-    (inst add offset index (- (ash instance-slots-offset word-shift)
-                              instance-pointer-lowtag))
-    (inst ld value object offset)))
+(macrolet ((def (signedp sc result-type)
+             `(progn
+               (define-vop ()
+                 (:translate ,(symbolicate "%RAW-INSTANCE-REF/" signedp "WORD"))
+                 (:policy :fast-safe)
+                 (:args (object :scs (descriptor-reg))
+                        (index :scs (any-reg)))
+                 (:arg-types * positive-fixnum)
+                 (:results (value :scs (,sc)))
+                 (:temporary (:scs (non-descriptor-reg)) offset)
+                 (:result-types ,result-type)
+                 (:generator 5
+                   (inst add offset index (- (ash instance-slots-offset word-shift)
+                                             instance-pointer-lowtag))
+                   (inst ld value object offset)))
 
-(define-vop (raw-instance-set/word)
-  (:translate %raw-instance-set/word)
-  (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg))
-         (index :scs (any-reg))
-         (value :scs (unsigned-reg)))
-  (:arg-types * positive-fixnum unsigned-num)
-  (:results (result :scs (unsigned-reg)))
-  (:temporary (:scs (non-descriptor-reg)) offset)
-  (:result-types unsigned-num)
-  (:generator 5
-    (inst add offset index (- (ash instance-slots-offset word-shift)
-                              instance-pointer-lowtag))
-    (inst st value object offset)
-    (move result value)))
+               (define-vop ()
+                 (:translate ,(symbolicate "%RAW-INSTANCE-SET/" signedp "WORD"))
+                 (:policy :fast-safe)
+                 (:args (object :scs (descriptor-reg))
+                        (index :scs (any-reg))
+                        (value :scs (,sc)))
+                 (:arg-types * positive-fixnum ,result-type)
+                 (:results (result :scs (,sc)))
+                 (:temporary (:scs (non-descriptor-reg)) offset)
+                 (:result-types ,result-type)
+                 (:generator 5
+                   (inst add offset index (- (ash instance-slots-offset word-shift)
+                                             instance-pointer-lowtag))
+                   (inst st value object offset)
+                   (move result value))))))
+  (def "" unsigned-reg unsigned-num)
+  (def "SIGNED-" signed-reg signed-num))
 
 (define-vop (raw-instance-ref/single)
   (:translate %raw-instance-ref/single)

@@ -76,7 +76,7 @@
             (:little-endian
                (ash (ldb (byte (- n-word-bits count) 0) number) count)))))))
 
-#-sb-fluid (declaim (inline start-mask end-mask))
+(declaim (inline start-mask end-mask))
 
 ;;; Produce a mask that contains 1's for the COUNT "start" bits and
 ;;; 0's for the remaining "end" bits. Only the lower 5 bits of COUNT
@@ -94,7 +94,7 @@
   (declare (fixnum count))
   (shift-towards-end most-positive-word (- count)))
 
-#-sb-fluid (declaim (inline word-sap-ref %set-word-sap-ref))
+(declaim (inline word-sap-ref %set-word-sap-ref))
 (defun word-sap-ref (sap offset)
   (declare (type system-area-pointer sap)
            (type index offset)
@@ -138,15 +138,7 @@
                  (values system-area-pointer index))
         (let ((address (sap-int sap))
               (word-mask (1- (ash 1 word-shift))))
-          (values (int-sap #-alpha (word-logical-andc2 address word-mask)
-                           ;; KLUDGE: WORD-LOGICAL-ANDC2 is defined in
-                           ;; terms of n-word-bits.  On all systems
-                           ;; where n-word-bits is not equal to
-                           ;; n-machine-word-bits we have to do this
-                           ;; another way.  At this time, these
-                           ;; systems are alphas, though there was
-                           ;; some talk about an x86-64 build option.
-                           #+alpha (ash (ash address (- word-shift)) word-shift))
+          (values (int-sap (word-logical-andc2 address word-mask))
                   (+ ,(ecase bitsize
                        ((1 2 4) `(* (logand address word-mask)
                                     (/ n-byte-bits ,bitsize)))
@@ -160,11 +152,7 @@
 (defmacro !define-byte-bashers (bitsize)
   (let* ((bytes-per-word (/ n-word-bits bitsize))
          (byte-offset `(integer 0 (,bytes-per-word)))
-         (byte-count `(integer 1 (,bytes-per-word)))
-         (max-bytes sb-xc:most-positive-fixnum)
-         (offset `(integer 0 ,max-bytes))
-         (max-word-offset (ceiling max-bytes bytes-per-word))
-         (word-offset `(integer 0 ,max-word-offset))
+         (word-offset `(integer 0 ,(ceiling array-dimension-limit bytes-per-word)))
          (fix-sap-and-offset-name (intern (format nil "FIX-SAP-AND-OFFSET-UB~D" bitsize)))
          (constant-bash-name (intern (format nil "CONSTANT-UB~D-BASH" bitsize) (find-package "SB-KERNEL")))
          (array-fill-name (intern (format nil "UB~D-BASH-FILL" bitsize) (find-package "SB-KERNEL")))
@@ -196,16 +184,15 @@
             (if (zerop n-words)
                 ,(unless (= bytes-per-word 1)
                   `(unless (zerop length)
-                    (locally (declare (type ,byte-count length))
-                      (funcall dst-set-fn dst dst-word-offset
-                               (if (= length ,bytes-per-word)
-                                   value
-                                   (let ((mask (shift-towards-end
-                                                (start-mask (* length ,bitsize))
-                                                (* dst-byte-offset ,bitsize))))
-                                     (word-logical-or (word-logical-and value mask)
-                                                      (word-logical-andc2 (funcall dst-ref-fn dst dst-word-offset)
-                                                                          mask))))))))
+                     (funcall dst-set-fn dst dst-word-offset
+                              (if (>= length ,bytes-per-word)
+                                  value
+                                  (let ((mask (shift-towards-end
+                                               (start-mask (* length ,bitsize))
+                                               (* dst-byte-offset ,bitsize))))
+                                    (word-logical-or (word-logical-and value mask)
+                                                     (word-logical-andc2 (funcall dst-ref-fn dst dst-word-offset)
+                                                                         mask)))))))
                 (let ((interior (floor (- length final-bytes) ,bytes-per-word)))
                   ,@(unless (= bytes-per-word 1)
                      `((unless (zerop dst-byte-offset)
@@ -235,18 +222,19 @@
         (values))
 
       ;; common uses for constant-byte-bashing
-      (defknown ,array-fill-name (word simple-unboxed-array ,offset ,offset)
+      (defknown ,array-fill-name (word simple-unboxed-array index index)
           simple-unboxed-array
           ()
-        :result-arg 1)
+        :result-arg 1
+        :derive-type (sb-c::result-type-nth-arg 1))
       (defun ,array-fill-name (value dst dst-offset length)
-        (declare (type word value) (type ,offset dst-offset length))
+        (declare (type word value) (type index dst-offset length))
         (declare (optimize (speed 3) (safety 1)))
         (,constant-bash-name dst dst-offset length value
                              #'%vector-raw-bits #'%set-vector-raw-bits)
         dst)
       (defun ,system-area-fill-name (value dst dst-offset length)
-        (declare (type word value) (type ,offset dst-offset length))
+        (declare (type word value) (type index dst-offset length))
         (declare (optimize (speed 3) (safety 1)))
         (multiple-value-bind (dst dst-offset) (,fix-sap-and-offset-name dst dst-offset)
           (,constant-bash-name dst dst-offset length value
@@ -275,7 +263,7 @@
                     ((zerop length)
                      ;; We're not writing anything.  This is really easy.
                      )
-                    ((= length ,bytes-per-word)
+                    ((>= length ,bytes-per-word)
                      ;; DST-BYTE-OFFSET must be equal to zero, or we would be
                      ;; writing multiple words.  If SRC-BYTE-OFFSET is also zero,
                      ;; the we just transfer the single word.  Otherwise we have
@@ -295,45 +283,44 @@
                        `((t
                           ;; We are only writing some portion of the destination word.
                           ;; We still don't know whether we need one or two source words.
-                          (locally (declare (type ,byte-count length))
-                            (let ((mask (shift-towards-end (start-mask (* length ,bitsize))
-                                                           (* dst-byte-offset ,bitsize)))
-                                  (orig (funcall dst-ref-fn dst dst-word-offset))
-                                  (value (if (> src-byte-offset dst-byte-offset)
-                                             ;; The source starts further
-                                             ;; into the word than does the
-                                             ;; destination, so the source
-                                             ;; could extend into the next
-                                             ;; word.  If it does, we have
-                                             ;; to merge the two words, and
-                                             ;; it not, we can just shift
-                                             ;; the first word.
-                                             (let ((src-byte-shift (- src-byte-offset
-                                                                      dst-byte-offset)))
-                                               (if (> (+ src-byte-offset length) ,bytes-per-word)
-                                                   (word-logical-or
-                                                    (shift-towards-start
-                                                     (funcall src-ref-fn src src-word-offset)
-                                                     (* src-byte-shift ,bitsize))
-                                                    (shift-towards-end
-                                                     (funcall src-ref-fn src (1+ src-word-offset))
-                                                     (* (- src-byte-shift) ,bitsize)))
-                                                   (shift-towards-start (funcall src-ref-fn src src-word-offset)
-                                                                        (* src-byte-shift ,bitsize))))
-                                             ;; The destination starts further
-                                             ;; into the word than does the
-                                             ;; source, so we know the source
-                                             ;; cannot extend into a second
-                                             ;; word (or else the destination
-                                             ;; would too, and we wouldn't be
-                                             ;; in this branch).
-                                             (shift-towards-end
-                                              (funcall src-ref-fn src src-word-offset)
-                                              (* (- dst-byte-offset src-byte-offset) ,bitsize)))))
-                              (declare (type word mask orig value))
-                              (funcall dst-set-fn dst dst-word-offset
-                                       (word-logical-or (word-logical-and value mask)
-                                                        (word-logical-andc2 orig mask))))))))))
+                          (let ((mask (shift-towards-end (start-mask (* length ,bitsize))
+                                                         (* dst-byte-offset ,bitsize)))
+                                (orig (funcall dst-ref-fn dst dst-word-offset))
+                                (value (if (> src-byte-offset dst-byte-offset)
+                                           ;; The source starts further
+                                           ;; into the word than does the
+                                           ;; destination, so the source
+                                           ;; could extend into the next
+                                           ;; word.  If it does, we have
+                                           ;; to merge the two words, and
+                                           ;; it not, we can just shift
+                                           ;; the first word.
+                                           (let ((src-byte-shift (- src-byte-offset
+                                                                    dst-byte-offset)))
+                                             (if (> (+ src-byte-offset length) ,bytes-per-word)
+                                                 (word-logical-or
+                                                  (shift-towards-start
+                                                   (funcall src-ref-fn src src-word-offset)
+                                                   (* src-byte-shift ,bitsize))
+                                                  (shift-towards-end
+                                                   (funcall src-ref-fn src (1+ src-word-offset))
+                                                   (* (- src-byte-shift) ,bitsize)))
+                                                 (shift-towards-start (funcall src-ref-fn src src-word-offset)
+                                                                      (* src-byte-shift ,bitsize))))
+                                           ;; The destination starts further
+                                           ;; into the word than does the
+                                           ;; source, so we know the source
+                                           ;; cannot extend into a second
+                                           ;; word (or else the destination
+                                           ;; would too, and we wouldn't be
+                                           ;; in this branch).
+                                           (shift-towards-end
+                                            (funcall src-ref-fn src src-word-offset)
+                                            (* (- dst-byte-offset src-byte-offset) ,bitsize)))))
+                            (declare (type word mask orig value))
+                            (funcall dst-set-fn dst dst-word-offset
+                                     (word-logical-or (word-logical-and value mask)
+                                                      (word-logical-andc2 orig mask)))))))))
                  ((= src-byte-offset dst-byte-offset)
                   ;; The source and destination are aligned, so shifting
                   ;; is unnecessary.  But we have to pick the direction
@@ -538,7 +525,7 @@
 
          ;; common uses for unary-byte-bashing
          (defun ,array-copy-name (src src-offset dst dst-offset length)
-           (declare (type ,offset src-offset dst-offset length))
+           (declare (type index src-offset dst-offset length))
            (locally (declare (optimize (speed 3) (safety 1)))
              (,unary-bash-name src src-offset dst dst-offset length
                                #'%vector-raw-bits
@@ -546,7 +533,7 @@
                                #'%vector-raw-bits)))
 
          (defun ,system-area-copy-name (src src-offset dst dst-offset length)
-           (declare (type ,offset src-offset dst-offset length))
+           (declare (type index src-offset dst-offset length))
            (locally (declare (optimize (speed 3) (safety 1)))
              (multiple-value-bind (src src-offset) (,fix-sap-and-offset-name src src-offset)
                (declare (type system-area-pointer src))
@@ -557,7 +544,7 @@
                                    #'word-sap-ref)))))
 
          (defun ,array-copy-to-system-area-name (src src-offset dst dst-offset length)
-           (declare (type ,offset src-offset dst-offset length))
+           (declare (type index src-offset dst-offset length))
            (locally (declare (optimize (speed 3) (safety 1)))
              (multiple-value-bind (dst dst-offset) (,fix-sap-and-offset-name  dst dst-offset)
                (,unary-bash-name src src-offset dst dst-offset length
@@ -565,7 +552,7 @@
                                  #'%vector-raw-bits))))
 
          (defun ,system-area-copy-to-array-name (src src-offset dst dst-offset length)
-           (declare (type ,offset src-offset dst-offset length))
+           (declare (type index src-offset dst-offset length))
            (locally (declare (optimize (speed 3) (safety 1)))
              (multiple-value-bind (src src-offset) (,fix-sap-and-offset-name src src-offset)
                (,unary-bash-name src src-offset dst dst-offset length
@@ -586,6 +573,89 @@
         ;; FIXERS must come first so their inline expansions are available
         ;; for the bashers.
         finally (return `(progn ,@fixers ,@bashers)))
+
+(defmacro !define-constant-byte-bashers (bitsize type value-transformer &optional (name type))
+  (let ((constant-bash-name (intern (format nil "CONSTANT-UB~D-BASH" bitsize) (find-package "SB-KERNEL")))
+        (array-fill-name (intern (format nil "UB~D-BASH-FILL-WITH-~A" bitsize name) (find-package "SB-KERNEL"))))
+    `(progn
+       (defknown ,array-fill-name (,type simple-unboxed-array index index)
+           simple-unboxed-array
+           ()
+         :result-arg 1
+         :derive-type (sb-c::result-type-nth-arg 1))
+       (defun ,array-fill-name (value dst dst-offset length)
+         (declare (type ,type value) (type index dst-offset length))
+         (declare (optimize (speed 3) (safety 1)))
+         (,constant-bash-name dst dst-offset length (,value-transformer value)
+                              #'%vector-raw-bits #'%set-vector-raw-bits)
+         dst))))
+
+(macrolet ((def ()
+             `(progn
+                ,@(loop for n-bits = 1 then (* n-bits 2)
+                        until (= n-bits n-word-bits)
+                        collect
+                        `(!define-constant-byte-bashers ,n-bits
+                             (unsigned-byte ,n-bits)
+                             (lambda (value)
+                               ,@(loop for i = n-bits then (* 2 i)
+                                       until (= i sb-vm:n-word-bits)
+                                       collect
+                                       `(setf value (dpb value (byte ,i ,i) value))))
+                             ,(format nil "UB~A" n-bits))
+                        collect
+                        `(!define-constant-byte-bashers ,n-bits
+                             (signed-byte ,n-bits)
+                             (lambda (value)
+                               (let ((value (ldb (byte ,n-bits 0) value)))
+                                 ,@(loop for i = n-bits then (* 2 i)
+                                         until (= i sb-vm:n-word-bits)
+                                         collect
+                                         `(setf value (dpb value (byte ,i ,i) value)))))
+                             ,(format nil "SB~A" n-bits)))
+                (!define-constant-byte-bashers ,n-word-bits
+                    (signed-byte ,n-word-bits)
+                    (lambda (value)
+                      (ldb (byte ,n-word-bits 0) value))
+                    ,(format nil "SB~A" n-word-bits)))))
+  (def))
+
+(!define-constant-byte-bashers #.n-word-bits
+    fixnum
+    (lambda (value)
+      (ldb (byte #.n-word-bits 0) (ash value n-fixnum-tag-bits))))
+
+(!define-constant-byte-bashers 32
+    single-float
+    (lambda (value)
+      (let ((bits (ldb (byte 32 0) (single-float-bits value))))
+        #+64-bit
+        (dpb bits (byte 32 32) bits)
+        #-64-bit
+        bits)))
+
+#+64-bit
+(!define-constant-byte-bashers 64
+    double-float
+    (lambda (value)
+      (ldb (byte 64 0) (double-float-bits value))))
+
+#+64-bit
+(!define-constant-byte-bashers 64
+    (complex single-float)
+    (lambda (item)
+      #+big-endian
+      (logior (ash (ldb (byte 32 0)
+                        (single-float-bits (realpart item))) 32)
+              (ldb (byte 32 0)
+                   (single-float-bits (imagpart item))))
+      #+little-endian
+      (logior (ash (ldb (byte 32 0)
+                        (single-float-bits (imagpart item))) 32)
+              (ldb (byte 32 0)
+                   (single-float-bits (realpart item)))))
+    complex-single-float)
+
 
 ;;;; Bashing-Style search for bits
 ;;;;

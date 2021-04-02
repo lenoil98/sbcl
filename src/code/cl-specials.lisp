@@ -89,7 +89,7 @@
                          cl:*print-readably* cl:*read-eval*
                          cl:*read-suppress*))
 
-(declaim (type sb-pretty::pprint-dispatch-table cl:*print-pprint-dispatch*))
+(declaim (type sb-pretty:pprint-dispatch-table cl:*print-pprint-dispatch*))
 
 (declaim (type readtable cl:*readtable*))
 
@@ -121,7 +121,7 @@
                        cl:*query-io*
                        cl:*terminal-io*))
 
-(declaim (type (or function symbol) cl:*debugger-hook* cl:*macroexpand-hook*))
+(declaim (type sb-kernel:function-designator cl:*debugger-hook* cl:*macroexpand-hook*))
 
 (declaim (type unsigned-byte cl:*gensym-counter*))
 
@@ -140,6 +140,14 @@
                        cl:*load-truename*
                        cl:*compile-file-pathname*
                        cl:*compile-file-truename*))
+
+;;; Some functions for which we should *never* (or almost never) bind eagerly
+;;; to the functional definition.
+;;; IR2-CONVERT-GLOBAL-VAR won't use a :KNOWN-FUN constant-tn, but will instead
+;;; dereference the fdefinition like for most function calls.
+;;; They aren't actually "inlined", but they were bypassing the fdefinition in
+;;; situations involving (APPLY ...) which rendered encapsulation impossible.
+(declaim (notinline open compile-file load compile))
 
 ;;;; DEFGLOBAL and DEFINE-LOAD-TIME-GLOBAL
 ;;;; These have alternate definitions (in cross-misc) which rely on

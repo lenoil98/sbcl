@@ -19,27 +19,19 @@
 #include "immobile-space.h"
 #include "code.h"
 
-// Gencgc distinguishes between "quick" and "ordinary" requests.
-// Even on cheneygc we need this flag, but it's actually just ignored.
-#define ALLOC_QUICK 1
-
-#define CUSTOM_GC_SCAVENGE_FLAG 0x800000
-
 #ifdef LISP_FEATURE_GENCGC
 #include "gencgc-alloc-region.h"
-void *
-gc_alloc_with_region(struct alloc_region *my_region, sword_t nbytes,
-                     int page_type_flag, int quick_p);
 static inline void *
-gc_general_alloc(sword_t nbytes, int page_type_flag, int quick_p)
+gc_general_alloc(sword_t nbytes, int page_type_flag)
 {
+    void *gc_alloc_with_region(struct alloc_region*,sword_t,int);
     if (1 <= page_type_flag && page_type_flag <= 3)
         return gc_alloc_with_region(&gc_alloc_region[page_type_flag-1],
-                                    nbytes, page_type_flag, quick_p);
+                                    nbytes, page_type_flag);
     lose("bad page type flag: %d", page_type_flag);
 }
 #else
-extern void *gc_general_alloc(sword_t nbytes,int page_type_flag,int quick_p);
+extern void *gc_general_alloc(sword_t nbytes,int page_type_flag);
 #endif
 
 #define CHECK_COPY_PRECONDITIONS(object, nwords) \
@@ -54,14 +46,12 @@ extern void *gc_general_alloc(sword_t nbytes,int page_type_flag,int quick_p);
 #define note_transported_object(old, new) /* do nothing */
 
 static inline lispobj
-gc_general_copy_object(lispobj object, long nwords, int page_type_flag)
+gc_general_copy_object(lispobj object, size_t nwords, int page_type_flag)
 {
-    lispobj *new;
-
     CHECK_COPY_PRECONDITIONS(object, nwords);
 
     /* Allocate space. */
-    new = gc_general_alloc(nwords*N_WORD_BYTES, page_type_flag, ALLOC_QUICK);
+    lispobj *new = gc_general_alloc(nwords*N_WORD_BYTES, page_type_flag);
 
     /* Copy the object. */
     memcpy(new,native_pointer(object),nwords*N_WORD_BYTES);
@@ -71,7 +61,20 @@ gc_general_copy_object(lispobj object, long nwords, int page_type_flag)
     return make_lispobj(new, lowtag_of(object));
 }
 
-extern sword_t (*scavtab[256])(lispobj *where, lispobj object);
+// Like above but copy potentially fewer words than are allocated.
+// ('old_nwords' can be, but does not have to be, smaller than 'nwords')
+static inline lispobj
+gc_copy_object_resizing(lispobj object, long nwords, int page_type_flag,
+                        int old_nwords)
+{
+    CHECK_COPY_PRECONDITIONS(object, nwords);
+    lispobj *new = gc_general_alloc(nwords*N_WORD_BYTES, page_type_flag);
+    memcpy(new, native_pointer(object), old_nwords*N_WORD_BYTES);
+    note_transported_object(object, new);
+    return make_lispobj(new, lowtag_of(object));
+}
+
+extern sword_t (*const scavtab[256])(lispobj *where, lispobj object);
 extern struct cons *weak_vectors; /* in gc-common.c */
 extern struct hash_table *weak_hash_tables; /* in gc-common.c */
 
@@ -94,7 +97,7 @@ extern boolean scan_weak_hashtable(struct hash_table *hash_table,
                                    void (*)(lispobj*));
 extern int (*weak_ht_alivep_funs[4])(lispobj,lispobj);
 extern void gc_scav_pair(lispobj where[2]);
-extern void weakobj_init();
+extern void gc_common_init();
 extern boolean test_weak_triggers(int (*)(lispobj), void (*)(lispobj));
 
 lispobj  copy_unboxed_object(lispobj object, sword_t nwords);
@@ -103,7 +106,6 @@ lispobj  copy_large_object(lispobj object, sword_t nwords, int page_type_flag);
 
 lispobj *search_read_only_space(void *pointer);
 lispobj *search_static_space(void *pointer);
-lispobj *search_immobile_space(void *pointer);
 lispobj *search_dynamic_space(void *pointer);
 
 extern int properly_tagged_p_internal(lispobj pointer, lispobj *start_addr);
@@ -140,7 +142,6 @@ static inline boolean filler_obj_p(lispobj __attribute__((unused)) *obj) { retur
 extern void enliven_immobile_obj(lispobj*,int);
 
 #define IMMOBILE_OBJ_VISITED_FLAG    0x10
-#define IMMOBILE_OBJ_GENERATION_MASK 0x0f // mask off the VISITED flag
 
 // Immobile object header word:
 //                 generation byte --|    |-- widetag
@@ -159,40 +160,37 @@ extern void enliven_immobile_obj(lispobj*,int);
 // Shifting a 1 bit left by the contents of the generation byte
 // must not overflow a register.
 
-// Note: this does not work on a SIMPLE-FUN
-// because a simple-fun header does not contain a generation.
-#define __immobile_obj_generation(x) (__immobile_obj_gen_bits(x) & IMMOBILE_OBJ_GENERATION_MASK)
+// Mask off the VISITED flag to get the generation number
+#define immobile_obj_generation(x) (immobile_obj_gen_bits(x) & 0xf)
 
 #ifdef LISP_FEATURE_LITTLE_ENDIAN
+// Return the generation bits which means the generation number
+// in the 4 low bits (there's 1 excess bit) and the VISITED flag.
 static inline int immobile_obj_gen_bits(lispobj* obj) // native pointer
 {
+    // When debugging, assert that we're called only on a headered object
+    // whose header contains a generation byte.
+    gc_dcheck(!embedded_obj_p(widetag_of(obj)));
     char gen;
     switch (widetag_of(obj)) {
     default:
         gen = ((generation_index_t*)obj)[3]; break;
-    case SIMPLE_FUN_WIDETAG:
-        gen = ((generation_index_t*)fun_code_header(obj))[3]; break;
     case FDEFN_WIDETAG:
         gen = ((generation_index_t*)obj)[1]; break;
     }
     return gen & 0x1F;
 }
-// Slightly faster variant when we know that the object can't be a simple-fun,
-// such as when walking the immobile space.
-static inline int __immobile_obj_gen_bits(lispobj* obj) // native pointer
-{
-    int byte = widetag_of(obj) == FDEFN_WIDETAG ? 1 : 3;
-    return ((generation_index_t*)obj)[byte] & 0x1F;
-}
 // Turn a grey node black.
 static inline void set_visited(lispobj* obj)
 {
+    gc_dcheck(widetag_of(obj) != SIMPLE_FUN_WIDETAG);
+    gc_dcheck(immobile_obj_gen_bits(obj) == new_space);
     int byte = widetag_of(obj) == FDEFN_WIDETAG ? 1 : 3;
-    gc_dcheck(__immobile_obj_gen_bits(obj) == new_space);
     ((generation_index_t*)obj)[byte] |= IMMOBILE_OBJ_VISITED_FLAG;
 }
 static inline void assign_generation(lispobj* obj, generation_index_t gen)
 {
+    gc_dcheck(widetag_of(obj) != SIMPLE_FUN_WIDETAG);
     int byte = widetag_of(obj) == FDEFN_WIDETAG ? 1 : 3;
     generation_index_t* ptr = (generation_index_t*)obj + byte;
     // Clear the VISITED flag, assign a new generation, preserving the three
@@ -221,7 +219,7 @@ static inline boolean weak_pointer_breakable_p(struct weak_pointer *wp)
     return is_lisp_pointer(pointee) && (from_space_p(pointee)
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
          || (immobile_space_p(pointee) &&
-             immobile_obj_gen_bits(native_pointer(pointee)) == from_space)
+             immobile_obj_gen_bits(base_pointer(pointee)) == from_space)
 #endif
             );
 }
@@ -236,23 +234,54 @@ static inline void add_to_weak_pointer_chain(struct weak_pointer *wp) {
      * In cheneygc, chaining is performed in 'trans_weak_pointer'
      * which works just as well, since an object is transported
      * at most once per GC cycle */
-    wp->next = (struct weak_pointer *)LOW_WORD(weak_pointer_chain);
+    wp->next = weak_pointer_chain;
     weak_pointer_chain = wp;
 }
 
-/// Same as Lisp LOGBITP, except no negative bignums allowed.
-static inline boolean layout_bitmap_logbitp(int index, lispobj bitmap)
+#include "genesis/layout.h"
+struct bitmap { sword_t *bits; unsigned int nwords; };
+static inline struct bitmap get_layout_bitmap(struct layout* layout)
 {
-    if (fixnump(bitmap))
-      return (index < (N_WORD_BITS - N_FIXNUM_TAG_BITS))
-          ? (bitmap >> (index+N_FIXNUM_TAG_BITS)) & 1
-          : (sword_t)bitmap < 0;
-    return positive_bignum_logbitp(index, (struct bignum*)native_pointer(bitmap));
+    struct bitmap bitmap;
+    const int layout_id_vector_fixed_capacity = 7;
+#ifdef LISP_FEATURE_64_BIT
+    sword_t depthoid = layout->flags;
+    // Depthoid is stored in the upper 4 bytes of the header, as a fixnum.
+    depthoid >>= (32 + N_FIXNUM_TAG_BITS);
+    int extra_id_words =
+      (depthoid > layout_id_vector_fixed_capacity) ?
+      ALIGN_UP(depthoid - layout_id_vector_fixed_capacity, 2) / 2 : 0;
+#else
+    sword_t depthoid = layout->depthoid;
+    depthoid >>= N_FIXNUM_TAG_BITS;
+    int extra_id_words = (depthoid > layout_id_vector_fixed_capacity) ?
+      depthoid - layout_id_vector_fixed_capacity : 0;
+#endif
+    // The 2 bits for stable address-based hashing can't ever bet set.
+    const int baseline_payload_words = (sizeof (struct layout) / N_WORD_BYTES) - 1;
+    int payload_words = ((unsigned int)layout->header >> INSTANCE_LENGTH_SHIFT) & 0x3FFF;
+    bitmap.bits = (sword_t*)((char*)layout + sizeof (struct layout)) + extra_id_words;
+    bitmap.nwords = payload_words - baseline_payload_words - extra_id_words;
+    return bitmap;
+}
+
+/* Return true if the INDEXth bit is set in BITMAP.
+ * Index 0 corresponds to the word just after the instance header.
+ * So index 0 may be the layout pointer if #-compact-instance-header,
+ * or a user data slot if #+compact-instance-header
+ */
+static inline boolean bitmap_logbitp(unsigned int index, struct bitmap bitmap)
+{
+    unsigned int word_index = index / N_WORD_BITS;
+    unsigned int bit_index  = index % N_WORD_BITS;
+    if (word_index >= bitmap.nwords) return bitmap.bits[bitmap.nwords-1] < 0;
+    return (bitmap.bits[word_index] >> bit_index) & 1;
 }
 
 /* Keep in sync with 'target-hash-table.lisp' */
+#define hashtable_kind(ht) ((ht->flags >> (4+N_FIXNUM_TAG_BITS)) & 3)
 #define hashtable_weakp(ht) (ht->flags & (8<<N_FIXNUM_TAG_BITS))
-#define hashtable_weakness(ht) (ht->flags >> (4+N_FIXNUM_TAG_BITS))
+#define hashtable_weakness(ht) (ht->flags >> (6+N_FIXNUM_TAG_BITS))
 
 #if defined(LISP_FEATURE_GENCGC)
 
@@ -289,10 +318,18 @@ static inline boolean layout_bitmap_logbitp(int index, lispobj bitmap)
          operation; \
          protect_page(page_address(page_index), page_index); }}
 
+#ifdef LISP_FEATURE_DARWIN_JIT
+#define OS_VM_PROT_JIT_READ OS_VM_PROT_READ
+#define OS_VM_PROT_JIT_ALL OS_VM_PROT_READ | OS_VM_PROT_WRITE
+#else
+#define OS_VM_PROT_JIT_READ OS_VM_PROT_READ | OS_VM_PROT_EXECUTE
+#define OS_VM_PROT_JIT_ALL OS_VM_PROT_ALL
+#endif
+
 /* This is used bu the fault handler, and potentially during GC */
 static inline void unprotect_page_index(page_index_t page_index)
 {
-    os_protect(page_address(page_index), GENCGC_CARD_BYTES, OS_VM_PROT_ALL);
+    os_protect(page_address(page_index), GENCGC_CARD_BYTES, OS_VM_PROT_JIT_ALL);
     unsigned char *pflagbits = (unsigned char*)&page_table[page_index].gen - 1;
     __sync_fetch_and_or(pflagbits, WP_CLEARED_FLAG);
     __sync_fetch_and_and(pflagbits, ~WRITE_PROTECTED_FLAG);
@@ -300,9 +337,12 @@ static inline void unprotect_page_index(page_index_t page_index)
 
 static inline void protect_page(void* page_addr, page_index_t page_index)
 {
-    os_protect((void *)page_addr,
-               GENCGC_CARD_BYTES,
-               OS_VM_PROT_READ|OS_VM_PROT_EXECUTE);
+#ifdef LISP_FEATURE_DARWIN_JIT
+    if ((page_table[page_index].type & PAGE_TYPE_MASK) == CODE_PAGE_TYPE) {
+      return;
+    }
+#endif
+    os_protect((void *)page_addr, GENCGC_CARD_BYTES, OS_VM_PROT_JIT_READ);
 
     /* Note: we never touch the write_protected_cleared bit when protecting
      * a page. Consider two random threads that reach their SIGSEGV handlers
@@ -334,5 +374,71 @@ static inline void protect_page(void* page_addr, page_index_t page_index)
 
 #define KV_PAIRS_HIGH_WATER_MARK(kvv) fixnum_value(kvv[0])
 #define KV_PAIRS_REHASH(kvv) kvv[1]
+
+/* This is NOT the same value that lisp's %INSTANCE-LENGTH returns.
+ * Lisp always uses the logical length (as originally allocated),
+ * except when heap-walking which requires exact physical sizes */
+static inline int instance_length(lispobj header)
+{
+    // * Byte 3 of an instance header word holds the immobile gen# and visited bit,
+    //   so those have to be masked off.
+    // * fullcgc uses bit index 31 as a mark bit, so that has to
+    //   be cleared. Lisp does not have to clear bit 31 because fullcgc does not
+    //   operate concurrently.
+    // * If the object is in hashed-and-moved state and the original instance payload
+    //   length was odd (total object length was even), then add 1.
+    //   This can be detected by ANDing some bits, bit 10 being the least-significant
+    //   bit of the original size, and bit 9 being the 'hashed+moved' bit.
+    // * 64-bit machines do not need 'long' right-shifts, so truncate to int.
+
+    int extra = ((unsigned int)header >> 10) & ((unsigned int)header >> 9) & 1;
+    return (((unsigned int)header >> INSTANCE_LENGTH_SHIFT) & 0x3FFF) + extra;
+}
+
+/// instance_layout() and layout_of() macros takes a lispobj* and are lvalues
+#ifdef LISP_FEATURE_COMPACT_INSTANCE_HEADER
+
+# ifdef LISP_FEATURE_LITTLE_ENDIAN
+#  define instance_layout(native_ptr) ((uint32_t*)(native_ptr))[1]
+# else
+#  error "No instance_layout() defined"
+# endif
+# define funinstance_layout(native_ptr) instance_layout(native_ptr)
+// generalize over either metatype, but not as general as SB-KERNEL:LAYOUT-OF
+# define layout_of(native_ptr) instance_layout(native_ptr)
+
+#else
+
+// first 2 words of ordinary instance are: header, layout
+# define instance_layout(native_ptr) ((lispobj*)native_ptr)[1]
+// first 4 words of funcallable instance are: header, trampoline, layout, fin-fun
+# define funinstance_layout(native_ptr) ((lispobj*)native_ptr)[2]
+# define layout_of(native_ptr) \
+  ((lispobj*)native_ptr)[1+((widetag_of(native_ptr)>>LAYOUT_SELECTOR_BIT)&1)]
+
+#endif
+
+static inline int layout_depth2_id(struct layout* layout) {
+    int32_t* vector = (int32_t*)&layout->id_word0;
+    return vector[0];
+}
+// Keep in sync with hardwired IDs in src/compiler/generic/genesis.lisp
+#define LAYOUT_LAYOUT_ID 3
+#define LFLIST_NODE_LAYOUT_ID 4
+
+/// Return true if 'thing' is a layout.
+/// This predicate is careful, as is it used to verify heap invariants.
+static inline boolean layoutp(lispobj thing)
+{
+    lispobj base_ptr = thing - INSTANCE_POINTER_LOWTAG;
+    lispobj layout;
+    if ((base_ptr & LOWTAG_MASK) || !(layout = layout_of((lispobj*)base_ptr)))
+        return 0;
+    return layout_depth2_id(LAYOUT(layout)) == LAYOUT_LAYOUT_ID;
+}
+/// Return true if 'thing' is the layout of any subtype of sb-lockless::list-node.
+static inline boolean lockfree_list_node_layout_p(struct layout* layout) {
+    return layout_depth2_id(layout) == LFLIST_NODE_LAYOUT_ID;
+}
 
 #endif /* _GC_PRIVATE_H_ */

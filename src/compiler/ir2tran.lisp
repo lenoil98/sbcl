@@ -157,6 +157,12 @@
               (emit-move node block (make-load-time-constant-tn :known-fun name)
                          res))
              (t
+              #+untagged-fdefns
+              (let ((fdefn-tn (make-load-time-constant-tn :named-call name)))
+                (if unsafe
+                    (vop sb-vm::untagged-fdefn-fun node block fdefn-tn res)
+                    (vop sb-vm::safe-untagged-fdefn-fun node block fdefn-tn res)))
+              #-untagged-fdefns
               (let ((fdefn-tn (make-load-time-constant-tn :fdefinition name)))
                 (if unsafe
                     (vop fdefn-fun node block fdefn-tn res)
@@ -197,9 +203,7 @@
   (values))
 
 ;;; Emit code to load a function object implementing FUNCTIONAL into
-;;; RES. This gets interesting when the referenced function is a
-;;; closure: we must make the closure and move the closed-over values
-;;; into it.
+;;; RES.
 ;;;
 ;;; FUNCTIONAL is either a :TOPLEVEL-XEP functional or the XEP lambda
 ;;; for the called function, since local call analysis converts all
@@ -266,63 +270,54 @@
     current-fp
     (find-in-physenv what this-env)))
 
-(defoptimizer (%allocate-closures ltn-annotate) ((leaves) node ltn-policy)
-  (declare (ignore ltn-policy))
-  (when (lvar-dynamic-extent leaves)
-    (let ((info (make-ir2-lvar *backend-t-primitive-type*)))
-      (setf (ir2-lvar-kind info) :delayed)
-      (setf (lvar-info leaves) info)
-      (setf (ir2-lvar-stack-pointer info)
-            (make-stack-pointer-tn)))))
-
-(defoptimizer (%allocate-closures ir2-convert) ((leaves) call 2block)
-  (let ((dx-p (lvar-dynamic-extent leaves)))
+;;; Emit code to create function objects implementing the FUNCTIONALs
+;;; of the enclose node. This gets interesting when the functions are
+;;; mutually referential closures as in LABELS constructs: we must
+;;; make the closures first and move the closed-over values into them
+;;; in such a way that any closed over closures are initialized before
+;;; they are moved into environments. A simple solution: we postpone
+;;; the initialization of the closures until after they have all been
+;;; created, though this may require more registers. TODO: it may be
+;;; possible to improve on this somehow.
+(defun ir2-convert-enclose (node ir2-block)
+  (declare (type enclose node)
+           (type ir2-block ir2-block))
+  (let ((funs (enclose-funs node))
+        (lvar (node-lvar node))) ; non-null when DX
+    (when lvar
+      (vop current-stack-pointer node ir2-block (ir2-lvar-stack-pointer (lvar-info lvar))))
     (collect ((delayed))
-      (when dx-p
-        (vop current-stack-pointer call 2block
-             (ir2-lvar-stack-pointer (lvar-info leaves))))
-      (dolist (leaf (lvar-value leaves))
-        (binding* ((xep (awhen (functional-entry-fun leaf)
-                          ;; if the xep's been deleted then we can skip it
-                          (if (eq (functional-kind it) :deleted)
-                              nil it))
-                        :exit-if-null)
-                   (nil (aver (xep-p xep)))
-                   (entry-info (lambda-info xep) :exit-if-null)
-                   (tn (entry-info-closure-tn entry-info) :exit-if-null)
-                   (closure (physenv-closure (get-lambda-physenv xep)))
-                   #-x86-64
-                   (entry (make-load-time-constant-tn :entry xep)))
-          (let ((this-env (node-physenv call))
-                (leaf-dx-p (and dx-p (leaf-dynamic-extent leaf))))
-            (aver (entry-info-offset entry-info))
-            (vop make-closure call 2block #-x86-64 entry
-                 (entry-info-offset entry-info) (length closure)
-                 leaf-dx-p tn)
-            (loop for what in closure and n from 0 do
-                  (unless (and (lambda-var-p what)
-                               (null (leaf-refs what)))
-                    ;; In LABELS a closure may refer to another closure
-                    ;; in the same group, so we must be sure that we
-                    ;; store a closure only after its creation.
-                    ;;
-                    ;; TODO: Here is a simple solution: we postpone
-                    ;; putting of all closures after all creations
-                    ;; (though it may require more registers).
-                    (if (lambda-p what)
-                      (delayed (list tn (find-in-physenv what this-env) n))
-                      (let ((initial-value (closure-initial-value
-                                            what this-env nil)))
-                        (if initial-value
-                          (vop closure-init call 2block
-                               tn initial-value n)
-                          ;; An initial-value of NIL means to stash
-                          ;; the frame pointer... which requires a
-                          ;; different VOP.
-                          (vop closure-init-from-fp call 2block tn n)))))))))
+      (dolist (fun funs)
+        (let ((xep (functional-entry-fun fun)))
+          ;; If there is no XEP then no closure needs to be created.
+          (when (and xep (not (eq (functional-kind xep) :deleted)))
+            (aver (xep-p xep))
+            (let ((closure (physenv-closure (get-lambda-physenv xep))))
+              (when closure
+                (let* ((entry-info (lambda-info xep))
+                       (tn (entry-info-closure-tn entry-info))
+                       #-x86-64
+                       (entry (make-load-time-constant-tn :entry xep))
+                       (env (node-physenv node))
+                       (leaf-dx-p (and lvar (leaf-dynamic-extent fun))))
+                  (aver (entry-info-offset entry-info))
+                  (vop make-closure node ir2-block #-x86-64 entry
+                                    (entry-info-offset entry-info) (length closure)
+                                    leaf-dx-p tn)
+                  (loop for what in closure and n from 0 do
+                    (unless (and (lambda-var-p what)
+                                 (null (leaf-refs what)))
+                      (if (lambda-p what)
+                          (delayed (list tn (find-in-physenv what env) n))
+                          (let ((initial-value (closure-initial-value what env nil)))
+                            (if initial-value
+                                (vop closure-init node ir2-block tn initial-value n)
+                                ;; An initial-value of NIL means to stash
+                                ;; the frame pointer... which requires a
+                                ;; different VOP.
+                                (vop closure-init-from-fp node ir2-block tn n))))))))))))
       (loop for (tn what n) in (delayed)
-            do (vop closure-init call 2block
-                    tn what n))))
+            do (vop closure-init node ir2-block tn what n))))
   (values))
 
 ;;; Convert a SET node. If the NODE's LVAR is annotated, then we also
@@ -443,7 +438,8 @@
 ;;; IR2-LVAR-LOCS. Otherwise we make a new list padded as necessary by
 ;;; discarded TNs. We always return a TN of the specified type, using
 ;;; the lvar locs only when they are of the correct type.
-(defun lvar-result-tns (lvar types &optional primitive-types)
+(defun lvar-result-tns (lvar types &optional primitive-types
+                                             call)
   (declare (type (or lvar null) lvar)
            (type list primitive-types types))
   (let ((primitive-types (or primitive-types
@@ -460,13 +456,21 @@
                               for prim-type in primitive-types
                               always (eq (tn-primitive-type loc) prim-type)))
                    locs
-                   (loop for prim-type in primitive-types
+                   (loop with optional = (and call
+                                              (vop-info-p (combination-info call))
+                                              (vop-info-optional-results (combination-info call)))
+                         for prim-type in primitive-types
                          for type in types
+                         for i from 0
                          for loc = (pop locs)
-                         collect (if (and loc
-                                          (eq (tn-primitive-type loc) prim-type))
-                                     loc
-                                     (make-normal-tn prim-type type))))))
+                         collect (cond ((and loc
+                                             (eq (tn-primitive-type loc) prim-type))
+                                        loc)
+                                       ((and (not loc)
+                                             (member i optional))
+                                        (make-unused-tn))
+                                       (t
+                                        (make-normal-tn prim-type type)))))))
             (:unknown
              (mapcar #'make-normal-tn primitive-types types))))
         (mapcar #'make-normal-tn primitive-types types))))
@@ -507,6 +511,7 @@
         (ndest (length dest)))
     (mapc (lambda (from to)
             (unless (or (eq from to)
+                        (eq (tn-kind from) :unused)
                         (eq (tn-kind to) :unused))
               (emit-move node block from to)))
           (if (> ndest nsrc)
@@ -584,7 +589,7 @@
                                               (lvar-value bound))
                                              ((and (integer-type-p bound-type)
                                                    (nth-value 1 (integer-type-numeric-bounds bound-type))))
-                                             (sb-xc:array-dimension-limit))))))
+                                             (array-dimension-limit))))))
          (index-type (lvar-type index)))
     (when (eq (type-intersection bound-type index-type)
               *empty-type*)
@@ -707,7 +712,9 @@
                  (return nil))))
         locs
         (lvar-result-tns lvar
-                         (find-template-result-types call rtypes)))))
+                         (find-template-result-types call rtypes)
+                         nil
+                         call))))
 
 ;;; Get the operands into TNs, make TN-REFs for them, and then call
 ;;; the template emit function.
@@ -970,7 +977,8 @@
   (declare (type combination node) (type ir2-block block))
   (let* ((fun (ref-leaf (lvar-uses (basic-combination-fun node))))
          (kind (functional-kind fun)))
-    (cond ((eq kind :let)
+    (cond ((eq kind :deleted))
+          ((eq kind :let)
            (ir2-convert-let node block fun))
           ((eq kind :assignment)
            (ir2-convert-assignment node block fun))
@@ -1010,14 +1018,15 @@
                         (= (length locs) 1)))
              (values loc nil)))
           ((lvar-fun-name lvar t)
-           (let ((name (lvar-fun-name lvar t)))
-             (values (cond ((sb-vm::static-fdefn-offset name)
-                            name)
-                           (t
-                            ;; Named call to an immobile fdefn from an immobile component
-                            ;; uses the FUN-TN only to preserve liveness of the fdefn.
-                            ;; The name becomes an info arg.
-                            (make-load-time-constant-tn :fdefinition name)))
+           ;; Uncross so that we don't create a constant for SB-XC:GENSYM
+           ;; and CL:GENSYM, in case a piece of code mentions both.
+           (let ((name (uncross (lvar-fun-name lvar t))))
+             ;; Static fdefns never need a code header constant.
+             (values (if (sb-vm::static-fdefn-offset name)
+                         name
+                         ;; Calls to immobile space fdefns won't use this constant,
+                         ;; but it needs to exist for GC's pointer tracing.
+                         (make-load-time-constant-tn :named-call name))
                      name)))
           (t
            (values (lvar-tn node block lvar) nil)))))
@@ -1218,30 +1227,31 @@
           (when (member stem *full-calls-to-warn-about* :test #'string=)
             (warn "Full call to ~S" fname)))))
 
-    (let* ((inlineable-p (not (let ((*lexenv* (node-lexenv node)))
-                                (fun-lexically-notinline-p fname))))
-           (inlineable-bit (if inlineable-p 1 0))
-           (cell (info :function :emitted-full-calls fname)))
-      (if (not cell)
-          ;; The low bit indicates whether any not-NOTINLINE call was seen.
-          ;; The next-lowest bit is magic. Refer to %COMPILER-DEFMACRO
-          ;; and WARN-IF-INLINE-FAILED/CALL for the pertinent logic.
-          (setf cell (list (logior 4 inlineable-bit))
-                (info :function :emitted-full-calls fname) cell)
-          (incf (car cell) (+ 4 (if (oddp (car cell)) 0 inlineable-bit))))
-      ;; If the full call was wanted, don't record anything.
-      ;; (This was originally for debugging SBCL self-compilation)
-      (when inlineable-p
-        (unless *failure-p*
-          (warn-if-inline-failed/call fname (node-lexenv node) cell))
-        (case *track-full-called-fnames*
-          (:detailed
-           (when (boundp 'sb-xc:*compile-file-pathname*)
-             (pushnew sb-xc:*compile-file-pathname* (cdr cell)
-                      :test #'equal)))
-          (:very-detailed
-           (pushnew (component-name *component-being-compiled*)
-                    (cdr cell) :test #'equalp)))))
+    (unless (pcl-methodfn-name-p fname)
+      (let* ((inlineable-p (not (let ((*lexenv* (node-lexenv node)))
+                                  (fun-lexically-notinline-p fname))))
+             (inlineable-bit (if inlineable-p 1 0))
+             (cell (info :function :emitted-full-calls fname)))
+        (if (not cell)
+            ;; The low bit indicates whether any not-NOTINLINE call was seen.
+            ;; The next-lowest bit is magic. Refer to %COMPILER-DEFMACRO
+            ;; and WARN-IF-INLINE-FAILED/CALL for the pertinent logic.
+            (setf cell (list (logior 4 inlineable-bit))
+                  (info :function :emitted-full-calls fname) cell)
+            (incf (car cell) (+ 4 (if (oddp (car cell)) 0 inlineable-bit))))
+        ;; If the full call was wanted, don't record anything.
+        ;; (This was originally for debugging SBCL self-compilation)
+        (when inlineable-p
+          (unless *failure-p*
+            (warn-if-inline-failed/call fname (node-lexenv node) cell))
+          (case *track-full-called-fnames*
+            (:detailed
+             (when (boundp '*compile-file-pathname*)
+               (pushnew *compile-file-pathname* (cdr cell)
+                        :test #'equal)))
+            (:very-detailed
+             (pushnew (component-name *component-being-compiled*)
+                      (cdr cell) :test #'equalp))))))
 
     ;; Special mode, usually only for the cross-compiler
     ;; and only with the feature enabled.
@@ -1275,20 +1285,6 @@
     (when (consp fname)
       (aver (legal-fun-name-p fname))))) ;; FIXME: needless check?
 
-#+call-symbol
-(defun remove-%coerce-callable-for-call (call)
-  (let* ((fun (basic-combination-fun call))
-         (use (lvar-uses fun)))
-    (when (and (combination-p use)
-               (eq (lvar-fun-name (combination-fun use) t)
-                   '%coerce-callable-for-call))
-      (let ((callable (car (combination-args use))))
-        ;; Everything else can't handle NIL, just don't
-        ;; bother optimizing it.
-        (unless (and (constant-lvar-p callable)
-                     (null (lvar-value callable)))
-          (setf (basic-combination-fun call) callable))))))
-
 ;;; If the call is in a tail recursive position and the return
 ;;; convention is standard, then do a tail full call. If one or fewer
 ;;; values are desired, then use a single-value call, otherwise use a
@@ -1296,8 +1292,6 @@
 (defun ir2-convert-full-call (node block)
   (declare (type combination node) (type ir2-block block))
   (ponder-full-call node)
-  #+call-symbol
-  (remove-%coerce-callable-for-call node)
   (cond ((node-tail-p node)
          (ir2-convert-tail-full-call node block))
         ((let ((lvar (node-lvar node)))
@@ -1310,7 +1304,9 @@
 
 ;;;; entering functions
 (defun xep-verify-arg-count (node block fun arg-count-location)
-  (when (policy fun (plusp verify-arg-count))
+  (when (and (policy fun (plusp verify-arg-count))
+             ;; this property will be absent in most cases
+             (getf (functional-plist fun) 'verify-arg-count t))
     (let* ((ef (functional-entry-fun fun))
            (optional (optional-dispatch-p ef))
            (min (and optional
@@ -1357,7 +1353,7 @@
               ;; not all backends have been updated yet.  On backends
               ;; that have not been updated, we still need to use
               ;; XEP-SETUP-SP here.
-              #+(or alpha hppa mips sparc)
+              #+(or mips sparc)
               (vop xep-setup-sp node block)
               (vop copy-more-arg node block (optional-dispatch-max-args ef)
                    #+x86-64 verified))
@@ -1479,7 +1475,7 @@
       (setf (ir2-physenv-environment-start env) lab)
       (vop note-environment-start node block lab)
       #+sb-safepoint
-      (unless (policy fun (>= inhibit-safepoints 2))
+      (when (policy fun (/= insert-safepoints 0))
         (vop sb-vm::insert-safepoint node block))))
 
   (values))
@@ -1599,8 +1595,6 @@
 (defun ir2-convert-mv-call (node block)
   (declare (type mv-combination node) (type ir2-block block))
   (aver (basic-combination-args node))
-  #+call-symbol
-  (remove-%coerce-callable-for-call node)
   (let* ((start-lvar (lvar-info (first (basic-combination-args node))))
          (start (first (ir2-lvar-locs start-lvar)))
          (tails (and (node-tail-p node)
@@ -1742,17 +1736,16 @@ not stack-allocated LVAR ~S." source-lvar)))))
        (loop for loc in (ir2-lvar-locs 2lvar)
              for idx upfrom 0
              unless (eq (tn-kind loc) :unused)
-             do #+(vop-named sb-vm::more-arg-or-nil)
-                (vop sb-vm::more-arg-or-nil node block
-                     (lvar-tn node block context)
-                     (lvar-tn node block count)
-                     idx
-                     loc)
-                #-(vop-named sb-vm::more-arg-or-nil)
-                (vop sb-vm::more-arg node block
-                     (lvar-tn node block context)
-                     (emit-constant idx)
-                     loc)))
+             do (if-vop-existsp (:named sb-vm::more-arg-or-nil)
+                    (vop sb-vm::more-arg-or-nil node block
+                         (lvar-tn node block context)
+                         (lvar-tn node block count)
+                         idx
+                         loc)
+                    (vop sb-vm::more-arg node block
+                         (lvar-tn node block context)
+                         (emit-constant idx)
+                         loc))))
       (:unknown
        (let ((locs (ir2-lvar-locs 2lvar)))
          (vop* %more-arg-values node block
@@ -1762,21 +1755,10 @@ not stack-allocated LVAR ~S." source-lvar)))))
                 nil)
                ((reference-tn-list locs t))))))))
 
-;;; If ir2-convert-full-call gets to it first REMOVE-%COERCE-CALLABLE-FOR-CALL does the job.
 #+call-symbol
 (defoptimizer (%coerce-callable-for-call ir2-convert) ((fun) node block)
-  (let ((dest (node-dest node)))
-    (if (and (basic-combination-p dest)
-             (eq (basic-combination-kind dest) :full)
-             ;; Everything else can't handle NIL, just don't
-             ;; bother optimizing it.
-             (not (and (constant-lvar-p fun)
-                       (null (lvar-value fun))))
-             (let ((dest-fun (basic-combination-fun dest)))
-               (or (eq dest-fun fun) ;; already removed
-                   (eq (lvar-uses dest-fun) node))))
-        (setf (basic-combination-fun dest) fun)
-        (ir2-convert-full-call node block))))
+  (when fun
+    (ir2-convert-full-call node block)))
 
 ;;;; special binding
 
@@ -1807,9 +1789,9 @@ not stack-allocated LVAR ~S." source-lvar)))))
 
 (defoptimizer (%special-unbind ir2-convert) ((&rest symbols) node block)
   (declare (ignorable symbols))
-  #-(vop-named sb-c:unbind-n) (vop unbind node block)
-  #+(vop-named sb-c:unbind-n) (vop unbind-n node block
-                                    (mapcar #'lvar-value symbols)))
+  (if-vop-existsp (:named sb-c:unbind-n)
+    (vop unbind-n node block (mapcar #'lvar-value symbols))
+    (vop unbind node block)))
 
 ;;; ### It's not clear that this really belongs in this file, or
 ;;; should really be done this way, but this is the least violation of
@@ -1828,7 +1810,7 @@ not stack-allocated LVAR ~S." source-lvar)))))
                           (dolist (var vars)
                             ;; CLHS says "bound and then made to have no value" -- user
                             ;; should not be able to tell the difference between that and this.
-                            (about-to-modify-symbol-value var 'progv)
+                            (about-to-modify-symbol-value var 'makunbound)
                             (%primitive dynbind unbound-marker var))))
                       (,bind (vars vals)
                         (declare (optimize (speed 2) (debug 0)
@@ -1843,6 +1825,7 @@ not stack-allocated LVAR ~S." source-lvar)))))
                                  (%primitive dynbind val var))
                                (,bind (cdr vars) (cdr vals))))))
                (,bind ,vars ,vals)
+               nil
                ,@body)
           ;; Technically ANSI CL doesn't allow declarations at the
           ;; start of the cleanup form. SBCL happens to allow for
@@ -1916,21 +1899,13 @@ not stack-allocated LVAR ~S." source-lvar)))))
            (type (or lvar null) tag))
   (let* ((2info (nlx-info-info info))
          (kind (cleanup-kind (nlx-info-cleanup info)))
-         (block-tn (physenv-live-tn
-                    (make-normal-tn
-                     (primitive-type-or-lose
-                      (ecase kind
-                        (:catch
-                         'catch-block)
-                        ((:unwind-protect :block :tagbody)
-                         'unwind-block))))
-                    (node-physenv node)))
+         (block-tn (ir2-nlx-info-block-tn 2info))
          (res (make-stack-pointer-tn))
          (target-label (ir2-nlx-info-target 2info)))
-    #-x86-64
+    #-unbind-in-unwind
     (vop current-binding-pointer node block
          (car (ir2-nlx-info-dynamic-state 2info)))
-    #-x86-64
+    #-unbind-in-unwind
     (vop* save-dynamic-state node block
           (nil)
           ((reference-tn-list (cdr (ir2-nlx-info-dynamic-state 2info)) t)))
@@ -2000,14 +1975,14 @@ not stack-allocated LVAR ~S." source-lvar)))))
   (let* ((info (lvar-value info-lvar))
          (lvar (node-lvar node))
          (2info (nlx-info-info info))
-         (top-loc (ir2-nlx-info-save-sp 2info))
-         (start-loc (make-nlx-entry-arg-start-location))
-         (count-loc (make-arg-count-location))
          (target (ir2-nlx-info-target 2info)))
 
     (ecase (cleanup-kind (nlx-info-cleanup info))
       ((:catch :block :tagbody)
-       (let ((2lvar (and lvar (lvar-info lvar))))
+       (let ((top-loc (ir2-nlx-info-save-sp 2info))
+             (start-loc (make-nlx-entry-arg-start-location))
+             (count-loc (make-arg-count-location))
+             (2lvar (and lvar (lvar-info lvar))))
          (if (and 2lvar (eq (ir2-lvar-kind 2lvar) :unknown))
              (vop* nlx-entry-multiple node block
                    (top-loc start-loc count-loc nil)
@@ -2020,13 +1995,22 @@ not stack-allocated LVAR ~S." source-lvar)))))
                      target
                      (length locs))
                (move-lvar-result node block locs lvar)))))
-      (:unwind-protect
-       (let ((block-loc (standard-arg-location 0)))
+      #-no-continue-unwind
+      ((:unwind-protect)
+       (let ((start-loc (make-nlx-entry-arg-start-location))
+             (count-loc (make-arg-count-location))
+             (block-loc (standard-arg-location 0)))
          (vop uwp-entry node block target block-loc start-loc count-loc)
          (move-lvar-result
           node block
           (list block-loc start-loc count-loc)
-          lvar))))
+          lvar)))
+      #+no-continue-unwind
+      ((:unwind-protect)
+       (if lvar
+           (vop sb-vm::uwp-entry-block node block target
+                (car (ir2-lvar-locs (lvar-info lvar))))
+           (vop uwp-entry node block target))))
 
     #+sb-dyncount
     (when *collect-dynamic-statistics*
@@ -2035,14 +2019,20 @@ not stack-allocated LVAR ~S." source-lvar)))))
     ;; Make sure this is done before NSP is reset, as that may leave
     ;; *free-interrupt-context-index* unprotected below the stack
     ;; pointer.
-    #-x86-64
+    #-unbind-in-unwind
     (vop unbind-to-here node block
          (car (ir2-nlx-info-dynamic-state 2info)))
 
-    #-x86-64
+    #-unbind-in-unwind
     (vop* restore-dynamic-state node block
           ((reference-tn-list (cdr (ir2-nlx-info-dynamic-state 2info)) nil))
           (nil))))
+
+(defoptimizer (%unwind-protect-breakup ir2-convert) ((info-lvar) node block)
+  (vop %unwind-protect-breakup node block (ir2-nlx-info-block-tn (nlx-info-info (lvar-value info-lvar)))))
+
+(defoptimizer (%catch-breakup ir2-convert) ((info-lvar) node block)
+  (vop %catch-breakup node block (ir2-nlx-info-block-tn (nlx-info-info (lvar-value info-lvar)))))
 
 ;;;; n-argument functions
 
@@ -2215,7 +2205,7 @@ not stack-allocated LVAR ~S." source-lvar)))))
                              (member (loop-kind (block-loop block))
                                      '(:natural :strange))
                              (eq block (loop-head (block-loop block)))
-                             (policy first-node (< inhibit-safepoints 2)))
+                             (policy first-node (/= insert-safepoints 0)))
                     (vop sb-vm::insert-safepoint first-node 2block))))
             (ir2-convert-block block)
             (incf num))))))
@@ -2325,7 +2315,9 @@ not stack-allocated LVAR ~S." source-lvar)))))
          (when (exit-entry node)
            (ir2-convert-exit node 2block)))
         (entry
-         (ir2-convert-entry node 2block)))))
+         (ir2-convert-entry node 2block))
+        (enclose
+         (ir2-convert-enclose node 2block)))))
 
   (finish-ir2-block block)
 

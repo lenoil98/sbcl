@@ -55,6 +55,16 @@
   (def loadw ldr word-shift)
   (def storew str word-shift))
 
+(defmacro storew-pair (object1 offset1 object2 offset2
+                       base)
+  (assert (= (eval offset1) (1- (eval offset2))))
+  `(inst stp ,object1 ,object2 (@ ,base (* ,(eval offset1) n-word-bytes))))
+
+(defmacro loadw-pair (object1 offset1 object2 offset2
+                       base)
+  (assert (= (eval offset1) (1- (eval offset2))))
+  `(inst ldp ,object1 ,object2 (@ ,base (* ,(eval offset1) n-word-bytes))))
+
 (defmacro load-symbol (reg symbol)
   (once-only ((reg reg) (symbol symbol))
     `(inst add ,reg null-tn (add-sub-immediate  (static-symbol-offset ,symbol)))))
@@ -100,14 +110,11 @@
   "Return to RETURN-PC."
   `(let* ((function ,function)
           (lip ,lip))
-     ;; Indicate a single-valued return by clearing all of the status
-     ;; flags, or a multiple-valued return by setting all of the status
-     ;; flags.
      (aver (sc-is lip interior-reg))
+     ;; Indicate a single-valued return by clearing the Z flag
      ,@(ecase return-style
-         (:single-value '((inst msr :nzcv zr-tn)))
-         (:multiple-values '((inst orr tmp-tn zr-tn #xf0000000)
-                             (inst msr :nzcv tmp-tn)))
+         (:single-value '((inst cmp null-tn 0)))
+         (:multiple-values '((inst cmp zr-tn zr-tn)))
          (:known))
      (inst sub lip function (- other-pointer-lowtag 8))
      (inst ret lip)))
@@ -174,88 +181,74 @@
 ;;; P-A FLAG-TN is also acceptable here.
 
 #+gencgc
-(defun allocation-tramp (alloc-tn size back-label return-in-tmp lip)
+(defun allocation-tramp (type alloc-tn size back-label return-in-tmp lip)
   (unless (eq size tmp-tn)
     (inst mov tmp-tn size))
-  (load-inline-constant alloc-tn '(:fixup alloc-tramp :assembly-routine) lip)
+  (let ((asm-routine (if (eq type 'list) 'list-alloc-tramp 'alloc-tramp)))
+    (load-inline-constant alloc-tn `(:fixup ,asm-routine :assembly-routine) lip))
   (inst blr alloc-tn)
   (unless return-in-tmp
     (move alloc-tn tmp-tn))
   (inst b back-label))
 
-(defmacro allocation (result-tn size lowtag &key flag-tn
-                                                 stack-allocate-p
-                                                 (lip (if stack-allocate-p
-                                                          nil
-                                                          (missing-arg))))
+(defun allocation (type size lowtag result-tn
+                      &key flag-tn
+                           stack-allocate-p
+                           (lip (if stack-allocate-p nil (missing-arg))))
+  (declare (ignorable type lip))
   ;; Normal allocation to the heap.
-  (once-only ((result-tn result-tn)
-              (size size)
-              (lowtag lowtag)
-              (flag-tn flag-tn)
-              (stack-allocate-p stack-allocate-p)
-              (lip lip))
-    `(cond (,stack-allocate-p
-            (assemble ()
-              (move ,result-tn csp-tn)
-              (inst tst ,result-tn lowtag-mask)
-              (inst b :eq ALIGNED)
-              (inst add ,result-tn ,result-tn n-word-bytes)
-              ALIGNED
-              (inst add csp-tn ,result-tn (add-sub-immediate ,size))
-              ;; :ne is from TST above, this needs to be done after the
-              ;; stack pointer has been stored.
-              (inst b :eq ALIGNED2)
-              (storew zr-tn ,result-tn -1 0)
-              ALIGNED2
-              (when ,lowtag
-                (inst add ,result-tn ,result-tn ,lowtag))))
-           #-gencgc
-           (t
-            (load-symbol-value ,flag-tn *allocation-pointer*)
-            (inst add ,result-tn ,flag-tn ,lowtag)
-            (inst add ,flag-tn ,flag-tn (add-sub-immediate ,size))
-            (store-symbol-value ,flag-tn *allocation-pointer*))
-           #+gencgc
-           (t
-            (let ((alloc (gen-label))
-                  (back-from-alloc (gen-label))
-                  size)
-              #-sb-thread
-              (progn
-                (load-inline-constant ,flag-tn '(:fixup "gc_alloc_region" :foreign) ,lip)
-                (inst ldp ,result-tn ,flag-tn (@ ,flag-tn)))
-              #+sb-thread
-              (inst ldp ,result-tn ,flag-tn (@ thread-tn
-                                               (* n-word-bytes thread-alloc-region-slot)))
-              (setf size (add-sub-immediate ,size))
-              (inst add ,result-tn ,result-tn size)
-              (inst cmp ,result-tn ,flag-tn)
-              (inst b :hi ALLOC)
-              #-sb-thread
-              (progn
-                (load-inline-constant ,flag-tn '(:fixup "gc_alloc_region" :foreign) ,lip)
-                (storew ,result-tn ,flag-tn))
-              #+sb-thread
-              (storew ,result-tn thread-tn thread-alloc-region-slot)
-
-              ;; alloc_tramp uses tmp-tn for returning the result,
-              ;; save on a move when possible
-              (inst sub (if ,lowtag
-                            tmp-tn
-                            ,result-tn) ,result-tn size)
-
-              (emit-label BACK-FROM-ALLOC)
-              (when ,lowtag
-                (inst add ,result-tn tmp-tn ,lowtag))
-
-              (assemble (:elsewhere)
-                (emit-label ALLOC)
-                (allocation-tramp ,result-tn
-                                  ,size BACK-FROM-ALLOC
-                                  ;; see the comment above aboout alloc_tramp
-                                  (and ,lowtag t)
-                                  ,lip)))))))
+  (if stack-allocate-p
+      (assemble ()
+        (move result-tn csp-tn)
+        (inst tst result-tn lowtag-mask)
+        (inst b :eq ALIGNED)
+        (inst add result-tn result-tn n-word-bytes)
+        ALIGNED
+        (inst add csp-tn result-tn (add-sub-immediate size))
+        ;; :ne is from TST above, this needs to be done after the
+        ;; stack pointer has been stored.
+        (inst b :eq ALIGNED2)
+        (storew zr-tn result-tn -1 0)
+        ALIGNED2
+        (when lowtag
+          (inst add result-tn result-tn lowtag)))
+      #-gencgc
+      (progn
+        (load-symbol-value flag-tn *allocation-pointer*)
+        (inst add result-tn flag-tn lowtag)
+        (inst add flag-tn flag-tn (add-sub-immediate size))
+        (store-symbol-value flag-tn *allocation-pointer*))
+      #+gencgc
+      (let ((alloc (gen-label)) (back-from-alloc (gen-label)))
+        #-sb-thread
+        (progn
+          ;; load-pair can't base off null-tn because the displacement
+          ;; has to be a multiple of 8
+          (load-immediate-word flag-tn boxed-region)
+          (inst ldp result-tn flag-tn (@ flag-tn 0)))
+        #+sb-thread
+        (inst ldp result-tn flag-tn (@ thread-tn (* n-word-bytes thread-alloc-region-slot)))
+        (setf size (add-sub-immediate size))
+        (inst add result-tn result-tn size)
+        (inst cmp result-tn flag-tn)
+        (inst b :hi ALLOC)
+        #-sb-thread (inst str result-tn (@ null-tn (load-store-offset (- boxed-region nil-value))))
+        #+sb-thread (storew result-tn thread-tn thread-alloc-region-slot)
+        ;; alloc_tramp uses tmp-tn for returning the result,
+        ;; save on a move when possible
+        (inst sub (if lowtag tmp-tn result-tn) result-tn size)
+        (emit-label BACK-FROM-ALLOC)
+        (when lowtag
+          (inst add result-tn tmp-tn lowtag))
+        (assemble (:elsewhere)
+          (emit-label ALLOC)
+          (allocation-tramp type
+                            result-tn
+                            size
+                            BACK-FROM-ALLOC
+                            ;; see the comment above aboout alloc_tramp
+                            lowtag
+                            lip)))))
 
 (defmacro with-fixed-allocation ((result-tn flag-tn type-code size
                                             &key (lowtag other-pointer-lowtag)
@@ -271,8 +264,8 @@
               (type-code type-code) (size size) (lowtag lowtag)
               (stack-allocate-p stack-allocate-p)
               (lip lip))
-    `(pseudo-atomic (,flag-tn)
-       (allocation ,result-tn (pad-data-block ,size) ,lowtag
+    `(pseudo-atomic (,flag-tn :sync ,type-code)
+       (allocation nil (pad-data-block ,size) ,lowtag ,result-tn
                    :flag-tn ,flag-tn
                    :stack-allocate-p ,stack-allocate-p
                    :lip ,lip)
@@ -315,10 +308,11 @@
                            other-pointer-lowtag)))))
 
 ;;; handy macro for making sequences look atomic
-(defmacro pseudo-atomic ((flag-tn) &body forms)
-  #+sb-safepoint-strictly
+(defmacro pseudo-atomic ((flag-tn &key (sync t)) &body forms)
+  (declare (ignorable sync))
+  #+sb-safepoint
   `(progn ,@forms (emit-safepoint))
-  #-sb-safepoint-strictly
+  #-sb-safepoint
   `(progn
      (without-scheduling ()
        #-sb-thread
@@ -336,7 +330,8 @@
          (load-symbol-value ,flag-tn *pseudo-atomic-interrupted*))
        #+sb-thread
        (progn
-         (inst dmb)
+         (when ,sync
+           (inst dmb))
          (inst str (32-bit-reg zr-tn)
                (@ thread-tn
                   (* n-word-bytes thread-pseudo-atomic-bits-slot)))
@@ -346,9 +341,7 @@
        (let ((not-interrputed (gen-label)))
          (inst cbz ,flag-tn not-interrputed)
          (inst brk pending-interrupt-trap)
-         (emit-label not-interrputed))
-       #+sb-safepoint
-       (emit-safepoint))))
+         (emit-label not-interrputed)))))
 
 ;;;; memory accessor vop generators
 
@@ -505,18 +498,12 @@
 
 (defmacro load-tl-symbol-value (reg symbol)
   #+sb-thread
-  `(let ((reg ,reg))
-     (load-symbol tmp-tn ',symbol)
-     (inst ldr (32-bit-reg tmp-tn) (tls-index-of tmp-tn))
-     (inst ldr reg (@ thread-tn tmp-tn)))
+  `(inst ldr ,reg (@ thread-tn ,(info :variable :wired-tls symbol)))
   #-sb-thread
   `(load-symbol-value ,reg ,symbol))
 
 (defmacro store-tl-symbol-value (reg symbol)
   #+sb-thread
-  `(let ((reg ,reg))
-     (load-symbol tmp-tn ',symbol)
-     (inst ldr (32-bit-reg tmp-tn) (tls-index-of tmp-tn))
-     (inst str reg (@ thread-tn tmp-tn)))
+  `(inst str ,reg (@ thread-tn ,(info :variable :wired-tls symbol)))
   #-sb-thread
   `(store-symbol-value ,reg ,symbol))

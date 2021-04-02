@@ -224,39 +224,39 @@
 ;;; uninteresting nodes intervening.
 ;;;
 ;;; Uninteresting nodes are nodes in the same block which are either
-;;; REFs, external CASTs to the same destination, or known combinations
-;;; that never unwind.
+;;; REFs, ENCLOSEs, or external CASTs to the same destination.
 (defun almost-immediately-used-p (lvar node)
   (declare (type lvar lvar)
            (type node node))
   (unless (bind-p node)
     (aver (eq (node-lvar node) lvar)))
-  (let ((dest (lvar-dest lvar)))
+  (let ((dest (lvar-dest lvar))
+        ctran)
     (tagbody
      :next
-       (let ((ctran (node-next node)))
-         (cond (ctran
-                (setf node (ctran-next ctran))
-                (if (eq node dest)
-                    (return-from almost-immediately-used-p t)
-                    (typecase node
-                      (ref
-                       (go :next))
-                      (cast
-                       (when (and (memq (cast-type-check node) '(:external nil))
-                                  (eq dest (node-dest node)))
-                         (go :next)))
-                      (combination
-                       ;; KLUDGE: Unfortunately we don't have an attribute for
-                       ;; "never unwinds", so we just special case
-                       ;; %ALLOCATE-CLOSURES: it is easy to run into with eg.
-                       ;; FORMAT and a non-constant first argument.
-                       (when (eq '%allocate-closures (combination-fun-source-name node nil))
-                         (go :next))))))
-               (t
-                (when (eq (block-start (first (block-succ (node-block node))))
-                          (node-prev dest))
-                  (return-from almost-immediately-used-p t))))))))
+       (setf ctran (node-next node))
+     :next-ctran
+       (cond (ctran
+              (setf node (ctran-next ctran))
+              (if (eq node dest)
+                  (return-from almost-immediately-used-p t)
+                  (typecase node
+                    (ref
+                     (go :next))
+                    (cast
+                     (when (and (memq (cast-type-check node) '(:external nil))
+                                (eq dest (node-dest node)))
+                       (go :next)))
+                    (enclose
+                     (go :next)))))
+             (t
+              ;; Loops shouldn't cause a problem, either it will
+              ;; encounter a not "uninteresting" node, or the destination
+              ;; will be unreachable anyway.
+              (let ((start (block-start (first (block-succ (node-block node))))))
+                (when start
+                  (setf ctran start)
+                  (go :next-ctran))))))))
 
 ;;; Check that all the uses are almost immediately used and look through CASTs,
 ;;; as they can be freely deleted removing the immediateness
@@ -266,6 +266,16 @@
                  (or (not (cast-p use))
                      (lvar-almost-immediately-used-p (cast-value use))))
       (return))))
+
+(defun let-var-immediately-used-p (ref var lvar)
+  (let ((bind (lambda-bind (lambda-var-home var))))
+    (when bind
+      (let* ((next-ctran (node-next bind))
+             (next-node (and next-ctran
+                             (ctran-next next-ctran))))
+        (and (eq next-node ref)
+             (lvar-almost-immediately-used-p lvar))))))
+
 
 ;;;; BLOCK UTILS
 
@@ -371,9 +381,10 @@
         (node-ends-block node)))))
 
 (defun lexenv-contains-lambda (lambda parent-lexenv)
-  (loop for lexenv = (lambda-call-lexenv lambda)
+  (loop for lexenv = (lambda-lexenv lambda)
         then (let ((lambda (lexenv-lambda lexenv)))
-               (and (lambda-call-lexenv lambda)))
+               (and lambda
+                    (lambda-call-lexenv lambda)))
         while lexenv
         thereis
         (loop for parent = lexenv then (lexenv-parent parent)
@@ -384,14 +395,14 @@
 ;;; (dx-let ((x (let ((m (make-array)))
 ;;;               (fill m)
 ;;;               m))))
-(defun propagate-ref-dx (new-ref old-lvar old-lambda-var)
+(defun propagate-ref-dx (new-ref old-lvar)
   (let ((dx (lvar-dynamic-extent old-lvar))
         (new-lambda-var (ref-leaf new-ref)))
     (when (and dx
                (lambda-var-p new-lambda-var)
-               ;; Make sure the let inside the dx let
+               ;; Make sure the let is inside the dx let
                (lexenv-contains-lambda (lambda-var-home new-lambda-var)
-                                       (lambda-lexenv (lambda-var-home old-lambda-var))))
+                                       (cleanup-lexenv dx)))
       (let ((new-lvar (lambda-var-ref-lvar new-ref)))
         (when new-lvar
           (propagate-lvar-dx new-lvar old-lvar t)
@@ -595,6 +606,9 @@
     (when (eq (lambda-home fun) fun)
       (return fun))))
 
+(defun lambda-parent (lambda)
+  (lexenv-lambda (lambda-lexenv lambda)))
+
 (declaim (ftype (sfunction (node) component) node-component))
 (defun node-component (node)
   (block-component (node-block node)))
@@ -602,7 +616,7 @@
 (defun node-physenv (node)
   (lambda-physenv (node-home-lambda node)))
 
-#-sb-fluid (declaim (inline node-stack-allocate-p))
+(declaim (inline node-stack-allocate-p))
 (defun node-stack-allocate-p (node)
   (awhen (node-lvar node)
     (lvar-dynamic-extent it)))
@@ -741,13 +755,6 @@
   ;; It's just a distraction otherwise.
   (declare (ignorable lvar flush))
 
-  #+(and sb-xc-host
-          (not (and stack-allocatable-closures
-                    stack-allocatable-vectors
-                    stack-allocatable-lists
-                    stack-allocatable-fixed-objects)))
-  (return-from note-no-stack-allocation)
-
   (do-uses (use (principal-lvar lvar))
     (dolist (use (ensure-list (if (cast-p use)
                                   (principal-lvar-use (cast-value use))
@@ -756,7 +763,11 @@
                ;; Don't complain about not being able to stack allocate constants.
                (and (ref-p use) (constant-p (ref-leaf use)))
                ;; If we're flushing, don't complain if we can flush the combination.
-               (and flush (combination-p use) (flushable-combination-p use))
+               (and flush
+                    (or
+                     (node-to-be-deleted-p use)
+                     (and (combination-p use)
+                          (flushable-combination-p use))))
                ;; Don't report those with homes in :OPTIONAL -- we'd get doubled
                ;; reports that way.
                ;; Also don't report if the home is :EXTERNAL. This allows declaring
@@ -1095,7 +1106,7 @@
 (defun cast-single-value-p (cast)
   (not (values-type-p (cast-asserted-type cast))))
 
-#-sb-fluid (declaim (inline lvar-single-value-p))
+(declaim (inline lvar-single-value-p))
 (defun lvar-single-value-p (lvar)
   (or (not lvar) (%lvar-single-value-p lvar)))
 (defun %lvar-single-value-p (lvar)
@@ -1139,7 +1150,8 @@
                           (lexenv-disabled-package-locks default))
                          (policy (lexenv-policy default))
                          (user-data (lexenv-user-data default))
-                         (flushable (lexenv-flushable default)))
+                         (flushable (lexenv-flushable default))
+                         (parent default))
   (macrolet ((frob (var slot)
                `(let ((old (,slot default)))
                   (if ,var
@@ -1156,7 +1168,7 @@
      cleanup handled-conditions disabled-package-locks
      policy
      user-data
-     default)))
+     parent)))
 
 ;;; Makes a LEXENV, suitable for using in a MACROLET introduced
 ;;; macroexpander
@@ -1416,7 +1428,10 @@
                     (unless (eq type1 type2)
                       (derive-node-type ref1
                                         (values-type-union type1 type2)
-                                        :from-scratch t)))
+                                        :from-scratch t))
+                    (setf (ref-constraints ref1)
+                          (intersection (ref-constraints ref1)
+                                        (ref-constraints ref2))))
                   (loop for pred in (block-pred block2)
                         do
                         (change-block-successor pred block2 block1))
@@ -1535,8 +1550,32 @@
             ((not ctran))
           (setf (ctran-block ctran) new-block))
         new-block))))
+
+;;; This is called by locall-analyze-fun-1 after it convers a call to
+;;; FUN into a local call.
+;;; Presumably, the function can be no longer reused by new calls to
+;;; FUN, so the whole thing has to be removed from (FREE-FUN *IR1-NAMESPACE*).
+(defun note-local-functional (fun &aux (free-funs (free-funs *ir1-namespace*)))
+  (declare (type functional fun))
+  (when (and (leaf-has-source-name-p fun)
+             (eq (leaf-source-name fun) (functional-debug-name fun)))
+    (let* ((name (leaf-source-name fun))
+           (defined-fun (gethash name free-funs)))
+      (when (and (defined-fun-p defined-fun)
+                 ;; KLUDGE: We must not blow away the free-fun entry
+                 ;; while block compiling. It would be better to get
+                 ;; rid of this function entirely and untangle this
+                 ;; mess, since this is really a workaround.
+                 (not (eq (block-compile *compilation*) t)))
+        (remhash name free-funs)))))
+
 
 ;;;; deleting stuff
+
+#-sb-devel
+(declaim (start-block delete-ref delete-functional flush-node flush-dest
+                      delete-lvar delete-block delete-block-lazily delete-lambda
+                      mark-for-deletion))
 
 ;;; Deal with deleting the last (read) reference to a LAMBDA-VAR.
 (defun delete-lambda-var (leaf)
@@ -1579,22 +1618,6 @@
 
   (values))
 
-;;; Note that something interesting has happened to VAR.
-(defun reoptimize-lambda-var (var)
-  (declare (type lambda-var var))
-  (let ((fun (lambda-var-home var)))
-    ;; We only deal with LET variables, marking the corresponding
-    ;; initial value arg as needing to be reoptimized.
-    (when (and (eq (functional-kind fun) :let)
-               (leaf-refs var))
-      (do ((args (basic-combination-args
-                  (lvar-dest (node-lvar (first (leaf-refs fun)))))
-                 (cdr args))
-           (vars (lambda-vars fun) (cdr vars)))
-          ((eq (car vars) var)
-           (reoptimize-lvar (car args))))))
-  (values))
-
 ;;; Delete a function that has no references. This need only be called
 ;;; on functions that never had any references, since otherwise
 ;;; DELETE-REF will handle the deletion.
@@ -1606,11 +1629,20 @@
     (clambda (delete-lambda fun)))
   (values))
 
+(defun lambda-ever-used-p (lambda)
+  (let ((optional-dispatch (lambda-optional-dispatch lambda)))
+    (if optional-dispatch
+        (or (leaf-ever-used optional-dispatch)
+            ;; Warn only for the main entry
+            (not (eq (optional-dispatch-main-entry optional-dispatch)
+                     lambda)))
+        (leaf-ever-used lambda))))
+
 ;;; Deal with deleting the last reference to a CLAMBDA, which means
 ;;; that the lambda is unreachable, so that its body may be
 ;;; deleted. We set FUNCTIONAL-KIND to :DELETED and rely on
 ;;; IR1-OPTIMIZE to delete its blocks.
-(defun delete-lambda (clambda &optional (delete-children t))
+(defun delete-lambda (clambda)
   (declare (type clambda clambda))
   (let ((original-kind (functional-kind clambda))
         (bind (lambda-bind clambda)))
@@ -1619,24 +1651,6 @@
     (aver (or (eq original-kind :zombie) bind))
     (setf (functional-kind clambda) :deleted)
     (setf (lambda-bind clambda) nil)
-
-    (when delete-children
-      (labels ((delete-children (lambda)
-                 (dolist (child (lambda-children lambda))
-                   (cond ((eq (functional-kind child) :deleted)
-                          (delete-children child))
-                         ;; Can happen when all optional entries produce
-                         ;; errors, making the main entry unreachable,
-                         ;; but the XEP should not be deleted, as it can
-                         ;; still be reachable.
-                         ((and (eq (functional-kind child) :external)
-                               (eq (main-entry (functional-entry-fun child)) clambda)))
-                         (t
-                          (delete-lambda child nil)
-                          (delete-children child))))
-                 (setf (lambda-children lambda) nil)
-                 (setf (lambda-parent lambda) nil)))
-        (delete-children clambda)))
 
     ;; (The IF test is (FUNCTIONAL-SOMEWHAT-LETLIKE-P CLAMBDA), except
     ;; that we're using the old value of the KIND slot, not the
@@ -1647,16 +1661,7 @@
        (let ((bind-block (node-block bind)))
          (mark-for-deletion bind-block))
        (let ((home (lambda-home clambda)))
-         (setf (lambda-lets home) (delete clambda (lambda-lets home))))
-       ;; KLUDGE: In presence of NLEs we cannot always understand that
-       ;; LET's BIND dominates its body [for a LET "its" body is not
-       ;; quite its]; let's delete too dangerous for IR2 stuff. --
-       ;; APD, 2004-01-01
-       (dolist (var (lambda-vars clambda))
-         (flet ((delete-node (node)
-                  (mark-for-deletion (node-block node))))
-         (mapc #'delete-node (leaf-refs var))
-         (mapc #'delete-node (lambda-var-sets var)))))
+         (setf (lambda-lets home) (delete clambda (lambda-lets home)))))
       (t
        ;; Function has no reachable references.
        (dolist (ref (lambda-refs clambda))
@@ -1671,7 +1676,7 @@
               (component (block-component bind-block))
               (return (lambda-return clambda))
               (return-block (and return (node-block return))))
-         (unless (leaf-ever-used clambda)
+         (unless (lambda-ever-used-p clambda)
            (let ((*compiler-error-context* bind))
              (compiler-notify 'code-deletion-note
                               :format-control "deleting unused function~:[.~;~:*~%  ~S~]"
@@ -1753,54 +1758,6 @@
             (frob main))))))
 
   (values))
-
-;;; This is called by locall-analyze-fun-1 after it convers a call to
-;;; FUN into a local call.
-;;; Presumably, the function can be no longer reused by new calls to
-;;; FUN, so the whole thing has to be removed from *FREE-FUNS*
-(defun note-local-functional (fun)
-  (declare (type functional fun))
-  (when (and (leaf-has-source-name-p fun)
-             (eq (leaf-source-name fun) (functional-debug-name fun)))
-    (let* ((name (leaf-source-name fun))
-           (defined-fun (gethash name *free-funs*)))
-      (when (defined-fun-p defined-fun)
-        (remhash name *free-funs*)))))
-
-;;; Return functional for DEFINED-FUN which has been converted in policy
-;;; corresponding to the current one, or NIL if no such functional exists.
-;;;
-;;; Also check that the parent of the functional is visible in the current
-;;; environment and is in the current component.
-(defun defined-fun-functional (defined-fun)
-  (let ((functionals (defined-fun-functionals defined-fun)))
-    (when functionals
-      (let* ((sample (car functionals))
-             (there (lambda-parent (if (lambda-p sample)
-                                       sample
-                                       (optional-dispatch-main-entry sample)))))
-        (when there
-          (labels ((lookup (here)
-                     (unless (eq here there)
-                       (if here
-                           (lookup (lambda-parent here))
-                           ;; We looked up all the way up, and didn't find the parent
-                           ;; of the functional -- therefore it is nested in a lambda
-                           ;; we don't see, so return nil.
-                           (return-from defined-fun-functional nil)))))
-            (lookup (lexenv-lambda *lexenv*)))))
-      ;; Now find a functional whose policy matches the current one, if we already
-      ;; have one.
-      (let ((policy (lexenv-%policy *lexenv*)))
-        (dolist (functional functionals)
-          (when (and (not (memq (functional-kind functional) '(:deleted :zombie)))
-                     (policy= policy (lexenv-%policy (functional-lexenv functional)))
-                     ;; Is it in the same component
-                     (let ((home-lambda (lambda-home (main-entry functional))))
-                       (and (not (memq (functional-kind home-lambda) '(:deleted :zombie)))
-                            (eq (lambda-component home-lambda)
-                                *current-component*))))
-            (return functional)))))))
 
 ;;; Do stuff to delete the semantic attachments of a REF node. When
 ;;; this leaves zero or one reference, we do a type dispatch off of
@@ -1977,10 +1934,14 @@
          (setf (basic-var-sets var)
                (delete node (basic-var-sets var)))))
       (cast
-       (flush-dest (cast-value node)))))
+       (flush-dest (cast-value node)))
+      (enclose)
+      (no-op)))
 
   (remove-from-dfo block)
   (values))
+
+(declaim (end-block))
 
 ;;; Do stuff to indicate that the return node NODE is being deleted.
 (defun delete-return (node)
@@ -1999,19 +1960,17 @@
 ;;; declared IGNORE, then complain.
 (defun note-unreferenced-vars (vars policy)
   (dolist (var vars)
-    (unless (or (leaf-ever-used var)
-                (lambda-var-ignorep var))
+    (unless (or (eq (leaf-ever-used var) t) (lambda-var-ignorep var))
       (unless (policy policy (= inhibit-warnings 3))
         ;; ANSI section "3.2.5 Exceptional Situations in the Compiler"
         ;; requires this to be no more than a STYLE-WARNING.
-        #-sb-xc-host
-        (compiler-style-warn "The variable ~S is defined but never used."
-                             (leaf-debug-name var))
         ;; There's no reason to accept this kind of equivocation
         ;; when compiling our own code, though.
-        #+sb-xc-host
-        (warn "The variable ~S is defined but never used."
-              (leaf-debug-name var)))
+        (#-sb-xc-host compiler-style-warn #+sb-xc-host warn
+         (if (eq (leaf-ever-used var) 'set)
+             "The variable ~S is assigned but never read."
+             "The variable ~S is defined but never used.")
+         (leaf-debug-name var)))
       (setf (leaf-ever-used var) t)))) ; to avoid repeated warnings? -- WHN
 
 (defun note-unreferenced-fun-vars (fun)
@@ -2019,6 +1978,22 @@
   (let ((*compiler-error-context* (lambda-bind fun)))
     (note-unreferenced-vars (lambda-vars fun)
                             *compiler-error-context*))
+  (values))
+
+;;; Note that something interesting has happened to VAR.
+(defun reoptimize-lambda-var (var)
+  (declare (type lambda-var var))
+  (let ((fun (lambda-var-home var)))
+    ;; We only deal with LET variables, marking the corresponding
+    ;; initial value arg as needing to be reoptimized.
+    (when (and (eq (functional-kind fun) :let)
+               (leaf-refs var))
+      (do ((args (basic-combination-args
+                  (lvar-dest (node-lvar (first (leaf-refs fun)))))
+                 (cdr args))
+           (vars (lambda-vars fun) (cdr vars)))
+          ((eq (car vars) var)
+           (reoptimize-lvar (car args))))))
   (values))
 
 ;;; Return true if we can find OBJ in FORM, NIL otherwise. We bound
@@ -2089,7 +2064,8 @@
                                   (let ((pkg (cl:symbol-package first)))
                                     (and pkg (neq pkg *keyword-package*))))
                               (not (member first '(t nil)))
-                              (not (cl:typep first '(or fixnum character)))
+                              (not (cl:typep first '(or fixnum character
+                                                     #+64-bit single-float)))
                               (every (lambda (x)
                                        (present-in-form first x 0))
                                      (source-path-forms path))
@@ -2323,6 +2299,19 @@ is :ANY, the function name is not checked."
   (unlink-node combination)
   (values))
 
+(defun replace-combination-with-constant (constant combination)
+  (with-ir1-environment-from-node combination
+    (let* ((lvar (node-lvar combination))
+           (prev (node-prev combination))
+           (intermediate-ctran (make-ctran)))
+      (%delete-lvar-use combination)
+      (setf (ctran-next prev) nil)
+      (setf (node-prev combination) nil)
+      (reference-constant prev intermediate-ctran lvar constant)
+      (link-node-to-previous-ctran combination intermediate-ctran)
+      (reoptimize-lvar lvar)
+      (flush-combination combination))))
+
 
 ;;;; leaf hackery
 
@@ -2365,105 +2354,153 @@ is :ANY, the function name is not checked."
   (values))
 
 ;;; Return a LEAF which represents the specified constant object. If
-;;; the object is not in *CONSTANTS*, then we create a new constant
-;;; LEAF and enter it. If we are producing a fasl file, make sure that
+;;; the object is not in (CONSTANTS *IR1-NAMESPACE*), then we create a new
+;;; constant LEAF and enter it. If we are producing a fasl file, make sure that
 ;;; MAKE-LOAD-FORM gets used on any parts of the constant that it
 ;;; needs to be.
 ;;;
 ;;; We are allowed to coalesce things like EQUAL strings and bit-vectors
 ;;; when file-compiling, but not when using COMPILE.
-(defun find-constant (object &optional (name nil namep))
+;;; FIXME:
+;;;  - EQUAL (the comparator in the similarity hash-table) is both too strict
+;;;    and not strict enough. Too strict because it won't compare simple-vector;
+;;;    not strict enough because base-string and character-string can't coalesce.
+;;;    We deal with this fine, but a real SIMILAR kind of hash-table would be nice.
+;;;  - arrays other than the handled kinds can be similar.
+;;;
+;;; If SYMBOL is supplied, then we will never try to match OBJECT against
+;;; a constant already present in the FASL-OUTPUT-EQ-TABLE, but we _will_ add
+;;; items to the namespace's EQL table. The reason is extremely subtle:
+;;; * if an anonymous structure constant happens to be EQ to a named constant
+;;;   seen first, but there is no applicable make-load-form-method on the type of
+;;;   the object, we "accidentally" permit the structure lacking a load form
+;;;   to be used (as if dumped) by virtue of the fact that it sees the named constant.
+;;;   I can't imagine that the spec wants that to work as if by magic, when it sure
+;;;   seems like a user error. However, our own code relies on such in a few places:
+;;;    (1) we want to dump #<SB-KERNEL:NAMED-TYPE T> but only after seeing it referenced
+;;;        in the same file as SB-KERNEL:*UNIVERSAL-TYPE*.
+;;;        This occurs where ADD-EQUALITY-CONSTRAINTS calls FIND-CONSTANT.
+;;;    (2) src/code/aprof would get an error
+;;;            "don't know how to dump R13 (default MAKE-LOAD-FORM method called)."
+;;;        in the LIST IR2-converter for
+;;;            (load-time-value `((xor :qword ,p-a-flag ,(get-gpr :qword rbp-offset)) ...))
+;;;        where P-A-FLAG is
+;;;            (defconstant-eqx p-a-flag `(ea 40 ,(get-gpr :qword ...)))
+;;;        But it somehow loses the fact that p-a-flag was a defconstant.
+;;;
+;;; * if within the same file we are willing to coalesce a named constant and
+;;;   unnamed constant (where the unnamed was dumped first), but in a different file
+;;;   we did not see a use of a similar unnamed constant, and went directly to
+;;;   SYMBOL-GLOBAL-VALUE, then two functions which reference the same globally named
+;;;   constant C might end up seeing two different versions of the load-time constant -
+;;;   one whose load-time producing form is `(SYMBOL-VALUE ,C) and one whose
+;;;   producing form is whatever else it was.
+;;;   This would matter only if at load-time, the form which produced C assigns
+;;;   some completely different (not EQ and maybe not even similar) to the symbol.
+;;;   But some weird behavior was definitely observable in user code.
+
+(defun find-constant (object &optional name
+                             &aux (namespace (if (boundp '*ir1-namespace*) *ir1-namespace*))
+                                  (output *compile-object*))
+
   ;; Pick off some objects that aren't actually constants in user code.
   ;; These things appear as literals in forms such as `(%POP-VALUES ,x)
   ;; acting as a magic mechanism for passing data along.
   (when (opaque-box-p object) ; quote an object without examining it
-    (return-from find-constant (make-constant (opaque-box-value object))))
-  (when (typep object '(or lvar nlx-info restart-location))
-    ;; implicitly opaque-boxed
-    (return-from find-constant (make-constant object)))
-  ;; Note that we haven't picked off LAYOUT yet for two reasons:
-  ;;  1. layouts go in the hash-table so that a code component references
-  ;;     any given layout at most once
-  ;;  2. STANDARD-OBJECT layouts use MAKE-LOAD-FORM
-  (let ((faslp (producing-fasl-file)))
-    (labels ((core-coalesce-p (x)
-               ;; True for things which retain their identity under EQUAL,
-               ;; so we can safely share the same CONSTANT leaf between
-               ;; multiple references.
-               (typep x '(or symbol number character instance)))
-             (cons-coalesce-p (x)
-               (if (eq +code-coverage-unmarked+ (cdr x))
-                   ;; These are already coalesced, and the CAR should
-                   ;; always be OK, so no need to check.
-                   t
-                   (when (coalesce-tree-p x)
-                     (labels ((descend (x)
-                                (do ((y x (cdr y)))
-                                    ((atom y) (atom-colesce-p y))
-                                  ;; Don't just call file-coalesce-p, because it'll
-                                  ;; invoke COALESCE-TREE-P repeatedly
-                                  (let ((car (car y)))
-                                    (unless (if (consp car)
-                                                (descend car)
-                                                (atom-colesce-p car))
-                                      (return nil))))))
-                       (descend x)))))
-             (atom-colesce-p (x)
-               (or (core-coalesce-p x)
-                   ;; We *could* coalesce base-strings as well,
-                   ;; but we'd need a separate hash-table for
-                   ;; that, since we are not allowed to coalesce
-                   ;; base-strings with non-base-strings.
-                   (typep x
-                          '(or bit-vector
-                            ;; in the cross-compiler, we coalesce
-                            ;; all strings with the same contents,
-                            ;; because we will end up dumping them
-                            ;; as base-strings anyway.  In the
-                            ;; real compiler, we're not allowed to
-                            ;; coalesce regardless of string
-                            ;; specialized element type, so we
-                            ;; KLUDGE by coalescing only character
-                            ;; strings (the common case) and
-                            ;; punting on the other types.
-                            #+sb-xc-host
-                            string
-                            #-sb-xc-host
-                            (vector character)))))
-             (file-coalesce-p (x)
-               ;; CLHS 3.2.4.2.2: We are also allowed to coalesce various
-               ;; other things when file-compiling.
-               (if (consp x)
-                   (cons-coalesce-p x)
-                   (atom-colesce-p x))))
-      ;; When compiling to core we don't coalesce strings, because
-      ;;  "The functions eval and compile are required to ensure that literal objects
-      ;;   referenced within the resulting interpreted or compiled code objects are
-      ;;   the _same_ as the corresponding objects in the source code."
-      ;; but in a dumped image, if gc_coalesce_string_literals is 1 then GC will
-      ;; coalesce similar immutable strings to save memory,
-      ;; even if not technically permitted. According to CLHS 3.7.1
-      ;;  "The consequences are undefined if literal objects are destructively modified
-      ;;   For this purpose, the following operations are considered destructive:
-      ;;   array - Storing a new value into some element of the array ..."
-      ;; so a string, once used as a literal in source, becomes logically immutable.
-      #-sb-xc-host
-      (when (and (not faslp) (simple-string-p object))
-        (logically-readonlyize object nil))
-      (let ((hashp (and (boundp '*constants*)
-                        (if faslp
-                            (file-coalesce-p object)
-                            (core-coalesce-p object)))))
-        (awhen (and hashp (gethash object *constants*))
-          (return-from find-constant it))
-        (when (and faslp (not (sb-fasl:dumpable-layout-p object)))
-          (if namep
-              (maybe-emit-make-load-forms object name)
-              (maybe-emit-make-load-forms object)))
-        (let ((new (make-constant object)))
-          (when hashp
-            (setf (gethash object *constants*) new))
-          new)))))
+    (return-from find-constant
+      (make-constant (opaque-box-value object) *universal-type*)))
+
+  (when (or (core-object-p output)
+            ;; Git rev eded4f76 added an assertion that a named non-fixnum is referenced
+            ;; via its name at (defconstant +share-me-4+ (* 2 most-positive-fixnum))
+            ;; I'm not sure that test makes any sense, but whatever...
+            (if name
+                (sb-xc:typep object '(or fixnum character symbol))
+                (sb-xc:typep object '(or number character symbol))))
+    ;;  "The consequences are undefined if literal objects are destructively modified
+    ;;   For this purpose, the following operations are considered destructive:
+    ;;   array - Storing a new value into some element of the array ..."
+    ;; so a string, once used as a literal in source, becomes logically immutable.
+    (when (and (core-object-p output) (sb-xc:typep object '(simple-array * (*))))
+      #-sb-xc-host (logically-readonlyize object nil))
+    ;;  "The functions eval and compile are required to ensure that literal objects
+    ;;   referenced within the resulting interpreted or compiled code objects are
+    ;;   the _same_ as the corresponding objects in the source code.
+    ;;   ...
+    ;;   The constraints on literal objects described in this section apply only to
+    ;;   compile-file; eval and compile do not copy or coalesce constants."
+    ;;   (http://www.lispworks.com/documentation/HyperSpec/Body/03_bd.htm)
+    ;; The preceding notwithstanding, numbers are always freely copyable and coaelescible.
+    (return-from find-constant
+      (if namespace
+          (values (ensure-gethash object (eql-constants namespace) (make-constant object)))
+          (make-constant object))))
+
+  ;; From here down, we're dealing only with COMPILE-FILE and a constant
+  ;; whose type is (not (or number character symbol)).
+  ;; CLHS 3.2.4.2.2: We are allowed to coalesce by similarity when file-compiling.
+  ;; But this logic is incomplete, lacking PACKAGE, RANDOM-STATE, SIMPLE-VECTOR,
+  ;; HASH-TABLE, and PATHNAME, and all arrays of rank other than 1.
+  ;; SIMPLE-VECTOR, PATHNAME, and possibly RANDOM-STATE, could be worthwhile to handle.
+  (labels ((cons-coalesce-p (x)
+             (when (coalesce-tree-p x)
+               (labels ((descend (x)
+                          (do ((y x (cdr y)))
+                              ((atom y) (atom-colesce-p y))
+                            ;; Don't just call file-coalesce-p, because it'll
+                            ;; invoke COALESCE-TREE-P repeatedly
+                            (let ((car (car y)))
+                              (unless (if (consp car)
+                                          (descend car)
+                                        (atom-colesce-p car))
+                                (return nil))))))
+                 (descend x))))
+           (atom-colesce-p (x)
+             (sb-xc:typep x '(or (unboxed-array (*)) number symbol instance character))))
+    (let ((coalescep
+           ;; When COALESCEP is true, the similarity table is "useful" for this object,
+           ;; and that also implies that the object is not circular.
+           (if (consp object)
+               (cons-coalesce-p object)
+               ;; Coalescing of SYMBOL, INSTANCE, CHARACTER is not useful - if OBJECT is
+               ;; one of those, it would only be findable in the EQL table.
+               ;; However, a coalescible objects with subparts may contain those.
+               (sb-xc:typep object '(or (unboxed-array (*)) number)))))
+
+      ;; If the constant is named, always look in the named-constants table first.
+      ;; This ensure that there is no chance of referring to the constant at load-time
+      ;; through an access path other than `(SYMBOL-GLOBAL-VALUE ,name).
+      ;; Additionally, replace any unnamed constant that is similar to this one
+      ;; with the named constant. (THIS IS VERY SUSPICIOUS)
+      (when name
+        (return-from find-constant
+          (or (gethash name (named-constants namespace))
+              (let ((new (make-constant object (ctype-of object) name)))
+                (setf (gethash name (named-constants namespace)) new)
+                ;; If there was no EQL constant, or an unnamed one, add NEW
+                (let ((old (gethash object (eql-constants namespace))))
+                  (when (or (not old) (eq (leaf-%source-name old) '.anonymous.))
+                    (setf (gethash object (eql-constants namespace)) new)))
+                ;; Same for SIMILAR table, if coalescible
+                (when coalescep
+                  (let ((old (get-similar object (similar-constants namespace))))
+                    (when (or (not old) (eq (leaf-%source-name old) '.anonymous.))
+                      (setf (get-similar object (similar-constants namespace)) new))))
+                new))))
+
+      ;; Has the identical object or a similar object been seen before?
+      (let ((found (or (gethash object (eql-constants namespace))
+                       (and coalescep
+                            (get-similar object (similar-constants namespace))))))
+        (when found
+          (return-from find-constant found)))
+
+      (ensure-externalizable object)
+      (let ((new (make-constant object)))
+        (setf (gethash object (eql-constants namespace)) new)
+        (when coalescep
+          (setf (get-similar object (similar-constants namespace)) new))
+        new))))
 
 ;;; Return true if X and Y are lvars whose only use is a
 ;;; reference to the same leaf, and the value of the leaf cannot
@@ -2653,36 +2690,33 @@ is :ANY, the function name is not checked."
   (aver (eq (basic-combination-kind call) :local))
   (ref-leaf (lvar-uses (basic-combination-fun call))))
 
-(defvar *inline-expansion-limit* 200
-  "an upper limit on the number of inline function calls that will be expanded
-   in any given code object (single function or block compilation)")
+(defun register-inline-expansion (leaf call)
+  (let* ((name (leaf-%source-name leaf))
+         (calls (basic-combination-inline-expansions call))
+         (recursive (memq name calls)))
+    (cond (recursive
+           (incf (cadr recursive))
+           calls)
+          (t
+           (list* name 1 calls)))))
 
 ;;; Check whether NODE's component has exceeded its inline expansion
 ;;; limit, and warn if so, returning NIL.
-(defun inline-expansion-ok (node)
-  (let ((expanded (incf (component-inline-expansions
-                         (block-component
-                          (node-block node))))))
-    (cond ((> expanded *inline-expansion-limit*) nil)
+(defun inline-expansion-ok (combination leaf)
+  (let* ((name (leaf-%source-name leaf))
+         (expansions (memq name
+                           (basic-combination-inline-expansions combination)))
+         (expanded (cadr expansions)))
+    (cond ((not expanded))
+          ((> expanded *inline-expansion-limit*) nil)
           ((= expanded *inline-expansion-limit*)
-           ;; FIXME: If the objective is to stop the recursive
-           ;; expansion of inline functions, wouldn't it be more
-           ;; correct to look back through surrounding expansions
-           ;; (which are, I think, stored in the *CURRENT-PATH*, and
-           ;; possibly stored elsewhere too) and suppress expansion
-           ;; and print this warning when the function being proposed
-           ;; for inline expansion is found there? (I don't like the
-           ;; arbitrary numerical limit in principle, and I think
-           ;; it'll be a nuisance in practice if we ever want the
-           ;; compiler to be able to use WITH-COMPILATION-UNIT on
-           ;; arbitrarily huge blocks of code. -- WHN)
-           (let ((*compiler-error-context* node))
-             (compiler-notify "*INLINE-EXPANSION-LIMIT* (~W) was exceeded, ~
-                               probably trying to~%  ~
-                               inline a recursive function."
-                              *inline-expansion-limit*))
+           (let ((*compiler-error-context* combination))
+             (compiler-notify "*INLINE-EXPANSION-LIMIT* (~W) was exceeded ~
+                               while inlining ~s"
+                              *inline-expansion-limit* name))
+           (incf (cadr expansions))
            nil)
-          (t t))))
+          (t))))
 
 ;;; Make sure that FUNCTIONAL is not let-converted or deleted.
 (defun assure-functional-live-p (functional)
@@ -2729,28 +2763,18 @@ is :ANY, the function name is not checked."
 
 ;;; Apply a function to some arguments, returning a list of the values
 ;;; resulting of the evaluation. If an error is signalled during the
-;;; application, then we produce a warning message using WARN-FUN and
-;;; return NIL as our second value to indicate this. NODE is used as
-;;; the error context for any error message, and CONTEXT is a string
-;;; that is spliced into the warning.
-(declaim (ftype (sfunction ((or symbol function) list node function string)
-                          (values list boolean))
+;;; application, then return the condition and NIL as the
+;;; second value.
+(declaim (ftype (sfunction ((or symbol function) list)
+                          (values t boolean))
                 careful-call))
-(defun careful-call (function args node warn-fun context)
-  (declare (ignorable node warn-fun context))
-  ;; When cross-compiling, being "careful" is the wrong thing - our code should
-  ;; not allowed malformed or out-of-order definitions to proceed as if all is well.
-  #+sb-xc-host
-  (values (multiple-value-list (apply function args)) t)
-  #-sb-xc-host
-  (values
-   (multiple-value-list
-    (handler-case (apply function args)
-      (error (condition)
-        (let ((*compiler-error-context* node))
-          (funcall warn-fun "Lisp error during ~A:~%~A" context condition)
-          (return-from careful-call (values nil nil))))))
-   t))
+(defun careful-call (function args)
+  (handler-case (values (multiple-value-list (apply function args)) t)
+    ;; When cross-compiling, being "careful" is the wrong thing - our code should
+    ;; not allowed malformed or out-of-order definitions to proceed as if all is well.
+    #-sb-xc-host
+    (error (condition)
+      (values condition nil))))
 
 ;;; Variations of SPECIFIER-TYPE for parsing possibly wrong
 ;;; specifiers.
@@ -2991,7 +3015,7 @@ is :ANY, the function name is not checked."
 
 ;;; If the dest is a LET variable use the variable refs.
 (defun map-all-lvar-dests (lvar fun)
-  (let ((dest (principal-lvar-dest lvar)))
+  (multiple-value-bind (dest lvar) (principal-lvar-dest-and-lvar lvar)
     (if (and (combination-p dest)
              (eq (combination-kind dest) :local))
         (let ((var (lvar-lambda-var lvar)))
@@ -3000,7 +3024,7 @@ is :ANY, the function name is not checked."
               (funcall fun lvar dest)
               (loop for ref in (lambda-var-refs var)
                     do (multiple-value-bind (dest lvar)
-                           (principal-lvar-dest (node-lvar ref))
+                           (principal-lvar-dest-and-lvar (node-lvar ref))
                          (funcall fun lvar dest)))))
         (funcall fun lvar dest))))
 
@@ -3071,7 +3095,11 @@ is :ANY, the function name is not checked."
           do (nsubst new old (lvar-function-designator-annotation-deps dep))
           when (lvar-p new)
           do
-          (pushnew dep (lvar-dependent-annotations new))))
+          (pushnew dep (lvar-dependent-annotations new) :test #'eq))
+    (loop for dep in (lvar-dependent-nodes old)
+          when (lvar-p new)
+          do
+          (pushnew dep (lvar-dependent-nodes new) :test #'eq)))
   (when (lvar-p new)
     (setf
      (lvar-annotations new)
@@ -3134,6 +3162,15 @@ is :ANY, the function name is not checked."
                    (values :calls constants)))))))))
 
 (defun process-lvar-modified-annotation (lvar annotation)
+  (loop for annot in (lvar-annotations lvar)
+        when (lvar-lambda-var-annotation-p annot)
+        do (let ((lambda-var (lvar-lambda-var-annotation-lambda-var annot)))
+             (when (and (lambda-var-constant lambda-var)
+                        (not (lambda-var-sets lambda-var)))
+               (warn 'sb-kernel::macro-arg-modified
+                     :fun-name (lvar-modified-annotation-caller annotation)
+                     :variable (lambda-var-original-name lambda-var))
+               (return-from process-lvar-modified-annotation))))
   (multiple-value-bind (type values) (lvar-constants lvar)
     (labels ((modifiable-p (value)
                (or (consp value)
@@ -3155,23 +3192,26 @@ is :ANY, the function name is not checked."
                    (report values)))
         t)))))
 
+(defun improper-sequence-p (annotation value)
+  (case annotation
+    (proper-list
+     (and (listp value)
+          (not (proper-list-p value))))
+    (proper-sequence
+     (and (typep value 'sequence)
+          (not (proper-sequence-p value))))
+    (proper-or-circular-list
+     (and (listp value)
+          (not (proper-or-circular-list-p value))))
+    (proper-or-dotted-list
+     (and (listp value)
+          (not (proper-or-dotted-list-p value))))))
+
 (defun process-lvar-proper-sequence-annotation (lvar annotation)
   (multiple-value-bind (type values) (lvar-constants lvar)
     (let ((kind (lvar-proper-sequence-annotation-kind annotation)))
       (labels ((bad-p (value)
-                 (case kind
-                   (proper-list
-                    (and (listp value)
-                         (not (proper-list-p value))))
-                   (proper-sequence
-                    (and (typep value 'sequence)
-                         (not (proper-sequence-p value))))
-                   (proper-or-circular-list
-                    (and (listp value)
-                         (not (proper-or-circular-list-p value))))
-                   (proper-or-dotted-list
-                    (and (listp value)
-                         (not (proper-or-dotted-list-p value))))))
+                 (improper-sequence-p kind value))
                (report (values)
                  (when (every #'bad-p values)
                    (if (singleton-p values)
@@ -3205,6 +3245,38 @@ is :ANY, the function name is not checked."
              (lvar-value lvar))
     t))
 
+(defun process-lvar-type-annotation (lvar annotation)
+  (let* ((uses (lvar-uses lvar))
+         (condition (case (lvar-type-annotation-context annotation)
+                      (:initform
+                       (if (policy (if (consp uses)
+                                       (car uses)
+                                       uses)
+                               (zerop type-check))
+                           'slot-initform-type-style-warning
+                           (return-from process-lvar-type-annotation)))
+                      (t
+                       'sb-int:type-warning)))
+         (type (lvar-type-annotation-type annotation)))
+    (cond ((not (types-equal-or-intersect (lvar-type lvar) type))
+           (%compile-time-type-error-warn annotation (type-specifier type)
+                                          (type-specifier (lvar-type lvar))
+                                          (let ((path (lvar-annotation-source-path annotation)))
+                                            (list
+                                             (if (eq (car path) 'original-source-start)
+                                                 (find-original-source path)
+                                                 (car path))))
+                                          :condition condition))
+          ((consp uses)
+           (loop for use in uses
+                 for dtype = (node-derived-type use)
+                 unless (values-types-equal-or-intersect dtype type)
+                 do (%compile-time-type-error-warn annotation
+                                                   (type-specifier type)
+                                                   (type-specifier dtype)
+                                                   (list (node-source-form use))
+                                                   :condition condition))))))
+
 (defun process-annotations (lvar)
   (unless (and (combination-p (lvar-dest lvar))
                (lvar-fun-is
@@ -3228,7 +3300,9 @@ is :ANY, the function name is not checked."
                     (lvar-function-designator-annotation
                      (check-function-designator-lvar lvar annot))
                     (lvar-function-annotation
-                     (check-function-lvar lvar annot)))
+                     (check-function-lvar lvar annot))
+                    (lvar-type-annotation
+                     (process-lvar-type-annotation lvar annot)))
               (setf (lvar-annotation-fired annot) t))))))
 
 (defun add-annotation (lvar annotation)
@@ -3247,3 +3321,44 @@ is :ANY, the function name is not checked."
                  (node-lexenv (lvar-dest lvar)))
                 *lexenv*)))
     t))
+
+;;; Return functional for DEFINED-FUN which has been converted in policy
+;;; corresponding to the current one, or NIL if no such functional exists.
+;;;
+;;; Also check that the parent of the functional is visible in the current
+;;; environment and is in the current component.
+(defun defined-fun-functional (defined-fun)
+  (let ((functionals (defined-fun-functionals defined-fun)))
+    ;; FIXME: If we are block compiling, forget about finding the
+    ;; right functional. Just pick the first one we see and hope
+    ;; people don't mix inlined functions and policy with block
+    ;; compiling. (For now)
+    (when (block-compile *compilation*)
+      (return-from defined-fun-functional (first functionals)))
+    (when functionals
+      (let* ((sample (car functionals))
+             (there (lambda-parent (if (lambda-p sample)
+                                       sample
+                                       (optional-dispatch-main-entry sample)))))
+        (when there
+          (labels ((lookup (here)
+                     (unless (eq here there)
+                       (if here
+                           (lookup (lambda-parent here))
+                           ;; We looked up all the way up, and didn't find the parent
+                           ;; of the functional -- therefore it is nested in a lambda
+                           ;; we don't see, so return nil.
+                           (return-from defined-fun-functional nil)))))
+            (lookup (lexenv-lambda *lexenv*)))))
+      ;; Now find a functional whose policy matches the current one, if we already
+      ;; have one.
+      (let ((policy (lexenv-%policy *lexenv*)))
+        (dolist (functional functionals)
+          (when (and (not (memq (functional-kind functional) '(:deleted :zombie)))
+                     (policy= policy (lexenv-%policy (functional-lexenv functional)))
+                     ;; Is it in the same component
+                     (let ((home-lambda (lambda-home (main-entry functional))))
+                       (and (not (memq (functional-kind home-lambda) '(:deleted :zombie)))
+                            (eq (lambda-component home-lambda)
+                                *current-component*))))
+            (return functional)))))))

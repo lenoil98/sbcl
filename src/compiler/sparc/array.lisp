@@ -27,9 +27,11 @@
       (inst add ndescr rank (+ (* array-dimensions-offset n-word-bytes)
                                lowtag-mask))
       (inst andn ndescr lowtag-mask)
-      (allocation header ndescr other-pointer-lowtag :temp-tn gencgc-temp)
-      (inst add ndescr rank (fixnumize (1- array-dimensions-offset)))
-      (inst sll ndescr ndescr n-widetag-bits)
+      (allocation nil ndescr other-pointer-lowtag header :temp-tn gencgc-temp)
+      ;; Compute the encoded rank. See ENCODE-ARRAY-RANK.
+      (inst sub ndescr rank (fixnumize 1))
+      (inst and ndescr ndescr (fixnumize array-rank-mask))
+      (inst sll ndescr ndescr array-rank-byte-pos)
       (inst or ndescr ndescr type)
       ;; Remove the extraneous fixnum tag bits because TYPE and RANK
       ;; were fixnums
@@ -48,17 +50,16 @@
   (:policy :fast-safe)
   (:variant array-dimensions-offset other-pointer-lowtag))
 
-(define-vop (array-rank-vop)
+(define-vop ()
   (:translate %array-rank)
   (:policy :fast-safe)
   (:args (x :scs (descriptor-reg)))
-  (:temporary (:scs (non-descriptor-reg)) temp)
-  (:results (res :scs (any-reg descriptor-reg)))
+  (:results (res :scs (unsigned-reg)))
+  (:result-types positive-fixnum)
   (:generator 6
-    (loadw temp x 0 other-pointer-lowtag)
-    (inst sra temp n-widetag-bits)
-    (inst sub temp (1- array-dimensions-offset))
-    (inst sll res temp n-fixnum-tag-bits)))
+    (inst ldub res x (- 1 other-pointer-lowtag)) ; big-endian only
+    (inst add res res 1)
+    (inst and res res array-rank-mask)))
 
 ;;;; Bounds checking routine.
 (define-vop (check-bound)

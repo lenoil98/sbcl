@@ -131,21 +131,23 @@
     (store-tl-symbol-value uwp *current-unwind-protect-block* temp)))
 
 
-(define-vop (unlink-catch-block)
+(define-vop (%catch-breakup)
+  (:args (current-block))
+  (:ignore current-block)
   (:temporary (:scs (any-reg)) block)
   #+sb-thread (:temporary (:scs (any-reg)) temp)
   (:policy :fast-safe)
-  (:translate %catch-breakup)
   (:generator 17
     (load-tl-symbol-value block *current-catch-block*)
     (loadw block block catch-block-previous-catch-slot)
     (store-tl-symbol-value block *current-catch-block* temp)))
 
-(define-vop (unlink-unwind-protect)
+(define-vop (%unwind-protect-breakup)
+  (:args (current-block))
+  (:ignore current-block)
   (:temporary (:scs (any-reg)) block)
   #+sb-thread (:temporary (:scs (any-reg)) temp)
   (:policy :fast-safe)
-  (:translate %unwind-protect-breakup)
   (:generator 17
     (load-tl-symbol-value block *current-unwind-protect-block*)
     (loadw block block unwind-block-uwp-slot)
@@ -214,12 +216,12 @@
 
 
 (define-vop (nlx-entry-multiple)
-  (:args (top :target result) (src) (count))
+  (:args (top :target result) (src) (count :target limit))
   ;; Again, no SC restrictions for the args, 'cause the loading would
   ;; happen before the entry label.
   (:info label)
   (:temporary (:scs (any-reg)) dst)
-  (:temporary (:scs (descriptor-reg)) temp)
+  (:temporary (:scs (descriptor-reg)) temp limit)
   (:results (result :scs (any-reg) :from (:argument 0))
             (num :scs (any-reg) :from (:argument 0)))
   (:save-p :force-to-stack)
@@ -227,30 +229,30 @@
   (:generator 30
     (emit-return-pc label)
     (note-this-location vop :non-local-entry)
-    (let ((loop (gen-label))
-          (done (gen-label)))
 
-      ;; Setup results, and test for the zero value case.
-      (load-stack-tn result top)
-      (inst cmpwi count 0)
-      (inst li num 0)
-      (inst beq done)
+    ;; Setup results, and test for the zero value case.
+    (load-stack-tn result top)
+    (inst cmpwi count 0)
+    (inst li num 0)
+    (inst beq done)
+    (inst slwi limit count (- word-shift n-fixnum-tag-bits))
 
-      ;; Compute dst as one slot down from result, because we inc the index
-      ;; before we use it.
-      (inst subi dst result n-word-bytes)
+    ;; Compute dst as one slot down from result, because we inc the index
+    ;; before we use it.
+    (inst subi dst result n-word-bytes)
 
-      ;; Copy stuff down the stack.
-      (emit-label loop)
-      (inst ldx temp src num)
-      (inst addi num num (fixnumize 1))
-      (inst cmpw num count)
-      (inst stdx temp dst num)
-      (inst bne loop)
+    ;; Copy stuff down the stack.
+    LOOP
+    (inst ldx temp src num)
+    (inst addi num num n-word-bytes)
+    (inst cmpw num limit)
+    (inst stdx temp dst num)
+    (inst bne loop)
 
-      ;; Reset the CSP.
-      (emit-label done)
-      (inst add csp-tn result num))))
+    ;; Reset the CSP.
+    DONE
+    (inst add csp-tn result num)
+    (inst srwi num num (- word-shift n-fixnum-tag-bits))))
 
 
 ;;; This VOP is just to force the TNs used in the cleanup onto the stack.

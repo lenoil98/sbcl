@@ -664,6 +664,12 @@ default-value-8
                      15
                      (if (eq return :unknown) 25 0))
 
+       ,@(when (eq named t)
+           '((aver (sc-is name constant))
+             ;; It has to be an fdefinition constant, not a normal IR1 constant.
+             ;; This is the best we can assert without peeking into IR2-COMPONENT-CONSTANTS.
+             (aver (not (sb-c::tn-leaf name)))))
+
        (let* ((cur-nfp (current-nfp-tn vop))
               ,@(unless (eq return :tail)
                   '((lra-label (gen-label))))
@@ -762,8 +768,7 @@ default-value-8
                      (loadw name-pass cfp-tn (tn-offset name))
                      (do-next-filler))
                     (constant
-                     (loadw name-pass code-tn (tn-offset name)
-                         other-pointer-lowtag)
+                     (loadw name-pass code-tn (tn-offset name) code-tn-lowtag)
                      (do-next-filler)))
                   ;; The step instrumenting must be done after
                   ;; FUNCTION is loaded, but before ENTRY-POINT is
@@ -776,10 +781,9 @@ default-value-8
                   ;; pointer) that the function itself be in a
                   ;; register before the raw-addr is loaded.
                   (sb-assem:without-scheduling ()
-                    (loadw function name-pass fdefn-fun-slot
-                        other-pointer-lowtag)
-                    (loadw entry-point name-pass fdefn-raw-addr-slot
-                        other-pointer-lowtag))
+                    (let ((tag (+ #-untagged-fdefns other-pointer-lowtag)))
+                      (loadw function name-pass fdefn-fun-slot tag)
+                      (loadw entry-point name-pass fdefn-raw-addr-slot tag)))
                   (do-next-filler)))
                ((nil)
                 `((sc-case arg-fun
@@ -788,8 +792,7 @@ default-value-8
                      (loadw lexenv cfp-tn (tn-offset arg-fun))
                      (do-next-filler))
                     (constant
-                     (loadw lexenv code-tn (tn-offset arg-fun)
-                         other-pointer-lowtag)
+                     (loadw lexenv code-tn (tn-offset arg-fun) code-tn-lowtag)
                      (do-next-filler)))
                   (loadw function lexenv closure-fun-slot
                       fun-pointer-lowtag)
@@ -874,7 +877,7 @@ default-value-8
         (inst addi nsp-tn cur-nfp
               (- (bytes-needed-for-non-descriptor-stack-frame)
                  number-stack-displacement))))
-    (inst lr temp (make-fixup 'tail-call-variable :assembly-routine))
+    (inst addi temp null-tn (make-fixup 'tail-call-variable :asm-routine-nil-offset))
     (inst mtlr temp)
     (inst blr)))
 
@@ -1002,7 +1005,7 @@ default-value-8
       (move old-fp old-fp-arg)
       (move vals vals-arg)
       (move nvals nvals-arg)
-      (inst lr temp (make-fixup 'return-multiple :assembly-routine))
+      (inst addi temp null-tn (make-fixup 'return-multiple :asm-routine-nil-offset))
       (inst mtlr temp)
       (inst blr))))
 
@@ -1132,7 +1135,8 @@ default-value-8
   (:translate %more-arg))
 
 ;;; Turn more arg (context, count) into a list.
-(define-vop (listify-rest-args)
+(define-vop ()
+  (:translate %listify-rest-args)
   (:args (context-arg :target context :scs (descriptor-reg))
          (count-arg :target count :scs (any-reg)))
   (:arg-types * tagged-num)
@@ -1142,7 +1146,6 @@ default-value-8
   (:temporary (:scs (non-descriptor-reg) :from :eval) dst)
   (:temporary (:sc non-descriptor-reg :offset nl3-offset) pa-flag)
   (:results (result :scs (descriptor-reg)))
-  (:translate %listify-rest-args)
   (:policy :safe)
   (:node-var node)
   (:generator 20
@@ -1158,7 +1161,7 @@ default-value-8
       (inst beq done)
 
     ;; We need to do this atomically.
-    (pseudo-atomic (pa-flag)
+    (pseudo-atomic (pa-flag :sync nil)
       ;; Allocate a cons (2 words) for each item.
       (if dx-p
           (progn
@@ -1170,7 +1173,7 @@ default-value-8
             (inst add csp-tn csp-tn temp))
           (progn
             (inst sldi temp count (1+ (- word-shift n-fixnum-tag-bits)))
-            (allocation result temp list-pointer-lowtag
+            (allocation 'list temp list-pointer-lowtag result
                         :temp-tn dst
                         :flag-tn pa-flag)
             (move dst result)))
@@ -1207,7 +1210,7 @@ default-value-8
 ;;; preventing this info from being returned as values.  What we do is
 ;;; compute (- SUPPLIED FIXED), and return a pointer that many words
 ;;; below the current stack top.
-(define-vop (more-arg-context)
+(define-vop ()
   (:policy :fast-safe)
   (:translate sb-c::%more-arg-context)
   (:args (supplied :scs (any-reg)))

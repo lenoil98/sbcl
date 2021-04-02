@@ -95,9 +95,7 @@
   (defconstant read-only-space-start #x04000000)
   (defconstant read-only-space-end   #x07ff8000)
   (defconstant static-space-start    #x08000000)
-  (defconstant static-space-end      #x097fff00
-                                     ; #+64-bit #x0c7fff00
-    )
+  (defconstant static-space-end      #x097fff00)
 
   (defconstant linkage-table-space-start #x0a000000)
   (defconstant linkage-table-space-end   #x0b000000))
@@ -106,7 +104,10 @@
 #+gencgc
 (!gencgc-space-setup #x04000000 :dynamic-space-start #x4f000000)
 
-(defconstant linkage-table-entry-size #-64-bit 8 #+64-bit 20)
+(defconstant linkage-table-entry-size #-64-bit 4 #+64-bit 8) ; N-WORD-BYTES (not defined yet)
+(defconstant linkage-table-growth-direction :down)
+(setq *linkage-space-predefined-entries* '(#+gencgc("alloc" nil)
+                                           #+gencgc("alloc_list" nil)))
 
 #+(or linux netbsd)
 (progn
@@ -143,15 +144,14 @@
 ;;; can be loaded directly out of them by indirecting relative to NIL.
 ;;;
 (defconstant-eqx +static-symbols+
- `#(,@+common-static-symbols+
-    *allocation-pointer*
-
-    *binding-stack-pointer*
-    ;; interrupt handling
-    *pseudo-atomic-atomic*
-    *pseudo-atomic-interrupted*
-
-    ,@*runtime-asm-routines*)
+ #.`#(,@+common-static-symbols+
+      *allocation-pointer*
+      #-sb-thread
+      ,@'(*binding-stack-pointer*
+          ;; interrupt handling
+          *pseudo-atomic-atomic*
+          *pseudo-atomic-interrupted*)
+      ,@*runtime-asm-routines*)
   #'equalp)
 
 (defconstant-eqx +static-fdefns+

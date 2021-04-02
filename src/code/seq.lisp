@@ -32,12 +32,12 @@
     `((count nil
              nil
              (etypecase count
-               (null (1- sb-xc:most-positive-fixnum))
+               (null (1- most-positive-fixnum))
                (fixnum (max 0 count))
                (integer (if (minusp count)
                             0
-                            (1- sb-xc:most-positive-fixnum))))
-             (mod #.sb-xc:most-positive-fixnum))
+                            (1- most-positive-fixnum))))
+             (mod #.most-positive-fixnum))
       ;; Entries for {start,end}{,1,2}
       ,@(mapcan (lambda (names)
                   (destructuring-bind (start end length sequence) names
@@ -470,7 +470,7 @@
 ;;;; SUBSEQ
 ;;;;
 
-(!define-array-dispatch vector-subseq-dispatch (array start end)
+(!define-array-dispatch :jump-table vector-subseq-dispatch (array start end)
   (declare (optimize speed (safety 0)))
   (declare (type index start end))
   (subseq array start end))
@@ -484,6 +484,12 @@
   (declare (type index start)
            (type (or null index) end)
            (optimize speed))
+  ;; This seems suboptimal in that type checking is performed in the XEP
+  ;; but we also have fallback cases in the dispatch table for catching
+  ;; all invalid widetags. Otoh, WITH-ARRAY-DATA needs to dtrt too.
+  ;; So maybe the dispatch table could dispatch to the specialization
+  ;; that handles everything needed for each widetag.
+  ;; This "outer" use of WITH-ARRAY-DATA would be removed.
   (with-array-data ((data sequence)
                     (start start)
                     (end end)
@@ -847,7 +853,7 @@
   "Destructively modifies SEQUENCE1 by copying successive elements
 into it from the SEQUENCE2.
 
-Elements are copied to the subseqeuence bounded by START1 and END1,
+Elements are copied to the subsequence bounded by START1 and END1,
 from the subsequence bounded by START2 and END2. If these subsequences
 are not of the same length, then the shorter length determines how
 many elements are copied."
@@ -952,6 +958,7 @@ many elements are copied."
       ((atom 2nd) 3rd)
     (rplacd 2nd 3rd)))
 
+(declaim (inline nreverse-word-specialized-vector))
 (defun nreverse-word-specialized-vector (vector start end)
   (do ((left-index start (1+ left-index))
        (right-index (1- end) (1- right-index)))
@@ -1239,6 +1246,9 @@ many elements are copied."
                     (progn
                       (setf (car in-apply-args) (funcall elt s state))
                       (setf (caar in-iters) (funcall step s state from-end)))))))))))))
+#-sb-devel
+(declaim (start-block map %map))
+
 (defun %map-to-list (fun sequences)
   (declare (type function fun)
            (type list sequences))
@@ -1339,6 +1349,8 @@ many elements are copied."
                :expected-type result-type
                :format-arguments (list result result-type)))))
 
+(declaim (end-block))
+
 ;;;; MAP-INTO
 
 (defmacro map-into-lambda (sequences params &body body)
@@ -1351,7 +1363,9 @@ many elements are copied."
          (apply #'%map nil #'f ,sequences)
          (loop (f)))))
 
-(!define-array-dispatch vector-map-into (data start end fun sequences)
+;;; seqtran can generate code which accesses the array of specialized
+;;; functions, so we need the array for this, not a jump table.
+(!define-array-dispatch :call vector-map-into (data start end fun sequences)
   (declare (type index start end)
            (type function fun)
            (type list sequences))
@@ -1409,17 +1423,15 @@ many elements are copied."
            (setf (car node) (apply really-fun args))
            (setf node (cdr node)))))
       (sequence
-       (multiple-value-bind (iter limit from-end)
+       (multiple-value-bind (iter limit from-end step endp elt set)
            (sb-sequence:make-sequence-iterator result-sequence)
+         (declare (ignore elt) (type function step endp set))
          (map-into-lambda sequences (&rest args)
            (declare (truly-dynamic-extent args) (optimize speed))
-           (when (sb-sequence:iterator-endp result-sequence
-                                            iter limit from-end)
+           (when (funcall endp result-sequence iter limit from-end)
              (return-from map-into result-sequence))
-           (setf (sb-sequence:iterator-element result-sequence iter)
-                 (apply really-fun args))
-           (setf iter (sb-sequence:iterator-step result-sequence
-                                                           iter from-end)))))))
+           (funcall set (apply really-fun args) result-sequence iter)
+           (setf iter (funcall step result-sequence iter from-end)))))))
   result-sequence)
 
 ;;;; REDUCE

@@ -27,7 +27,6 @@ if [ -n "$SBCL_HOST_LOCATION" ]; then
     echo //copying host-1 output files to target
     rsync -a "$SBCL_HOST_LOCATION/output/" output/
     rsync -a "$SBCL_HOST_LOCATION/src/runtime/genesis" src/runtime
-    rsync -a "$SBCL_HOST_LOCATION/src/runtime/ldso-stubs.S" src/runtime/
 fi
 
 # Build the runtime system and symbol table (.nm) file.
@@ -38,13 +37,12 @@ fi
 # could come either before or after running the cross compiler; that
 # doesn't matter.)
 #
-# Note that the latter requirement does not apply to sb-dynamic-core
+# Note that the latter requirement does not apply to :linkage-table
 # builds, since the cross compiler does not depend on symbol tables in
 # that case.  Only because sbcl.nm is convenient for debugging purposes
 # is its generation left enabled even for those builds.
 echo //building runtime system and symbol table file
 
-# The clean is needed for Darwin's readonlyspace hack.
 $GNUMAKE -C src/runtime clean
 # $GNUMAKE -C src/runtime depend
 $GNUMAKE $SBCL_MAKE_JOBS -C src/runtime all

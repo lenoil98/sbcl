@@ -514,8 +514,10 @@
 (with-test (:name (:integer-division-using-multiplication :correctness))
   (let ((*random-state* (make-random-state t)))
     (dolist (dividend-type `((unsigned-byte ,sb-vm:n-word-bits)
+                             (signed-byte ,sb-vm:n-word-bits)
                              (and fixnum unsigned-byte)
-                             (integer 10000 10100)))
+                             (integer 10000 10100)
+                             fixnum))
       (dolist (divisor `(;; Some special cases from the paper
                          7 10 14 641 274177
                          ;; Range extremes
@@ -527,7 +529,9 @@
                                  for r = (random (expt 2 i))
                                  ;; We don't want 0, 1 and powers of 2.
                                  when (not (zerop (logand r (1- r))))
-                                 collect r)))
+                                 collect r
+                                 and
+                                 collect (- r))))
         (dolist (fun '(truncate ceiling floor mod rem))
           (let ((foo (checked-compile
                       `(lambda (x)
@@ -544,7 +548,8 @@
                                 ,@(loop for i from 4 to sb-vm:n-word-bits
                                         for pow = (expt 2 (1- i))
                                         for r = (+ pow (random pow))
-                                        collect r)))
+                                        collect r
+                                        collect (- r))))
               (when (typep dividend dividend-type)
                 (multiple-value-bind (q1 r1)
                     (funcall foo dividend)
@@ -826,3 +831,49 @@
   ;; ensure no funny business with constant sharing so that we're forced
   ;; to do the most general form or EQL on two (complex rational)s
   (eql (read-from-string "#c(1/2 1/3)") (read-from-string "#c(1/2 1/3)")))
+
+(with-test (:name :gcd-derive-type)
+  (checked-compile-and-assert
+   ()
+   '(lambda (a)
+     (declare (type (integer -142 -29) a))
+     (eql (gcd (setq a -29) a) 1))
+   ((-33) nil)))
+
+;;; Test that LOGIOR and LOGXOR on PPC64 can correctly perform the constant 2nd-arg
+;;; vop variant on a 32-bit immediate using op + op-shifted instructions.
+;;; (Probably we should refactor large parts of the test suite by the CPU
+;;; architecture so that you can really see clearly the areas of concern
+;;; for each backend, but I'm not about to embark on that now)
+(with-test (:name :ppc64-logxor-32-bit-const)
+  (let ((f (compile nil
+                    '(lambda (x)
+                      (declare (fixnum x))
+                      ;; The asm code went wrong only if the result was not in the same
+                      ;; register as the source, so make sure that X is live throughout
+                      ;; the test so that each result is in a different register.
+                      (let ((a (logxor x #x9516A7))
+                            (b (logior x #x2531b4))
+                            (c (ash x -1)))
+                        (list a b c x))))))
+    (let ((result (funcall f 0)))
+      (assert (equal result
+                     '(#x9516A7 #x2531b4 0 0))))))
+
+(with-test (:name :truncate-by-zero-derivation)
+  (assert
+   (not (equal (cadr
+                (cdaddr (sb-kernel:%simple-fun-type
+                         (checked-compile
+                          `(lambda ()
+                             (truncate 5 0))
+                          :allow-style-warnings t))))
+               '(integer 0 0)))))
+
+(with-test (:name :truncate-by-zero-derivation.2)
+  (checked-compile
+   `(lambda (x y)
+      (declare (type (unsigned-byte 8) x y)
+               (optimize speed (safety 0)))
+      (mod x y))
+   :allow-notes nil))

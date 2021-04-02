@@ -43,14 +43,15 @@
              (let* ((dx-p (node-stack-allocate-p node))
                     (cons-cells (if star (1- num) num))
                     (alloc (* (pad-data-block cons-size) cons-cells)))
-               (pseudo-atomic (pa-flag)
+               (pseudo-atomic (pa-flag :sync nil)
                  (if dx-p
                      (progn
                        (align-csp res)
                        (inst clrrwi res csp-tn n-lowtag-bits)
                        (inst ori res res list-pointer-lowtag)
                        (inst addi csp-tn csp-tn alloc))
-                     (allocation res alloc list-pointer-lowtag :temp-tn alloc-temp
+                     (allocation 'list alloc list-pointer-lowtag res
+                                 :temp-tn alloc-temp
                                  :flag-tn pa-flag))
                  (move ptr res)
                  (dotimes (i (1- cons-cells))
@@ -87,7 +88,7 @@
   (:translate make-fdefn)
   (:generator 37
     (with-fixed-allocation (result pa-flag temp fdefn-widetag fdefn-size)
-      (inst lr temp (make-fixup 'undefined-tramp :assembly-routine))
+      (load-asm-rtn-addr temp 'undefined-tramp)
       (storew name result fdefn-name-slot other-pointer-lowtag)
       (storew null-tn result fdefn-fun-slot other-pointer-lowtag)
       (storew temp result fdefn-raw-addr-slot other-pointer-lowtag))))
@@ -111,8 +112,8 @@
               (inst ori result result fun-pointer-lowtag)
               (inst lr temp (logior (ash (1- size) n-widetag-bits) closure-widetag)))
             (progn
-              (allocation result (pad-data-block size)
-                          fun-pointer-lowtag :temp-tn temp :flag-tn pa-flag)
+              (allocation nil (pad-data-block size) fun-pointer-lowtag result
+                          :temp-tn temp :flag-tn pa-flag)
               (inst lr temp (logior (ash (1- size) n-widetag-bits) closure-widetag))))
         (storew temp result 0 fun-pointer-lowtag)
         (storew function result closure-fun-slot fun-pointer-lowtag)))))
@@ -144,7 +145,7 @@
   (:args)
   (:results (result :scs (any-reg)))
   (:generator 1
-    (inst lr result (make-fixup 'funcallable-instance-tramp :assembly-routine))))
+    (load-asm-rtn-addr result 'funcallable-instance-tramp)))
 
 (define-vop (fixed-alloc)
   (:args)
@@ -162,8 +163,8 @@
 (define-vop (var-alloc)
   (:args (extra :scs (any-reg)))
   (:arg-types positive-fixnum)
-  (:info name words type lowtag)
-  (:ignore name)
+  (:info name words type lowtag stack-allocate-p)
+  (:ignore name stack-allocate-p)
   (:results (result :scs (descriptor-reg)))
   (:temporary (:scs (any-reg)) bytes)
   (:temporary (:scs (non-descriptor-reg)) header)
@@ -171,14 +172,14 @@
   (:temporary (:sc non-descriptor-reg :offset nl3-offset) pa-flag)
   (:generator 6
     (inst addi bytes extra (* (1+ words) n-word-bytes))
-    (inst slwi header bytes (- n-widetag-bits n-fixnum-tag-bits))
+    (inst slwi header bytes (- (length-field-shift type) n-fixnum-tag-bits))
     ;; The specified EXTRA value is the exact value placed in the header
     ;; as the word count when allocating code.
     (cond ((= type code-header-widetag)
            (inst addi header header type))
           (t
-           (inst addi header header (+ (ash -2 n-widetag-bits) type))
+           (inst addi header header (+ (ash -2 (length-field-shift type)) type))
            (inst clrrwi bytes bytes n-lowtag-bits)))
     (pseudo-atomic (pa-flag)
-      (allocation result bytes lowtag :temp-tn temp :flag-tn pa-flag)
+      (allocation nil bytes lowtag result :temp-tn temp :flag-tn pa-flag)
       (storew header result 0 lowtag))))

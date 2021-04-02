@@ -33,7 +33,8 @@
      (:temp loop-index unsigned-reg r9-offset))
 
   ;; Pick off the cases where everything fits in register args.
-  (inst jrcxz ZERO-VALUES)
+  (inst test rcx rcx)
+  (inst jmp :z ZERO-VALUES)
   (inst cmp rcx (fixnumize 1))
   (inst jmp :e ONE-VALUE)
   (inst cmp rcx (fixnumize 2))
@@ -236,7 +237,7 @@
   (inst jmp :nz not-callable)
   (inst cmp :byte (ea (- other-pointer-lowtag) fun) symbol-widetag)
   (inst jmp :ne not-callable)
-  (load-symbol-info-vector vector fun r11-tn)
+  (load-symbol-info-vector vector fun)
   ;; info-vector-fdefn
   (inst cmp vector nil-value)
   (inst jmp :e undefined)
@@ -247,17 +248,10 @@
   (inst jmp :b undefined)
 
   (loadw length vector 1 other-pointer-lowtag)
-  (inst mov fun (ea (- 8 other-pointer-lowtag) vector length 4))
+  (inst mov fun (ea (- 8 other-pointer-lowtag) vector length
+                    (ash 1 (- word-shift n-fixnum-tag-bits))))
 
-  (let ((fdefn-raw-addr
-          (ea (- (* fdefn-raw-addr-slot n-word-bytes) other-pointer-lowtag)
-              fun)))
-    #+immobile-code
-    (progn
-      (inst lea vector fdefn-raw-addr)
-      (inst jmp vector))
-    #-immobile-code
-    (inst jmp fdefn-raw-addr))
+  (inst jmp (ea (- (* fdefn-raw-addr-slot n-word-bytes) other-pointer-lowtag) fun))
   UNDEFINED
   (inst jmp (make-fixup 'undefined-tramp :assembly-routine))
   NOT-CALLABLE
@@ -296,7 +290,7 @@
     (inst test catch catch)             ; check for NULL pointer
     (inst jmp :z error))
 
-  (inst cmp target (make-ea-for-object-slot catch catch-block-tag-slot 0))
+  (inst cmp target (object-slot-ea catch catch-block-tag-slot 0))
   (inst jmp :e EXIT)
 
   (loadw catch catch catch-block-previous-catch-slot)
@@ -309,11 +303,17 @@
   ;; the :return-style to :none because that also affects the call sequence.
   (inst jmp (make-fixup 'unwind :assembly-routine)))
 
-;;;; non-local exit noise
+;;; Simply return and enter the loop in UNWIND instead of calling
+;;; UNWIND directly
+(define-vop ()
+  (:translate %continue-unwind)
+  (:policy :fast-safe)
+  (:generator 0
+    (inst ret)))
 
 (define-assembly-routine (unwind
                           (:return-style :none)
-                          (:translate %continue-unwind)
+                          (:translate %unwind)
                           (:policy :fast-safe))
                          ((:arg block (any-reg descriptor-reg) rax-offset)
                           (:arg start (any-reg descriptor-reg) rbx-offset)
@@ -324,8 +324,7 @@
                           (:temp symbol unsigned-reg r9-offset)
                           (:temp value unsigned-reg r10-offset)
                           (:temp zero complex-double-reg float0-offset))
-  (declare (ignore start count))
-
+  AGAIN
   (let ((error (generate-error-code nil 'invalid-unwind-error)))
     (inst test block block)             ; check for NULL pointer
     (inst jmp :z error))
@@ -335,39 +334,50 @@
   ;; Does *CURRENT-UNWIND-PROTECT-BLOCK* match the value stored in
   ;; argument's CURRENT-UWP-SLOT?
   (inst cmp uwp
-        (make-ea-for-object-slot block unwind-block-uwp-slot 0))
-  ;; If a match, return to conitext in arg block.
+        (object-slot-ea block unwind-block-uwp-slot 0))
+  ;; If a match, return to context in arg block.
   (inst jmp :e DO-EXIT)
 
   ;; Not a match - return to *CURRENT-UNWIND-PROTECT-BLOCK* context.
-  ;; Important! Must save (and return) the arg 'block' for later use!!
-  (move rdx-tn block)
-  (move block uwp)
-  ;; Set next unwind protect context.
-  (loadw uwp uwp unwind-block-uwp-slot)
-
-  DO-EXIT
+  (inst push block)
+  (inst push start)
+  (inst push count)
 
   ;; Need to perform unbinding before unlinking the UWP so that if
   ;; interrupted here it can still run the clean up form. While the
   ;; cleanup form itself cannot be protected from interrupts (can't
   ;; run it twice) one of the variables being unbound can be
   ;; *interrupts-enabled*
-  (loadw where block unwind-block-bsp-slot)
+  (loadw where uwp unwind-block-bsp-slot)
   (unbind-to-here where symbol value temp-reg-tn zero)
 
-  (store-tl-symbol-value uwp *current-unwind-protect-block*)
+  ;; Set next unwind protect context.
+  (loadw block uwp unwind-block-uwp-slot)
+  (store-tl-symbol-value block *current-unwind-protect-block*)
+
+  (loadw rbp-tn uwp unwind-block-cfp-slot)
+
+  (loadw block uwp unwind-block-current-catch-slot)
+  (store-tl-symbol-value block *current-catch-block*)
+
+  ;; Go to uwp-entry, it can fetch the pushed above values if it needs
+  ;; to.
+  (inst call (ea (* unwind-block-entry-pc-slot n-word-bytes) uwp))
+  (inst pop count)
+  (inst pop start)
+  (inst pop block)
+  (inst jmp AGAIN)
+
+  DO-EXIT
+  (loadw where block unwind-block-bsp-slot)
+  (unbind-to-here where symbol value temp-reg-tn zero)
 
   (loadw rbp-tn block unwind-block-cfp-slot)
 
   (loadw uwp block unwind-block-current-catch-slot)
   (store-tl-symbol-value uwp *current-catch-block*)
 
-
-  ;; Uwp-entry expects some things in known locations so that they can
-  ;; be saved on the stack: the block in rdx-tn, start in rbx-tn, and
-  ;; count in rcx-tn.
-
+  ;; nlx-entry expects start in RBX and count in RCX
   (inst jmp (ea (* unwind-block-entry-pc-slot n-word-bytes) block)))
 
 #+sb-assembling
@@ -378,12 +388,8 @@
     ;; to stack, because we do do not give the register allocator access to it.
     ;; And call_into_lisp saves it as per convention, not that it matters,
     ;; because there's no way to get back into C code anyhow.
-    #+sb-dynamic-core
-    (progn
-      (inst mov thread-base-tn (ea (make-fixup "all_threads" :foreign-dataref)))
-      (inst mov thread-base-tn (ea thread-base-tn)))
-    #-sb-dynamic-core
-    (inst mov thread-base-tn (ea (make-fixup "all_threads" :foreign)))))
+    (inst mov thread-base-tn (ea (make-fixup "all_threads" :foreign-dataref)))
+    (inst mov thread-base-tn (ea thread-base-tn))))
 
 ;;; Perform a store to code, updating the GC page (card) protection bits.
 ;;; This is not a "good" implementation of soft card marking.
@@ -416,7 +422,7 @@
         (inst cmp temp-reg-tn (thread-slot-ea thread-varyobj-card-count-slot))
         (inst jmp :ae try-dynamic-space)
         (inst mov rdi-tn (thread-slot-ea thread-varyobj-card-marks-slot))
-        (inst bts :dword (ea rdi-tn) temp-reg-tn :lock)
+        (inst bts :dword :lock (ea rdi-tn) temp-reg-tn)
         (inst jmp store))
 
       TRY-DYNAMIC-SPACE
@@ -434,20 +440,20 @@
              (inst shl temp-reg-tn 3) ; multiply by 8
              (inst add temp-reg-tn (thread-slot-ea thread-dynspace-pte-base-slot))
              ;; clear WP - bit index 5 of flags byte
-             (inst and :byte (ea 6 temp-reg-tn) (lognot (ash 1 5)) :lock))
+             (inst and :byte :lock (ea 6 temp-reg-tn) (lognot (ash 1 5))))
             (t
              (inst lea temp-reg-tn (ea temp-reg-tn temp-reg-tn 2)) ; multiply by 3
              (inst shl temp-reg-tn 2) ; then by 4, = 12
              (inst add temp-reg-tn (thread-slot-ea thread-dynspace-pte-base-slot))
              ;; clear WP
-             (inst and :byte (ea 8 temp-reg-tn) (lognot (ash 1 5)) :lock)))
+             (inst and :byte :lock (ea 8 temp-reg-tn) (lognot (ash 1 5)))))
 
       STORE
       (inst mov rdi-tn (ea 24 rsp-tn))      ; object
       (inst mov temp-reg-tn (ea 32 rsp-tn)) ; word index
       (inst mov rax-tn (ea 40 rsp-tn))      ; newval
       ;; set 'written' flag in the code header
-      (inst or :byte (ea (- 3 other-pointer-lowtag) rdi-tn) #x40 :lock)
+      (inst or :byte :lock (ea (- 3 other-pointer-lowtag) rdi-tn) #x40)
       ;; store newval into object
       (inst mov (ea (- other-pointer-lowtag) rdi-tn temp-reg-tn n-word-bytes)
             rax-tn)))
@@ -474,7 +480,7 @@
 
    (inst push rax-tn)
    (inst mov rax-tn (thread-slot-ea thread-varyobj-card-marks-slot))
-   (inst bts :dword (ea rax-tn) temp-reg-tn :lock)
+   (inst bts :dword :lock (ea rax-tn) temp-reg-tn)
    (inst pop rax-tn))
   DONE
   (inst ret 8)) ; remove 1 stack arg

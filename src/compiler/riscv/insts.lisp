@@ -29,6 +29,8 @@
 (define-arg-type s-imm :printer #'print-s-imm)
 (define-arg-type fp-reg :printer #'print-fp-reg)
 (define-arg-type control-reg :printer "(CR:#x~X)")
+(define-arg-type fence-ordering :printer #'print-fence-ordering)
+(define-arg-type a-ordering :printer #'print-a-ordering)
 (define-arg-type float-fmt :printer #'print-float-fmt)
 (define-arg-type float-rm :printer #'print-float-rm)
 ;; We don't use :sign-extend, since the immediate fields are hairy.
@@ -206,17 +208,17 @@
    (lambda (segment posn)
      (emit-j-inst segment (relative-offset target posn) lr #b1101111))))
 
-(defun emit-long-jump-at-fun (lr target)
-  (lambda (segment posn)
-    (declare (ignore posn))
-    (emit-back-patch
-     segment 8
-     (lambda (segment posn)
-       (multiple-value-bind (hi lo)
-           (u-and-i-inst-immediate (relative-offset target posn))
-         (assemble (segment)
-           (inst auipc lip-tn hi)
-           (inst jalr lr lip-tn lo)))))))
+(defconstant-eqx jalr-printer
+    '(:name :tab rd ", " rs1 ", " imm i-annotation)
+  #'equal)
+
+(define-instruction jalr (segment lr rs offset)
+  (:printer i ((funct3 #b000)
+               (opcode #b1100111)
+               (i-annotation nil :type 'jalr-annotation))
+            jalr-printer)
+  (:emitter
+   (emit-i-inst segment offset rs #b000 lr #b1100111)))
 
 ;;; For unconditional jumps, we either emit a one instruction or two
 ;;; instruction sequence.
@@ -239,17 +241,17 @@
            t))
        (emit-long-jump-at-fun lr target))))))
 
-(defconstant-eqx jalr-printer
-    '(:name :tab rd ", " rs1 ", " imm i-annotation)
-  #'equal)
-
-(define-instruction jalr (segment lr rs offset)
-  (:printer i ((funct3 #b000)
-               (opcode #b1100111)
-               (i-annotation nil :type 'jalr-annotation))
-            jalr-printer)
-  (:emitter
-   (emit-i-inst segment offset rs #b000 lr #b1100111)))
+(defun emit-long-jump-at-fun (lr target)
+  (lambda (segment posn)
+    (declare (ignore posn))
+    (emit-back-patch
+     segment 8
+     (lambda (segment posn)
+       (multiple-value-bind (hi lo)
+           (u-and-i-inst-immediate (relative-offset target posn))
+         (assemble (segment)
+           (inst auipc lip-tn hi)
+           (inst jalr lr lip-tn lo)))))))
 
 (define-instruction-macro j (target)
   `(inst jal zero-tn ,target))
@@ -311,12 +313,12 @@
   (define-load-instruction lhu #b101))
 
 (macrolet ((define-store-instruction (name funct3 &optional wordp)
-             `(define-instruction ,name (segment rs1 rs2 offset)
+             `(define-instruction ,name (segment rs2 rs1 offset)
                 (:printer s ((funct3 ,funct3) (opcode #b0100011))
                           '(:name :tab rs2 ", " "(" imm ")" rs1
                             ,(when wordp 'store-annotation)))
                 (:emitter
-                 (emit-s-inst segment offset rs1 rs2 ,funct3 #b0100011)))))
+                 (emit-s-inst segment offset rs2 rs1 ,funct3 #b0100011)))))
   (define-store-instruction sb #b000)
   (define-store-instruction sh #b001)
   (define-store-instruction sw #b010 #-64-bit t)
@@ -396,15 +398,6 @@
   (define-riscvi-arith-instruction sra #b0100000 #b101 sraw)
   (define-riscvi-arith-instruction or #b0000000 #b110)
   (define-riscvi-arith-instruction and #b0000000 #b111))
-
-(define-instruction-format (fence 32)
-  (funct4 :field (byte 4 28) :value #b0000)
-  (pred :field (byte 4 24))
-  (succ :field (byte 4 20))
-  (rs1 :field (byte 5 15) :value #b00000)
-  (funct3 :field (byte 3 12))
-  (rd :field (byte 5 7) :value #b00000)
-  (opcode :field (byte 7 0) :value #b0001111))
 
 (defun coerce-signed (unsigned-value width)
   (if (logbitp (1- width) unsigned-value)
@@ -501,6 +494,19 @@
 (define-instruction-macro li (reg value)
   `(%li ,reg ,value))
 
+(defconstant-eqx fence-printer
+    '(:name :tab pred ", " succ)
+  #'equal)
+
+(define-instruction-format (fence 32 :default-printer fence-printer)
+  (funct4 :field (byte 4 28) :value #b0000)
+  (pred :field (byte 4 24) :type 'fence-ordering)
+  (succ :field (byte 4 20) :type 'fence-ordering)
+  (rs1 :field (byte 5 15) :value #b00000)
+  (funct3 :field (byte 3 12))
+  (rd :field (byte 5 7) :value #b00000)
+  (opcode :field (byte 7 0) :value #b0001111))
+
 (defun fence-encoding (ops)
   (let ((vals '(:i 8 :o 4 :r 2 :w 1)))
     (etypecase ops
@@ -522,11 +528,11 @@
                     #b00000 funct3 #b00000 #b0001111))
 
 (define-instruction fence (segment pred succ)
-  (:printer fence ())
+  (:printer fence ((funct3 #b000)))
   (:emitter
    (emit-fence-inst segment pred succ #b000)))
 (define-instruction fence.i (segment)
-  (:printer fence ((pred #b0000) (succ #b0000)))
+  (:printer fence ((funct3 #b001)))
   (:emitter
    (emit-fence-inst segment #b0000 #b0000 #b001)))
 
@@ -599,13 +605,88 @@
   (define-riscvm-arith-instruction rem #b110)
   (define-riscvm-arith-instruction remu #b111))
 
+(defun parse-atomic-flags (flags)
+  (let ((aq 0) (rl 0))
+    (dolist (flag flags)
+      (ecase flag
+        ((nil))
+        (:aq (setq aq 1))
+        (:rl (setq rl 1))))
+    (values aq rl)))
+
+(defconstant-eqx r-atomic-printer
+    '(:name " " ordering :tab rd ", " rs2 ", " rs1)
+  #'equal)
+
+(define-instruction-format (r-atomic 32 :default-printer r-atomic-printer)
+  (funct5 :field (byte 5 27))
+  (ordering :field (byte 2 25) :type 'a-ordering)
+  (rs2 :field (byte 5 20) :type 'reg)
+  (rs1 :field (byte 5 15) :type 'reg)
+  (funct3 :field (byte 3 12))
+  (rd :field (byte 5 7) :type 'reg)
+  (opcode :field (byte 7 0) :value #b0101111))
+
+(defconstant-eqx lr-printer
+    '(:name " " ordering :tab rd ", " rs1)
+  #'equal)
+
+(macrolet ((define-load-reserved-instruction (name funct3)
+             `(define-instruction ,name (segment rd rs &optional flag1 flag2)
+                (:printer r-atomic ((funct5 #b00010) (funct3 ,funct3))
+                          lr-printer)
+                (:emitter
+                 (multiple-value-bind (aq rl)
+                     (parse-atomic-flags (list flag1 flag2))
+                   (emit-i-inst segment
+                                (logior (ash #b00010 7)
+                                        (ash aq 6)
+                                        (ash rl 5))
+                                rs ,funct3 rd #b0101111))))))
+  (define-load-reserved-instruction lr.w #b010)
+  (define-load-reserved-instruction lr.d #b011))
+
+(define-instruction-macro lr (rd rs &optional flag1 flag2)
+  `(inst #-64-bit lr.w #+64-bit lr.d ,rd ,rs ,flag1 ,flag2))
+
+(macrolet ((%define-riscva-instruction (name funct5 funct3)
+             `(define-instruction ,name (segment rd rs2 rs1 &optional flag1 flag2)
+                (:printer r-atomic ((funct5 ,funct5) (funct3 ,funct3)))
+                (:emitter
+                 (multiple-value-bind (aq rl)
+                     (parse-atomic-flags (list flag1 flag2))
+                   (emit-r-inst segment
+                                (logior (ash ,funct5 2)
+                                        (ash aq 1)
+                                        (ash rl 0))
+                                rs2 rs1 ,funct3 rd #b0101111)))))
+           (define-riscva-instruction (name funct5)
+             (let ((w-name (symbolicate name ".W"))
+                   (d-name (symbolicate name ".D")))
+               `(progn
+                  (%define-riscva-instruction ,w-name ,funct5 #b010)
+                  (%define-riscva-instruction ,d-name ,funct5 #b011)
+                  (define-instruction-macro ,name (rd rs2 rs1 &optional flag1 flag2)
+                    `(inst #-64-bit ,',w-name #+64-bit ,',d-name
+                           ,rd ,rs2 ,rs1 ,flag1 ,flag2))))))
+  (define-riscva-instruction sc      #b00011)
+  (define-riscva-instruction amoswap #b00001)
+  (define-riscva-instruction amoadd  #b00000)
+  (define-riscva-instruction amoxor  #b00100)
+  (define-riscva-instruction amoand  #b01100)
+  (define-riscva-instruction amoor   #b01000)
+  (define-riscva-instruction amomin  #b10000)
+  (define-riscva-instruction amomax  #b10100)
+  (define-riscva-instruction amominu #b11000)
+  (define-riscva-instruction amomaxu #b11100))
+
 ;;; Floating point
 (defconstant-eqx r-float-printer
-    '(:name :tab fmt ", " rd ", " rs1 ", " rs2 ", " rm)
+    '(:name fmt :tab rd ", " rs1 ", " rs2 ", " rm)
   #'equal)
 
 (defconstant-eqx r-float-unop-printer
-    '(:name :tab fmt ", " rd ", " rs1 ", " rm)
+    '(:name fmt :tab rd ", " rs1 ", " rm)
   #'equal)
 
 (define-instruction-format (r-float 32 :default-printer r-float-printer)
@@ -735,7 +816,7 @@
                  (rs1 nil :type 'reg)
                  (funct3 nil :printer #'funct3-printer)
                  (imm nil :sign-extend t))
-              '(:name :tab funct3 ", " rd ", (" imm ")" rs1))
+              '(:name funct3 :tab rd ", (" imm ")" rs1))
     (:emitter
      (emit-i-inst segment offset rs (fmt-funct3 fmt) rd #b0000111)))
 
@@ -745,7 +826,7 @@
                  (rs2 nil :type 'fp-reg)
                  (funct3 nil :printer #'funct3-printer)
                  (imm nil :type 's-imm))
-              '(:name :tab funct3 ", " rs2 ", " "(" imm ")" rs1))
+              '(:name funct3 :tab rs2 ", " "(" imm ")" rs1))
     (:emitter
      (emit-s-inst segment offset rs1 rs2 (fmt-funct3 fmt) #b0100111))))
 
@@ -830,3 +911,48 @@
 (define-instruction lra-header-word (segment)
   (:emitter
    (emit-header-data segment return-pc-widetag)))
+
+(define-instruction-macro load-layout-id (reg layout)
+  `(progn (inst .layout-id-fixup ,layout)
+          (inst lui ,reg #xfffff)
+          (inst addi ,reg ,reg -1)))
+
+(define-instruction .layout-id-fixup (segment layout)
+ (:emitter (sb-c:note-fixup segment :u+i-type (sb-c:make-fixup layout :layout-id))))
+
+(defun sb-vm:fixup-code-object (code offset value kind flavor)
+  (declare (type index offset))
+  (unless (zerop (rem offset sb-assem:+inst-alignment-bytes+))
+    (error "Unaligned instruction?  offset=#x~X." offset))
+  #+64-bit
+  (unless (typep value 'u+i-immediate)
+    (error "Tried to fixup with ~a." value))
+  (let ((sap (code-instructions code)))
+    (multiple-value-bind (u i) (u-and-i-inst-immediate value)
+      (ecase kind
+        (:absolute
+         (setf (sap-ref-32 sap offset) value))
+        (:u-type
+         (setf (ldb (byte 20 12) (sap-ref-32 sap offset)) u))
+        (:i-type
+         (setf (ldb (byte 12 20) (sap-ref-32 sap offset)) i))
+        (:u+i-type
+         (sb-vm:fixup-code-object code offset u :u-type flavor)
+         (sb-vm:fixup-code-object code (+ offset 4) i :i-type flavor))
+        (:s-type
+         (setf (ldb (byte 5 7) (sap-ref-32 sap offset))
+               (ldb (byte 5 0) i))
+         (setf (ldb (byte 7 25) (sap-ref-32 sap offset))
+               (ldb (byte 7 5) i))))))
+   nil)
+
+(define-instruction store-coverage-mark (segment path-index)
+  (:emitter
+   ;; No backpatch is needed to compute the offset into the code header
+   ;; because COMPONENT-HEADER-LENGTH is known at this point.
+   (let ((offset (+ (component-header-length)
+                    n-word-bytes ; skip over jump table word
+                    path-index
+                    (- other-pointer-lowtag))))
+     (inst* segment 'sb sb-vm::null-tn sb-vm::code-tn
+            (the (unsigned-byte 15) offset)))))

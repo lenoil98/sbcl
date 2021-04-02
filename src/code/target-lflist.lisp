@@ -15,19 +15,11 @@
 ;;;; provided with absolutely no warranty. See the COPYING and CREDITS
 ;;;; files for more information.
 
-(defpackage "SB-LOCKLESS"
-  (:use "CL" "SB-EXT" "SB-INT" "SB-SYS" "SB-KERNEL")
-  (:shadow "ENDP"))
-
 (in-package "SB-LOCKLESS")
-(setf (system-package-p *package*) t)
 
 ;;; The changes to GC to support this code were as follows:
-;;; * One bit of the payload length in an instance header is reserved to signify
-;;;   that the instance has a special GC scavenge method. This avoids indirecting
-;;;   to the layout to see whether all instances of a type have a special method.
 ;;;
-;;; * If an instance has a header bit so indicating, then the first data slot
+;;; * If an instance is flagged as being a LFlist node, then the first data slot
 ;;;   is treated as an instance pointer even if it missing its tag bits.
 ;;;
 ;;; * Since you can't pin an object that you don't a-priori have a tagged pointer
@@ -45,37 +37,12 @@
 ;;; DO-REFERENCED-OBJECT can follow untagged pointers.
 ;;; This is potentially more of an annoyance than it is a bug.
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (import 'sb-kernel::list-node))
-
-(defstruct (list-node
-            (:conc-name nil)
-            (:constructor %make-sentinel-node ())
-            (:copier nil))
-  (%node-next nil))
-
 (defstruct (keyed-node
             (:conc-name nil)
             (:include list-node)
-            (:constructor %make-node (node-key node-data)))
+            (:constructor make-node (node-key node-data)))
   (node-key 0 :read-only t)
   (node-data))
-
-(defconstant special-gc-strategy-flag #x800000)
-(declaim (ftype (sfunction (t t) list-node) make-node))
-(defun make-node (key data)
-  (declare (inline %make-node))
-  (let ((node (%make-node key data)))
-    #-x86-64
-    ;; Note that SET-HEADER-DATA only works on OTHER-POINTER-LOWTAG.
-    (with-pinned-objects (node)
-      (let ((sap (int-sap (get-lisp-obj-address node))))
-        (setf (sap-ref-word sap (- sb-vm:instance-pointer-lowtag))
-              (logior special-gc-strategy-flag
-                      (sap-ref-word sap (- sb-vm:instance-pointer-lowtag))))))
-    #+x86-64
-    (sb-sys:%primitive sb-vm::set-custom-gc-scavenge-bit node)
-    node))
 
 (declaim (inline ptr-markedp node-markedp))
 (defun ptr-markedp (bits) (fixnump bits))
@@ -93,20 +60,6 @@
     (setf (%node-next node) node)))
 
 (defmacro endp (node) `(eq ,node (load-time-value *tail-atom*)))
-
-;;; Specialized list variants will be created for
-;;;  fixnum, integer, real, string, generic "comparable"
-;;; but the node type and list type is the same regardless of key type.
-(defstruct (linked-list
-            (:constructor %make-lfl
-                          (head inserter deleter finder inequality equality))
-            (:conc-name list-))
-  (head       nil :type list-node :read-only t)
-  (inserter   nil :type function :read-only t)
-  (deleter    nil :type function :read-only t)
-  (finder     nil :type function :read-only t)
-  (inequality nil :type function :read-only t)
-  (equality   nil :type function :read-only t))
 
 (defconstant-eqx +predefined-key-types+
   #((fixnum  lfl-insert/fixnum  lfl-delete/fixnum  lfl-find/fixnum < =)

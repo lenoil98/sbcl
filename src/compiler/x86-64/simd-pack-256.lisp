@@ -11,6 +11,9 @@
 
 (in-package "SB-VM")
 
+(defun ea-for-avx-stack (tn &optional (base rbp-tn))
+  (ea (frame-byte-offset (+ (tn-offset tn) 3)) base))
+
 (defun float-avx2-p (tn)
   (sc-is tn single-avx2-reg single-avx2-stack single-avx2-immediate
             double-avx2-reg double-avx2-stack double-avx2-immediate))
@@ -48,7 +51,7 @@
          (p2 (%simd-pack-256-2 x))
          (p3 (%simd-pack-256-3 x)))
     (cond ((= p0 p1 p2 p3 0)
-           (inst vxorps y y))
+           (inst vxorps y y y))
           ((= p0 p1 p2 p3 (ldb (byte 64 0) -1))
            (inst vpcmpeqd y y y))
           (t
@@ -56,19 +59,19 @@
 
 (define-move-fun (load-int-avx2 2) (vop x y)
   ((int-avx2-stack) (int-avx2-reg))
-  (inst vmovdqu y (ea-for-sse-stack x)))
+  (inst vmovdqu y (ea-for-avx-stack x)))
 
 (define-move-fun (load-float-avx2 2) (vop x y)
   ((single-avx2-stack double-avx2-stack) (single-avx2-reg double-avx2-reg))
-  (inst vmovups y (ea-for-sse-stack x)))
+  (inst vmovups y (ea-for-avx-stack x)))
 
 (define-move-fun (store-int-avx2 2) (vop x y)
   ((int-avx2-reg) (int-avx2-stack))
-  (inst vmovdqu (ea-for-sse-stack y) x))
+  (inst vmovdqu (ea-for-avx-stack y) x))
 
 (define-move-fun (store-float-avx2 2) (vop x y)
   ((double-avx2-reg single-avx2-reg) (double-avx2-stack single-avx2-stack))
-  (inst vmovups (ea-for-sse-stack y) x))
+  (inst vmovups (ea-for-avx-stack y) x))
 
 (define-vop (avx2-move)
   (:args (x :scs (single-avx2-reg double-avx2-reg int-avx2-reg)
@@ -98,7 +101,7 @@
                 (int-avx2-reg 0)
                 (t 0)))
          y simd-pack-256-tag-slot other-pointer-lowtag)
-     (let ((ea (make-ea-for-object-slot
+     (let ((ea (object-slot-ea
                 y simd-pack-256-p0-slot other-pointer-lowtag)))
        (if (float-avx2-p x)
            (inst vmovups ea x)
@@ -111,7 +114,7 @@
   (:results (y :scs (int-avx2-reg double-avx2-reg single-avx2-reg)))
   (:note "pointer to AVX2 coercion")
   (:generator 2
-    (let ((ea (make-ea-for-object-slot x simd-pack-256-p0-slot other-pointer-lowtag)))
+    (let ((ea (object-slot-ea x simd-pack-256-p0-slot other-pointer-lowtag)))
       (if (float-avx2-p y)
           (inst vmovups y ea)
           (inst vmovdqu y ea)))))
@@ -136,8 +139,8 @@
               (inst vmovdqu y x))))
        ((int-avx2-stack double-avx2-stack single-avx2-stack)
         (if (float-avx2-p x)
-            (inst vmovups (ea-for-sse-stack y fp) x)
-            (inst vmovdqu (ea-for-sse-stack y fp) x))))))
+            (inst vmovups (ea-for-avx-stack y fp) x)
+            (inst vmovdqu (ea-for-avx-stack y fp) x))))))
 (define-move-vop move-avx2-arg :move-arg
   (int-avx2-reg double-avx2-reg single-avx2-reg descriptor-reg)
   (int-avx2-reg double-avx2-reg single-avx2-reg))
@@ -370,4 +373,10 @@
   (values (%simd-pack-256-double-item pack 0)
           (%simd-pack-256-double-item pack 1)
           (%simd-pack-256-double-item pack 2)
-          (%simd-pack-256-double-item pack 3))))
+          (%simd-pack-256-double-item pack 3)))
+
+(defun %simd-pack-256-inline-constant (pack)
+  (list :avx2 (logior (%simd-pack-256-0 pack)
+                      (ash (%simd-pack-256-1 pack) 64)
+                      (ash (%simd-pack-256-2 pack) 128)
+                      (ash (%simd-pack-256-3 pack) 192)))))

@@ -158,34 +158,43 @@
 (fmakunbound 'make-load-form)
 (defgeneric make-load-form (object &optional environment))
 
-(defun !incorporate-cross-compiled-methods (gf-name &key except)
+(defun !install-cross-compiled-methods (gf-name &key except)
   (assert (generic-function-p (fdefinition gf-name)))
-  (loop for (predicate fmf specializer qualifier lambda-list source-loc)
-        ;; Reversing installs less-specific methods first,
-        ;; so that if perchance we crash mid way through the loop,
-        ;; there is (hopefully) at least some installed method that works.
-        across (nreverse (remove-if (lambda (x) (member x except))
-                                    (cdr (assoc gf-name *!trivial-methods*))
-                                    :key #'third))
-        do (multiple-value-bind (specializers arg-info)
-               (ecase gf-name
+  ;; Reversing installs less-specific methods first,
+  ;; so that if perchance we crash mid way through the loop,
+  ;; there is (hopefully) at least some installed method that works.
+  (dovector (method (nreverse (cdr (assoc gf-name *!trivial-methods*))))
+    ;; METHOD is a vector:
+    ;;  #(#<GUARD> QUALIFIER SPECIALIZER #<FMF> LAMBDA-LIST SOURCE-LOC)
+    (let ((qualifier   (svref method 1))
+          (specializer (svref method 2))
+          (fmf         (svref method 3))
+          (lambda-list (svref method 4))
+          (source-loc  (svref method 5)))
+      (when (sb-kernel::layout-p specializer)
+        (setq specializer (classoid-name (layout-classoid specializer))))
+      (unless (member specializer except)
+        (multiple-value-bind (specializers arg-info)
+               (case gf-name
                  (print-object
                   (values (list (find-class specializer) (find-class t))
                           '(:arg-info (2))))
-                 (make-load-form
+                 ((make-load-form close)
                   (values (list (find-class specializer))
-                          '(:arg-info (1 . t)))))
+                          '(:arg-info (1 . t))))
+                 (t
+                  (values (list (find-class specializer)) '(:arg-info (1)))))
              (load-defmethod
               'standard-method gf-name
               (if qualifier (list qualifier)) specializers lambda-list
               `(:function
                 ,(let ((mf (%make-method-function fmf)))
-                   (sb-mop:set-funcallable-instance-function
-                    mf (method-function-from-fast-function fmf arg-info))
+                   (setf (%funcallable-instance-fun mf)
+                         (method-function-from-fast-function fmf arg-info))
                    mf)
                 plist ,arg-info simple-next-method-call t)
-              source-loc))))
-(!incorporate-cross-compiled-methods 'make-load-form :except '(layout))
+              source-loc))))))
+(!install-cross-compiled-methods 'make-load-form :except '(layout))
 
 (defmethod make-load-form ((class class) &optional env)
   ;; FIXME: should we not instead pass ENV to FIND-CLASS?  Probably
@@ -218,7 +227,13 @@
   (define-default-make-load-form-method standard-object)
   (define-default-make-load-form-method condition))
 
-sb-impl::
-(defmethod make-load-form ((host (eql *physical-host*)) &optional env)
-  (declare (ignore env))
-  '*physical-host*)
+;;; I guess if the user defines other kinds of EQL specializers, she would
+;;; need to implement this? And how is she supposed to know that?
+(defmethod eql-specializer-to-ctype ((specializer eql-specializer))
+  (if (slot-boundp specializer 'ctype)
+      (slot-value specializer 'ctype)
+      ;; this might want to use compare-and-swap, but it doesn't
+      ;; have to be guaranteed unique.
+      ;; (This is more like a cache than an aspect of this object per se)
+      (setf (slot-value specializer 'ctype)
+            (make-eql-type (eql-specializer-object specializer)))))

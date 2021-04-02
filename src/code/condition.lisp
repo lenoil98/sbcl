@@ -73,7 +73,12 @@
     (if (and olayout
              (not (mismatch (layout-inherits olayout) new-inherits)))
         olayout
-        (make-layout (make-undefined-classoid name)
+        ;; All condition classoid layouts carry the same LAYOUT-INFO - the defstruct
+        ;; description for CONDITION - which is a representation of the primitive object
+        ;; and not the lisp-level object.
+        (make-layout (hash-layout-name name)
+                     (make-undefined-classoid name)
+                     :info (layout-info cond-layout)
                      :flags +condition-layout-flag+
                      :inherits new-inherits
                      :depthoid -1
@@ -163,7 +168,7 @@
                          (slot (or (find-condition-class-slot class name)
                                    (error "missing slot ~S of ~S" name condition))))
                      (setf (getf (condition-assigned-slots condition) name)
-                           (do ((i (+ sb-vm:instance-data-start 2) (+ i 2)))
+                           (do ((i (+ sb-vm:instance-data-start 1) (+ i 2)))
                                ((>= i instance-length) (find-slot-default class slot))
                                (when (member (%instance-ref condition i)
                                              (condition-slot-initargs slot))
@@ -177,16 +182,22 @@
 
 ;;;; MAKE-CONDITION
 
+;;; Pre-scan INITARGS to see whether any are stack-allocated.
+;;; If not, then life is easy. If any are, then depending on whether the
+;;; condition is a TYPE-ERROR, call TYPE-OF on the bad datum, so that
+;;; if the condition outlives the extent of the object, and someone tries
+;;; to print the condition, we don't crash.
+;;; Putting a placeholder in for the datum would work, but seems a bit evil,
+;;; since the user might actually want to know what it was. And we shouldn't
+;;; assume that the object would definitely escape its dynamic-extent.
+
 (defun allocate-condition (designator &rest initargs)
   (when (oddp (length initargs))
     (error 'simple-error
            :format-control "odd-length initializer list: ~S."
-           :format-arguments
-           (let (list)
-             ;; avoid direct reference to INITARGS as a list
-             ;; so that it is not reified unless we reach here.
-             (do-rest-arg ((arg) initargs) (push arg list))
-             (list (nreverse list)))))
+           ;; Passing the initargs to LIST avoids consing them into
+           ;; a list except when this error is signaled.
+           :format-arguments (list (apply #'list initargs))))
   ;; I am going to assume that people are not somehow getting to here
   ;; with a CLASSOID, which is not strictly legal as a designator,
   ;; but which is accepted because it is actually the desired thing.
@@ -197,24 +208,84 @@
                      (symbol (find-classoid designator nil))
                      (class (lookup (class-name designator)))
                      (t designator)))))
-    (if (condition-classoid-p classoid)
-        ;; Interestingly we fail to validate the actual-initargs,
-        ;; allowing any random initarg names.  Is this permissible?
-        ;; And why is lazily filling in ASSIGNED-SLOTS beneficial anyway?
-        (let ((instance (%make-instance (+ sb-vm:instance-data-start
-                                           2 ; ASSIGNED-SLOTS and HASH
-                                           (length initargs))))) ; rest
-          (setf (%instance-layout instance) (classoid-layout classoid)
-                (condition-assigned-slots instance) nil)
-          (do-rest-arg ((val index) initargs)
-            (setf (%instance-ref instance (+ sb-vm:instance-data-start index 2)) val))
-          (values instance classoid))
-        (error 'simple-type-error
-               :datum designator
-               ;; CONDITION-CLASS isn't a type-specifier. Is this legal?
-               :expected-type 'condition-class
-               :format-control "~S does not designate a condition class."
-               :format-arguments (list designator)))))
+    (unless (condition-classoid-p classoid)
+      (error 'simple-type-error
+             :datum designator
+             :expected-type 'sb-pcl::condition-class
+             :format-control "~S does not designate a condition class."
+             :format-arguments (list designator)))
+    (flet ((stream-err-p (layout)
+             (let ((stream-err-layout (load-time-value (find-layout 'stream-error))))
+               (or (eq layout stream-err-layout)
+                   (find stream-err-layout (layout-inherits layout)))))
+           (type-err-p (layout)
+             (let ((type-err-layout (load-time-value (find-layout 'type-error))))
+               (or (eq layout type-err-layout)
+                   (find type-err-layout (layout-inherits layout)))))
+           ;; avoid full calls to STACK-ALLOCATED-P here
+           (stackp (x)
+             (let ((addr (get-lisp-obj-address x)))
+               (and (sb-vm:is-lisp-pointer addr)
+                    (<= (get-lisp-obj-address sb-vm:*control-stack-start*) addr)
+                    (< addr (get-lisp-obj-address sb-vm:*control-stack-end*))))))
+      (let* ((any-dx
+              (loop for arg-index from 1 below (length initargs) by 2
+                    thereis (stackp (fast-&rest-nth arg-index initargs))))
+             (layout (classoid-layout classoid))
+             (extra (if (and any-dx (type-err-p layout)) 2 0)) ; space for secret initarg
+             (instance (%make-instance (+ sb-vm:instance-data-start
+                                          1 ; ASSIGNED-SLOTS
+                                          (length initargs)
+                                          extra)))
+             (data-index (1+ sb-vm:instance-data-start))
+             (arg-index 0)
+             (have-type-error-datum)
+             (type-error-datum))
+        (setf (%instance-layout instance) layout
+              (condition-assigned-slots instance) nil)
+        (macrolet ((store-pair (key val)
+                     `(setf (%instance-ref instance data-index) ,key
+                            (%instance-ref instance (1+ data-index)) ,val)))
+          (cond ((not any-dx)
+                 ;; uncomplicated way
+                 (loop (when (>= arg-index (length initargs)) (return))
+                       (store-pair (fast-&rest-nth arg-index initargs)
+                                   (fast-&rest-nth (1+ arg-index) initargs))
+                       (incf data-index 2)
+                       (incf arg-index 2)))
+                (t
+                 (loop (when (>= arg-index (length initargs)) (return))
+                       (let ((key (fast-&rest-nth arg-index initargs))
+                             (val (fast-&rest-nth (1+ arg-index) initargs)))
+                         (when (and (eq key :datum)
+                                    (not have-type-error-datum)
+                                    (type-err-p layout))
+                           (setq type-error-datum val
+                                 have-type-error-datum t))
+                         (if (and (eq key :stream) (stream-err-p layout) (stackp val))
+                             (store-pair key (sb-impl::make-stub-stream val))
+                             (store-pair key val)))
+                       (incf data-index 2)
+                       (incf arg-index 2))
+                 (when (and have-type-error-datum (/= extra 0))
+                   ;; We can get into serious trouble here if the
+                   ;; datum is already stack garbage!
+                   (let ((actual-type (type-of type-error-datum)))
+                     (store-pair 'dx-object-type actual-type))))))
+        (values instance classoid)))))
+
+;;; Access the type of type-error-datum if the datum can't be accessed.
+;;; Testing the stack pointer when rendering the condition is a heuristic
+;;; that might work, but more likely, the erring frame has been exited
+;;; and then the stack pointer changed again to make it seems like the
+;;; object pointer is valid. I'm not sure what to do, but we can leave
+;;; that decision for later.
+(defun type-error-datum-stored-type (condition)
+  (do ((i (- (%instance-length condition) 2) (- i 2)))
+      ((<= i (1+ sb-vm:instance-data-start))
+       (make-unbound-marker))
+    (when (eq (%instance-ref condition i) 'dx-object-type)
+      (return (%instance-ref condition (1+ i))))))
 
 (defun make-condition (type &rest initargs)
   "Make an instance of a condition object using the specified initargs."
@@ -399,61 +470,64 @@
               (all-readers nil append)
               (all-writers nil append))
       (dolist (spec slot-specs)
-        (when (keywordp spec)
-          (warn "Keyword slot name indicates probable syntax error:~%  ~S"
-                spec))
-        (let* ((spec (if (consp spec) spec (list spec)))
-               (slot-name (first spec))
-               (allocation :instance)
-               (initform-p nil)
-               documentation
-               initform)
-          (collect ((initargs)
-                    (readers)
-                    (writers))
-            (do ((options (rest spec) (cddr options)))
-                ((null options))
-              (unless (and (consp options) (consp (cdr options)))
-                (error "malformed condition slot spec:~%  ~S." spec))
-              (let ((arg (second options)))
-                (case (first options)
-                  (:reader (readers arg))
-                  (:writer (writers arg))
-                  (:accessor
-                   (readers arg)
-                   (writers `(setf ,arg)))
-                  (:initform
-                   (when initform-p
-                     (error "more than one :INITFORM in ~S" spec))
-                   (setq initform-p t)
-                   (setq initform arg))
-                  (:initarg (initargs arg))
-                  (:allocation
-                   (setq allocation arg))
-                  (:documentation
-                   (when documentation
-                     (error "more than one :DOCUMENTATION in ~S" spec))
-                   (unless (stringp arg)
-                     (error "slot :DOCUMENTATION argument is not a string: ~S"
-                            arg))
-                   (setq documentation arg))
-                  (:type)
-                  (t
-                   (error "unknown slot option:~%  ~S" (first options))))))
+        (with-current-source-form (spec)
+          (when (keywordp spec)
+            (warn "Keyword slot name indicates probable syntax error:~%  ~S"
+                  spec))
+          (let* ((spec (if (consp spec) spec (list spec)))
+                 (slot-name (first spec))
+                 (allocation :instance)
+                 (initform-p nil)
+                 documentation
+                 initform)
+            (collect ((initargs)
+                      (readers)
+                      (writers))
+              (do ((options (rest spec) (cddr options)))
+                  ((null options))
+                (unless (and (consp options) (consp (cdr options)))
+                  (error "malformed condition slot spec:~%  ~S." spec))
+                (let ((arg (second options)))
+                  (case (first options)
+                    (:reader (readers arg))
+                    (:writer (writers arg))
+                    (:accessor
+                     (readers arg)
+                     (writers `(setf ,arg)))
+                    (:initform
+                     (when initform-p
+                       (error "more than one :INITFORM in ~S" spec))
+                     (setq initform-p t)
+                     (setq initform arg))
+                    (:initarg (initargs arg))
+                    (:allocation
+                     (setq allocation arg))
+                    (:documentation
+                     (when documentation
+                       (error "more than one :DOCUMENTATION in ~S" spec))
+                     (unless (stringp arg)
+                       (error "slot :DOCUMENTATION argument is not a string: ~S"
+                              arg))
+                     (setq documentation arg))
+                    (:type
+                     (check-slot-type-specifier
+                      arg slot-name (cons 'define-condition name)))
+                    (t
+                     (error "unknown slot option:~%  ~S" (first options))))))
 
-            (all-readers (readers))
-            (all-writers (writers))
-            (slots `(make-condition-slot
-                     :name ',slot-name
-                     :initargs ',(initargs)
-                     :readers ',(readers)
-                     :writers ',(writers)
-                     :initform-p ',initform-p
-                     :documentation ',documentation
-                     :initform ,(when initform-p `',initform)
-                     :initfunction ,(when initform-p
-                                      `#'(lambda () ,initform))
-                     :allocation ',allocation)))))
+              (all-readers (readers))
+              (all-writers (writers))
+              (slots `(make-condition-slot
+                       :name ',slot-name
+                       :initargs ',(initargs)
+                       :readers ',(readers)
+                       :writers ',(writers)
+                       :initform-p ',initform-p
+                       :documentation ',documentation
+                       :initform ,(when initform-p `',initform)
+                       :initfunction ,(when initform-p
+                                        `#'(lambda () ,initform))
+                       :allocation ',allocation))))))
 
       (dolist (option options)
         (unless (consp option)
@@ -597,6 +671,11 @@
    (lambda (condition stream)
      (format stream "~S is closed" (stream-error-stream condition)))))
 
+(define-condition closed-saved-stream-error (closed-stream-error) ()
+  (:report
+   (lambda (condition stream)
+     (format stream "~S was closed by SB-EXT:SAVE-LISP-AND-DIE" (stream-error-stream condition)))))
+
 (define-condition file-error (error)
   ((pathname :reader file-error-pathname :initarg :pathname))
   (:report
@@ -638,16 +717,20 @@
   ((not-yet-loaded :initform nil :reader not-yet-loaded :initarg :not-yet-loaded))
   (:report
    (lambda (condition stream)
-     (let ((*package* (find-package :keyword)))
+     (let ((name (cell-error-name condition)))
        (format stream
-               "~@<The function ~S is undefined.~@?~@:>"
-               (cell-error-name condition)
+               (if (and (symbolp name) (macro-function name))
+                   (sb-format:tokens "~@<~/sb-ext:print-symbol-with-prefix/ is a macro, ~
+                                      not a function.~@:>")
+                   (sb-format:tokens "~@<The function ~/sb-ext:print-symbol-with-prefix/ ~
+                                      is undefined.~@?~@:>"))
+               name
                (case (not-yet-loaded condition)
                  (:local
-                  "~:@_It is a local function ~
-                       not available at compile-time.")
-                 ((t) "~:@_It is defined earlier in the ~
-                           file but is not available at compile-time.")
+                  (sb-format:tokens "~:@_It is a local function ~
+                                     not available at compile-time."))
+                 ((t) (sb-format:tokens "~:@_It is defined earlier in the ~
+                                         file but is not available at compile-time."))
                  (t
                   "")))))))
 
@@ -762,6 +845,11 @@
 
 (define-condition simple-storage-condition (storage-condition simple-condition)
   ())
+
+(define-condition sanitizer-error (simple-error)
+  ((value :reader sanitizer-error-value :initarg :value)
+   (address :reader sanitizer-error-address :initarg :address)
+   (size :reader sanitizer-error-size :initarg :size)))
 
 ;;; a condition for use in stubs for operations which aren't supported
 ;;; on some platforms
@@ -882,6 +970,14 @@
   (:default-initargs :references '((:ansi-cl :special-operator quote)
                                    (:ansi-cl :section (3 2 2 3)))))
 
+(define-condition macro-arg-modified (constant-modified)
+  ((variable :initform nil :initarg :variable :reader macro-arg-modified-variable))
+  (:report (lambda (c s)
+             (format s "~@<Destructive function ~S called on a macro argument: ~S.~:>"
+                     (constant-modified-fun-name c)
+                     (macro-arg-modified-variable c))))
+  (:default-initargs :references nil))
+
 (define-condition package-at-variance (reference-condition simple-warning)
   ()
   (:default-initargs :references '((:ansi-cl :macro defpackage)
@@ -911,7 +1007,11 @@
   ()
   (:default-initargs
       :references '((:ansi-cl :function make-array)
-                    (:ansi-cl :function sb-xc:upgraded-array-element-type))))
+                    (:ansi-cl :function upgraded-array-element-type))))
+
+(define-condition initial-element-mismatch-style-warning
+    (array-initial-element-mismatch simple-style-warning)
+  ())
 
 (define-condition type-warning (reference-condition simple-warning)
   ()
@@ -919,6 +1019,7 @@
 (define-condition type-style-warning (reference-condition simple-style-warning)
   ()
   (:default-initargs :references '((:sbcl :node "Handling of Types"))))
+(define-condition slot-initform-type-style-warning (type-style-warning) ())
 
 (define-condition local-argument-mismatch (reference-condition simple-warning)
   ()
@@ -1139,7 +1240,7 @@ SB-EXT:PACKAGE-LOCKED-ERROR-SYMBOL."))
                      "An attempt to access an array of element-type ~
                       NIL was made.  Congratulations!")))
   (:default-initargs
-      :references '((:ansi-cl :function sb-xc:upgraded-array-element-type)
+      :references '((:ansi-cl :function upgraded-array-element-type)
                     (:ansi-cl :section (15 1 2 1))
                     (:ansi-cl :section (15 1 2 2)))))
 
@@ -1265,17 +1366,14 @@ SB-EXT:PACKAGE-LOCKED-ERROR-SYMBOL."))
    "Signaled when an operation in the context of a deadline takes
 longer than permitted by the deadline."))
 
-;;; DEFINE-CONDITION captures the initargs literally. It does no good
-;;; to have the TOKENS macro insert the literal string within the expression
-;;; when the entire point is to AVOID inserting that exact string.
-(define-load-time-global *decl-type-conflict-error-reporter*
-    (sb-format:tokens "Symbol ~/sb-ext:print-symbol-with-prefix/ cannot ~
-     be both the name of a type and the name of a declaration"))
 (define-condition declaration-type-conflict-error (reference-condition
                                                    simple-error)
   ()
   (:default-initargs
-   :format-control *decl-type-conflict-error-reporter*
+   :format-control
+   #.(macroexpand-1 ; stuff in a literal #<fmt-control>
+      '(sb-format:tokens "Symbol ~/sb-ext:print-symbol-with-prefix/ cannot ~
+     be both the name of a type and the name of a declaration"))
    :references '((:ansi-cl :section (3 8 21)))))
 
 ;;; Single stepping conditions
@@ -1516,9 +1614,7 @@ the usual naming convention (names like *FOO*) for special variables"
     (dubious-asterisks-around-variable-name)
   ())
 
-(define-condition &optional-and-&key-in-lambda-list
-    (style-warning simple-condition)
-  ())
+(define-condition &optional-and-&key-in-lambda-list (simple-style-warning) ())
 
 ;; We call this UNDEFINED-ALIEN-STYLE-WARNING because there are some
 ;; subclasses of ERROR above having to do with undefined aliens.
@@ -1528,7 +1624,9 @@ the usual naming convention (names like *FOO*) for special variables"
              (format stream "Undefined alien: ~S"
                      (undefined-alien-symbol warning)))))
 
-#+(or sb-eval sb-fasteval)
+;;; Formerly this was guarded by "#+(or sb-eval sb-fasteval)", but
+;;; why would someone build with no interpreter? And if they did,
+;;; would they really care that one extra condition definition exists?
 (define-condition lexical-environment-too-complex (style-warning)
   ((form :initarg :form :reader lexical-environment-too-complex-form)
    (lexenv :initarg :lexenv :reader lexical-environment-too-complex-lexenv))
@@ -1783,11 +1881,11 @@ CONTROL-ERROR if the restart does not exist.")
   (def step-next
       "Transfers control to the STEP-NEXT restart associated with the
 condition, executing the current form without stepping and continuing
-stepping with the next form. Signals CONTROL-ERROR is the restart does
-not exists.")
+stepping with the next form. Signals CONTROL-ERROR if the restart does
+not exist.")
   (def step-into
       "Transfers control to the STEP-INTO restart associated with the
-condition, stepping into the current form. Signals a CONTROL-ERROR is
+condition, stepping into the current form. Signals a CONTROL-ERROR if
 the restart does not exist."))
 
 ;;; Compiler macro magic
@@ -1839,11 +1937,43 @@ the restart does not exist."))
                        (program-error-message condition)))))
 
 (define-condition simple-control-error (simple-condition control-error) ())
-(define-condition simple-file-error    (simple-condition file-error)    ())
 
-(define-condition file-exists (simple-file-error) ())
-(define-condition file-does-not-exist (simple-file-error) ())
-(define-condition delete-file-error (simple-file-error) ())
+(define-condition simple-file-error (simple-condition file-error)
+  ((message :initarg :message :reader simple-file-error-message :initform nil))
+  (:report
+   (lambda (condition stream)
+     (format stream "~@<~?~@[: ~2I~_~A~]~@:>"
+             (simple-condition-format-control condition)
+             (simple-condition-format-arguments condition)
+             (simple-file-error-message condition)))))
+
+(defun %file-error (pathname &optional datum &rest arguments)
+  (typecase datum
+    (format-control (error 'simple-file-error :pathname pathname
+                                              :format-control datum
+                                              :format-arguments arguments))
+    (t (apply #'error datum :pathname pathname arguments))))
+
+(define-condition file-exists (simple-file-error) ()
+  (:report
+   (lambda (condition stream)
+     (format stream "~@<The file ~S already exists~@[: ~2I~_~A~]~@:>"
+             (file-error-pathname condition)
+             (simple-file-error-message condition)))))
+
+(define-condition file-does-not-exist (simple-file-error) ()
+  (:report
+   (lambda (condition stream)
+     (format stream "~@<The file ~S does not exist~@[: ~2I~_~A~]~@:>"
+             (file-error-pathname condition)
+             (simple-file-error-message condition)))))
+
+(define-condition delete-file-error (simple-file-error) ()
+  (:report
+   (lambda (condition stream)
+     (format stream "~@<Could not delete the file ~S~@[: ~2I~_~A~]~@:>"
+             (file-error-pathname condition)
+             (simple-file-error-message condition)))))
 
 (define-condition simple-stream-error (simple-condition stream-error) ())
 (define-condition simple-parse-error  (simple-condition parse-error)  ())

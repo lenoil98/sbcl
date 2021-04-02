@@ -41,7 +41,7 @@
              (let* ((cons-cells (if star (1- num) num))
                     (alloc (* (pad-data-block cons-size) cons-cells)))
                (pseudo-atomic (pa-flag)
-                 (allocation res alloc list-pointer-lowtag
+                 (allocation 'list alloc list-pointer-lowtag res
                              :flag-tn pa-flag
                              :stack-allocate-p (node-stack-allocate-p node))
                  (move ptr res)
@@ -98,8 +98,7 @@
     (let* ((size (+ length closure-info-offset))
            (alloc-size (pad-data-block size)))
       (pseudo-atomic (pa-flag)
-        (allocation result alloc-size
-                    fun-pointer-lowtag
+        (allocation nil alloc-size fun-pointer-lowtag result
                     :flag-tn pa-flag
                     :stack-allocate-p stack-allocate-p)
         (load-immediate-word pa-flag
@@ -154,8 +153,8 @@
 (define-vop (var-alloc)
   (:args (extra :scs (any-reg)))
   (:arg-types positive-fixnum)
-  (:info name words type lowtag)
-  (:ignore name)
+  (:info name words type lowtag stack-allocate-p)
+  (:ignore name stack-allocate-p)
   (:results (result :scs (descriptor-reg)))
   (:temporary (:scs (any-reg)) bytes)
   (:temporary (:scs (non-descriptor-reg)) header)
@@ -166,7 +165,7 @@
     (if (= type code-header-widetag)
         (inst add bytes extra 0)
         (inst add bytes extra (* (1- words) n-word-bytes)))
-    (inst mov header (lsl bytes (- n-widetag-bits n-fixnum-tag-bits)))
+    (inst mov header (lsl bytes (- (length-field-shift type) n-fixnum-tag-bits)))
     (inst add header header type)
     ;; Add the object header to the allocation size and round up to
     ;; the allocation granularity
@@ -177,5 +176,5 @@
     (inst bic bytes bytes lowtag-mask)
     ;; Allocate the object and set its header
     (pseudo-atomic (pa-flag)
-      (allocation result bytes lowtag :flag-tn pa-flag)
+      (allocation nil bytes lowtag result :flag-tn pa-flag)
       (storew header result 0 lowtag))))

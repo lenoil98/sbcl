@@ -266,7 +266,8 @@
                          (dfo-scavenge-dependency-graph (lambda-home clambda)
                                                         res)))
                  (scavenge-possibly-deleted-lambda (clambda)
-                   (unless (eql (lambda-kind clambda) :deleted)
+                   (unless (or (eql (lambda-kind clambda) :deleted)
+                               (eql (lambda-kind (lambda-home clambda)) :deleted))
                      (scavenge-lambda clambda)))
                  ;; Scavenge call relationship.
                  (scavenge-call (called-lambda)
@@ -281,7 +282,7 @@
                  ;; closed-over variable was unused and thus delete
                  ;; it. See e.g. cmucl-imp 2001-11-29.)
                  (scavenge-closure-var (var)
-                   (unless (null (lambda-var-refs var)) ; unless var deleted
+                   (when (lambda-var-refs var) ; unless var deleted
                      (let ((var-home-home (lambda-home (lambda-var-home var))))
                        (scavenge-possibly-deleted-lambda var-home-home))))
                  ;; Scavenge closure over an entry for nonlocal exit.
@@ -496,14 +497,7 @@
          (result-return (lambda-return result-lambda)))
     (cond
       ((null (rest lambdas)))
-      ((and result-return
-            ;; KLUDGE: why is the node deleted but clambda still has a return?
-            ;; see a test-case for this in tests/merge-lambdas.lisp
-            ;; But now it can only be exercised with block
-            ;; compilation, which doesn't seem to work anyway.
-            (not (node-to-be-deleted-p
-                  (ctran-use (node-prev
-                              (lvar-uses (return-result result-return)))))))
+      (result-return
        ;; Make sure the result's return node starts a block so that we
        ;; can splice code in before it.
        (let ((prev (node-prev

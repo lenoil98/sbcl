@@ -84,7 +84,7 @@
           (or *source-namestring*
               (when source-info
                 (make-file-info-namestring
-                 *compile-file-pathname*
+                 cl:*compile-file-pathname*
                  (get-toplevelish-file-info source-info)))))
          tlf-number
          form-number)
@@ -103,3 +103,9 @@
         (if name
             (namestring name)
             nil))))
+
+(in-package "SB-IMPL")
+
+(defvar *eval-source-context* nil)
+(defvar *eval-tlf-index* nil)
+(defvar *eval-source-info* nil)

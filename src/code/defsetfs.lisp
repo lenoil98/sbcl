@@ -41,12 +41,6 @@
 (defsetf %instance-ref %instance-set)
 
 (defsetf %raw-instance-ref/word %raw-instance-set/word)
-;; The *FEATURE* formerly known as :RAW-SIGNED-WORD
-;; This condition would be better as
-;;   (vop-translates sb-kernel:%raw-instance-ref/signed-word)
-;; however the defknown is only executed if the raw slot type exists.
-;; (See compiler/generic/vm-fndb where it maps over *raw-slot-data*)
-#+(vop-named sb-vm::raw-instance-ref/signed-word)
 (defsetf %raw-instance-ref/signed-word %raw-instance-set/signed-word)
 (defsetf %raw-instance-ref/single %raw-instance-set/single)
 (defsetf %raw-instance-ref/double %raw-instance-set/double)
@@ -55,7 +49,9 @@
 
 (defsetf %instance-layout %set-instance-layout)
 (defsetf %funcallable-instance-info %set-funcallable-instance-info)
-(defsetf %funcallable-instance-layout %set-funcallable-instance-layout)
+;;; The writer is named after the reader, but only operates on FUNCALLABLE-INSTANCE
+;;; even if the reader operates on any FUNCTION.
+(defsetf %fun-layout %set-fun-layout)
 
 ;;; from early-setf.lisp
 
@@ -203,14 +199,14 @@
 ;; it. In particular, this must fail: (SETF (GET 'SYM 'IND (ERROR "Foo")) 3).
 
 (defsetf get (symbol indicator &optional default &environment e) (newval)
-  (let ((constp (sb-xc:constantp default e)))
+  (let ((constp (constantp default e)))
     ;; always reference default's temp var to "use" it
     `(%put ,symbol ,indicator ,(if constp newval `(progn ,default ,newval)))))
 
 ;; A possible optimization for read/modify/write of GETHASH
 ;; would be to predetermine the vector element where the key/value pair goes.
 (defsetf gethash (key hashtable &optional default &environment e) (newval)
-  (let ((constp (sb-xc:constantp default e)))
+  (let ((constp (constantp default e)))
     ;; always reference default's temp var to "use" it
     `(%puthash ,key ,hashtable ,(if constp newval `(progn ,default ,newval)))))
 
@@ -219,7 +215,7 @@
 (define-setf-expander the (&whole form type place &environment env)
   (binding* ((op (car form))
              ((temps subforms store-vars setter getter)
-              (sb-xc:get-setf-expansion place env)))
+              (get-setf-expansion place env)))
     (values temps subforms store-vars
             `(multiple-value-bind ,store-vars (,op ,type (values ,@store-vars))
                ,setter)
@@ -227,7 +223,7 @@
 
 (define-setf-expander getf (place prop &optional default &environment env)
   (binding* (((place-tempvars place-tempvals stores set get)
-              (sb-xc:get-setf-expansion place env))
+              (get-setf-expansion place env))
              ((call-tempvars call-tempvals call-args bitmask)
               (collect-setf-temps (list prop default) env '(indicator default)))
              (newval (gensym "NEW")))
@@ -249,13 +245,13 @@
   (let (all-dummies all-vals newvals setters getters)
     (dolist (place places)
       (multiple-value-bind (dummies vals newval setter getter)
-          (sb-xc:get-setf-expansion place env)
+          (get-setf-expansion place env)
         ;; ANSI 5.1.2.3 explains this logic quite precisely.  --
         ;; CSR, 2004-06-29
         (setq all-dummies (append all-dummies dummies (cdr newval))
               all-vals (append all-vals vals
                                (mapcar (constantly nil) (cdr newval)))
-              newvals (append newvals (list (car newval))))
+              newvals (append newvals (and newval (list (car newval)))))
         (push setter setters)
         (push getter getters)))
     (values all-dummies all-vals newvals
@@ -311,7 +307,7 @@ place with bits from the low-order end of the new value."
                   (collect-setf-temps (list spec) env '(bytespec))))
              (byte (if (cdr byte-args) (cons 'byte byte-args) (car byte-args)))
              ((place-tempvars place-tempvals stores setter getter)
-              (sb-xc:get-setf-expansion place env))
+              (get-setf-expansion place env))
              (newval (sb-xc:gensym "NEW"))
              (new-int `(,store-fun
                         ,(if (eq load-fun 'logbitp) `(if ,newval 1 0) newval)
@@ -339,18 +335,19 @@ place with bits from the low-order end of the new value."
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (%defsetf 'truly-the (info :setf :expander 'the))
   (%defsetf 'the* (info :setf :expander 'the))
-
-  (%defsetf 'mask-field (info :setf :expander 'ldb)
-            "The first argument is a byte specifier. The second is any place form
+  (%defsetf 'mask-field
+              (lambda (&rest args)
+              "The first argument is a byte specifier. The second is any place form
 acceptable to SETF. Replaces the specified byte of the number in this place
-with bits from the corresponding position in the new value.")
+with bits from the corresponding position in the new value."
+              (apply (info :setf :expander 'ldb) args)))
 
 ;;; SETF of LOGBITP is not mandated by CLHS but is nice to have.
 ;;; FIXME: the code is suboptimal. Better code would "pre-shift" the 1 bit,
 ;;; so that result = (in & ~mask) | (flag ? mask : 0)
 ;;; Additionally (setf (logbitp N x) t) is extremely stupid- it first clears
 ;;; and then sets the bit, though it does manage to pre-shift the constants.
-   (%defsetf 'logbitp (info :setf :expander 'ldb))))
+  (%defsetf 'logbitp (info :setf :expander 'ldb))))
 
 ;;; Rather than have a bunch of SB-PCL::FAST-METHOD function names all point
 ;;; to one that is randomly chosen - and therefore looks confusing -
@@ -359,8 +356,8 @@ with bits from the corresponding position in the new value.")
 (export '(0-arg-nil 1-arg-nil 2-arg-nil 3-arg-nil n-arg-nil
           1-arg-t n-arg-t)
         "SB-IMPL") ; export to prevent death by tree-shaker
-(defun n-arg-nil () (declare (optimize (sb-c::verify-arg-count 0))) nil)
-(defun n-arg-t   () (declare (optimize (sb-c::verify-arg-count 0))) t)
+(defun n-arg-nil () (declare (optimize (sb-c:verify-arg-count 0))) nil)
+(defun n-arg-t   () (declare (optimize (sb-c:verify-arg-count 0))) t)
 (defun 0-arg-nil () nil)
 (defun 1-arg-nil (a) (declare (ignore a)) nil)
 (defun 1-arg-t   (a) (declare (ignore a)) t)

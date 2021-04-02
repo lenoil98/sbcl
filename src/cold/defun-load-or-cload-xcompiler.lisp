@@ -95,26 +95,7 @@
         (loop (if (plusp subprocess-count) (wait) (return)))
         (when stop
           (sb-cold::exit-process 1)))))
-
-  ;; We want to load compiled files, because that's what this function promises.
-  ;; Reloading is tricky because constructors for interned ctypes will construct
-  ;; new objects via their LOAD-TIME-VALUE forms, but globaldb already stored
-  ;; some objects from the interpreted pre-load.
-  ;; So wipe everything out that causes problems down the line.
-  ;; (Or perhaps we could make their effects idempotent)
-  (format t "~&; Parallel build: Clearing globaldb~%")
-  (funcall (intern "ANNIHILATE-GLOBALDB" "SB-C"))
-
-  (format t "~&; Parallel build: Reloading compilation artifacts~%")
-  ;; Now it works to load fasls.
-  (in-host-compilation-mode
-   (lambda ()
-     (handler-bind ((host-sb-kernel:redefinition-warning #'muffle-warning))
-       (do-stems-and-flags (stem flags 1)
-         (unless (position :not-host flags)
-           (load (stem-object-path stem flags :host-compile)
-                 :verbose t :print nil))))))
-  (format t "~&; Parallel build: Fasl loading complete~%"))
+  (format t "~&; Parallel build: Skipping fasl load~%"))
 
 ;;; Either load or compile-then-load the cross-compiler into the
 ;;; cross-compilation host Common Lisp.
@@ -132,6 +113,8 @@
   (if (and (make-host-1-parallelism)
            (eq load-or-cload-stem #'host-cload-stem))
       (progn
+        ;; FIXME: muffler not working in forked children?
+        (setq *fail-on-warnings* nil)
         ;; Multiprocess build uses the in-memory math ops cache but not
         ;; the persistent cache file because we don't need each child
         ;; to be forced to read the file. Moreover, newly inserted values
@@ -154,6 +137,8 @@
       (with-math-journal
        (do-stems-and-flags (stem flags 1)
          (unless (find :not-host flags)
+           ;; Enforce naming convention: target-* files are not for make-host-1
+           (assert (not (search "code/target-" stem)))
            (funcall load-or-cload-stem stem flags)
            (when (member :sb-show sb-xc:*features*)
              (funcall 'warn-when-cl-snapshot-diff *cl-snapshot*))))))
@@ -170,5 +155,16 @@
   ;; (Except that purifying actually slows down GENCGC). -- JES, 2006-05-30
   #+(and sbcl (not gencgc))
   (host-sb-ext:purify)
+
+  ;; Let's check that the type system, and various other things, are
+  ;; reasonably sane. (It's easy to spend a long time wandering around
+  ;; confused trying to debug cross-compilation if it isn't.)
+  (funcall 'sb-c::check-vop-existence-correctness)
+  (let ((*readtable* *xc-readtable*)
+        (*load-verbose* t))
+    (with-math-journal
+       (load "tests/type.before-xc.lisp")
+       (load "tests/info.before-xc.lisp")
+       (load "tests/vm.before-xc.lisp")))
 
   (values))

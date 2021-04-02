@@ -12,12 +12,25 @@
 
 (in-package "SB-KERNEL")
 
+(defun decode-internal-error-args (sap trap-number &optional error-number)
+  (let ((error-number (cond (error-number)
+                            ((>= trap-number sb-vm:error-trap)
+                             (prog1
+                                 (- trap-number sb-vm:error-trap)
+                               (setf trap-number sb-vm:error-trap)))
+                            (t
+                             (prog1 (sap-ref-8 sap 0)
+                               (setf sap (sap+ sap 1)))))))
+    (let ((length (error-length error-number)))
+      (declare (type (unsigned-byte 8) length))
+      (values error-number
+              (loop repeat length with index = 0
+                    collect (sb-c:sap-read-var-integerf sap index))
+              trap-number))))
+
 (defun muffle-warning-p (warning)
   (declare (special *muffled-warnings*))
   (typep warning *muffled-warnings*))
-
-;; Host lisp does not need a value for this, so start it out as NIL.
-(define-load-time-global **initial-handler-clusters** nil)
 
 ;;; Each cluster is an alist of the form
 ;;;
@@ -33,23 +46,6 @@
 ;;;
 ;;; Lists to which *HANDLER-CLUSTERS* is bound generally have dynamic
 ;;; extent.
-#+sb-thread (!define-thread-local *handler-clusters* **initial-handler-clusters**)
-#-sb-thread (defvar *handler-clusters* **initial-handler-clusters**)
-
-;;; a list of lists of currently active RESTART instances. maintained
-;;; by RESTART-BIND.
-(!define-thread-local *restart-clusters* nil)
-
-(defun !target-error-cold-init ()
-  (setq **initial-handler-clusters**
-        `(((,(find-classoid-cell 'warning :create t)
-            .
-            ,(named-lambda "MAYBE-MUFFLE" (warning)
-               (when (muffle-warning-p warning)
-                 (muffle-warning warning)))))))
-  ;;; If multithreaded, *HANDLER-CLUSTERS* is #<unbound> at this point.
-  ;;; This SETQ assigns to TLS since the value is not no-tls-value-marker.
-  (setq *handler-clusters* **initial-handler-clusters**))
 
 (defmethod print-object ((restart restart) stream)
   (if *print-escape*
@@ -308,6 +304,10 @@ with that condition (or with no condition) will be returned."
 
 (defun ecase-failure (value keys)
   (declare (optimize allow-non-returning-tail-call))
+  ;; inline definition not seen yet. Can't move this file later
+  ;; in build because **<foo>-clusters** are needed early.
+  (declare (notinline coerce))
+  (when (vectorp keys) (setq keys (coerce keys 'list)))
   (error 'case-failure
          :name 'ecase
          :datum value

@@ -14,24 +14,6 @@
 
 (in-package "SB-BIGNUM")
 
-;;; Return T if the least significant N-BITS bits of BIGNUM are all
-;;; zero, else NIL. If the integer-length of BIGNUM is less than N-BITS,
-;;; the result is NIL, too.
-(declaim (inline bignum-lower-bits-zero-p))
-(defun bignum-lower-bits-zero-p (bignum n-bits)
-  (declare (type bignum bignum)
-           (type bit-index n-bits))
-  (multiple-value-bind (n-full-digits n-bits-partial-digit)
-      (floor n-bits digit-size)
-    (declare (type bignum-length n-full-digits))
-    (when (> (%bignum-length bignum) n-full-digits)
-      (dotimes (index n-full-digits)
-        (declare (type bignum-index index))
-        (unless (zerop (%bignum-ref bignum index))
-          (return-from bignum-lower-bits-zero-p nil)))
-      (zerop (logand (1- (ash 1 n-bits-partial-digit))
-                     (%bignum-ref bignum n-full-digits))))))
-
 ;;; Return a nonnegative integer of DIGIT-SIZE many pseudo random bits.
 (declaim (inline random-bignum-digit))
 (defun random-bignum-digit (state)
@@ -56,7 +38,7 @@
 (declaim (inline concatenate-random-bignum))
 (defun concatenate-random-bignum (random-chunk bit-count state)
   (declare (type bignum-element-type random-chunk)
-           (type (integer 0 #.sb-xc:most-positive-fixnum) bit-count)
+           (type (integer 0 #.most-positive-fixnum) bit-count)
            (type random-state state))
   (let* ((n-total-bits (+ 1 n-random-chunk-bits bit-count)) ; sign bit
          (length (ceiling n-total-bits digit-size))
@@ -133,7 +115,7 @@
 ;;;   generate and compare the complete random number and risk to reject
 ;;;   it.
 (defun %random-bignum (arg state)
-  (declare (type (integer #.(1+ sb-xc:most-positive-fixnum)) arg)
+  (declare (type (integer #.(1+ most-positive-fixnum)) arg)
            (type random-state state)
            (inline bignum-lower-bits-zero-p))
   (let ((n-bits (bignum-integer-length arg)))

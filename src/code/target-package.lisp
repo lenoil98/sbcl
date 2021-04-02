@@ -48,8 +48,7 @@
 ;;;; sufficient, though interaction between parallel intern and use-package
 ;;;; needs to be considered with some care.
 
-(!define-load-time-global *package-graph-lock*
-    #.(sb-thread:make-mutex :name "Package Graph Lock"))
+(!define-load-time-global *package-graph-lock* (sb-thread:make-mutex :name "Package Graph Lock"))
 
 (defmacro with-package-graph ((&key) &body forms)
   ;; FIXME: Since name conflicts can be signalled while holding the
@@ -212,7 +211,7 @@
                          (ash (ldb (byte pkgnick-index-bits 0) token) 1))))))
 
 ;;; This would have to be bumped ~ 2*most-positive-fixnum times to overflow.
-(define-load-time-global *package-names-cookie* sb-xc:most-negative-fixnum)
+(define-load-time-global *package-names-cookie* most-negative-fixnum)
 (declaim (fixnum *package-names-cookie*))
 
 (defmacro with-package-names ((table-var &key) &body body)
@@ -469,8 +468,8 @@ error if any of PACKAGES is not a valid package designator."
 
 (defun lexically-unlocked-symbol-p (symbol)
   (member symbol
-          (if (boundp 'sb-c::*lexenv*)
-              (let ((list (sb-c::lexenv-disabled-package-locks sb-c::*lexenv*)))
+          (if (boundp 'sb-c:*lexenv*)
+              (let ((list (sb-c::lexenv-disabled-package-locks sb-c:*lexenv*)))
                 ;; The so-called LIST might be an interpreter env.
                 #+sb-fasteval
                 (unless (listp list)
@@ -534,6 +533,57 @@ error if any of PACKAGES is not a valid package designator."
   (let ((name (package-%name package)))
     (print-unreadable-object (package stream :type t :identity (not name))
       (if name (prin1 name stream) (write-string "(deleted)" stream)))))
+
+;;; Perform (GETHASH NAME TABLE) and then unwrap the value if it is a list.
+;;; List vs nonlist disambiguates a nickname from the primary name.
+;;; And never return the symbol :DELETED.
+(declaim (inline %get-package))
+(defun %get-package (name table)
+  (let ((found (info-gethash name table)))
+    (cond ((listp found) (car found))
+          ((neq found :deleted) found))))
+
+;;; This is undocumented and unexported for now, but the idea is that by
+;;; making this a generic function then packages with custom package classes
+;;; could hook into this to provide their own resolution.
+;;; (Any such generic solution will turn the performance to crap, so let's not)
+(declaim (inline find-package-using-package))
+(defun find-package-using-package (package-designator base)
+  (let ((string (typecase package-designator
+                  (package
+                   (return-from find-package-using-package package-designator))
+                  (symbol (symbol-name package-designator))
+                  (string package-designator)
+                  (character (string package-designator))
+                  (t
+                   (sb-c::%type-check-error package-designator '(or character package string symbol) nil)))))
+    (or (and base
+             (package-%local-nicknames base)
+             (pkgnick-search-by-name string base))
+        (%get-package string *package-names*))))
+
+(defun find-package (package-designator)
+  "If PACKAGE-DESIGNATOR is a package, it is returned. Otherwise PACKAGE-DESIGNATOR
+must be a string designator, in which case the package it names is located and returned.
+
+As an SBCL extension, the current package may affect the way a package name is
+resolved: if the current package has local nicknames specified, package names
+matching those are resolved to the packages associated with them instead.
+
+Example:
+
+  (defpackage :a)
+  (defpackage :example (:use :cl) (:local-nicknames (:x :a)))
+  (let ((*package* (find-package :example)))
+    (find-package :x)) => #<PACKAGE A>
+
+See also: ADD-PACKAGE-LOCAL-NICKNAME, PACKAGE-LOCAL-NICKNAMES,
+REMOVE-PACKAGE-LOCAL-NICKNAME, and the DEFPACKAGE option :LOCAL-NICKNAMES."
+  (declare (explicit-check))
+  ;; We had a BOUNDP check on *PACKAGE* here, but it's effectless due to the
+  ;; always-bound proclamation.
+  (find-package-using-package package-designator *package*))
+(declaim (notinline find-package-using-package))
 
 ;;; ANSI says (in the definition of DELETE-PACKAGE) that these, and
 ;;; most other operations, are unspecified for deleted packages. We
@@ -741,58 +791,6 @@ Experimental: interface subject to change."
   (declare (ignore condition))
   (bug "No such thing as DEBOOTSTRAP-PACKAGE"))
 
-(defun find-package (package-designator)
-  "If PACKAGE-DESIGNATOR is a package, it is returned. Otherwise PACKAGE-DESIGNATOR
-must be a string designator, in which case the package it names is located and returned.
-
-As an SBCL extension, the current package may affect the way a package name is
-resolved: if the current package has local nicknames specified, package names
-matching those are resolved to the packages associated with them instead.
-
-Example:
-
-  (defpackage :a)
-  (defpackage :example (:use :cl) (:local-nicknames (:x :a)))
-  (let ((*package* (find-package :example)))
-    (find-package :x)) => #<PACKAGE A>
-
-See also: ADD-PACKAGE-LOCAL-NICKNAME, PACKAGE-LOCAL-NICKNAMES,
-REMOVE-PACKAGE-LOCAL-NICKNAME, and the DEFPACKAGE option :LOCAL-NICKNAMES."
-  ;: We had a BOUNDP check on *PACKAGE* here, but it's effectless due to the
-  ;; always-bound proclamation.
-  (truly-the (or null package) ; force elision of return value type check
-    (find-package-using-package package-designator *package*)))
-
-;;; Perform (GETHASH NAME TABLE) and then unwrap the value if it is a list.
-;;; List vs nonlist disambiguates a nickname from the primary name.
-;;; And never return the symbol :DELETED.
-(defun %get-package (name table)
-  (let ((found (info-gethash name table)))
-    (cond ((listp found) (car found))
-          ((neq found :deleted) found))))
-
-;;; This is undocumented and unexported for now, but the idea is that by
-;;; making this a generic function then packages with custom package classes
-;;; could hook into this to provide their own resolution.
-;;; (Any such generic solution will turn the performance to crap, so let's not)
-(defun find-package-using-package (package-designator base)
-  (typecase package-designator
-    (package package-designator)
-    ;; Rather than use STRINGIFY-STRING-DESIGNATOR, we check type by hand
-    ;; to avoid consing a new simple-base-string if the designator is one
-    ;; that would undergo coercion entailing allocation.
-    ((or symbol string character)
-     (let ((string (string package-designator)))
-       (or (and base
-                (package-%local-nicknames base)
-                (pkgnick-search-by-name string base))
-           (%get-package string *package-names*))))
-    ;; Is there a fundamental reason we don't declare the FTYPE
-    ;; of FIND-PACKAGE-USING-PACKAGE letting the compiler do the checking?
-    (t (error 'type-error
-                :datum package-designator
-                :expected-type '(or character package string symbol)))))
-
 ;;; Return a list of packages given a package designator or list of
 ;;; package designators, or die trying.
 (defun package-listify (thing)
@@ -899,12 +897,12 @@ REMOVE-PACKAGE-LOCAL-NICKNAME, and the DEFPACKAGE option :LOCAL-NICKNAMES."
 ;;; of STRING. ENTRY-HASH is the entry-hash of the string and length.
 ;;; If the symbol is found, then FORMS are executed; otherwise not.
 
-(defmacro with-symbol (((symbol-var &optional (index-var (gensym))) table
+(defmacro with-symbol (((symbol-var &optional (index-var (sb-xc:gensym))) table
                        string length sxhash) &body forms)
   (with-unique-names (vec len h2 probed-thing name)
     `(let* ((,vec (package-hashtable-cells ,table))
             (,len (length ,vec))
-            (,index-var (rem (the hash ,sxhash) ,len))
+            (,index-var (rem (the hash-code ,sxhash) ,len))
             (,h2 (1+ (the index (rem ,sxhash (the index (- ,len 2)))))))
        (declare (type index ,len ,h2 ,index-var))
        (loop
@@ -933,7 +931,7 @@ REMOVE-PACKAGE-LOCAL-NICKNAME, and the DEFPACKAGE option :LOCAL-NICKNAMES."
          (length (length string))
          (hash (symbol-hash symbol)))
     (declare (type index length)
-             (type hash hash))
+             (hash-code hash))
     (with-symbol ((symbol index) table string length hash)
       ;; It is suboptimal to grab the vectors again, but not broken,
       ;; because we have exclusive use of the table for writing.
@@ -1199,7 +1197,7 @@ implementation it is ~S." *!default-package-use-list*)
   (declare (simple-string string)
            (type index length))
   (let ((hash (compute-symbol-hash string length)))
-    (declare (type hash hash))
+    (declare (hash-code hash))
     (with-symbol ((symbol) (package-internal-symbols package) string length hash)
       (return-from %find-symbol (values symbol :internal)))
     (with-symbol ((symbol) (package-external-symbols package) string length hash)
@@ -1332,7 +1330,7 @@ implementation it is ~S." *!default-package-use-list*)
   (declare (simple-string string))
   (let* ((length (length string))
          (hash (compute-symbol-hash string length)))
-    (declare (type index length) (type hash hash))
+    (declare (type index length) (hash-code hash))
     (with-symbol ((symbol) (package-external-symbols package) string length hash)
       (return-from find-external-symbol symbol)))
   0)
@@ -1798,7 +1796,10 @@ PACKAGE."
   (fresh-line)
   (prin1 symbol)
   (when (boundp symbol)
-    (write-string " (bound)"))
+    (let ((value (symbol-value symbol)))
+      (if (typep value '(or fixnum symbol hash-table))
+          (format t " = ~S" value)
+          (format t " (bound, ~S)" (type-of value)))))
   (when (fboundp symbol)
     (write-string " (fbound)")))
 
@@ -1857,6 +1858,9 @@ PACKAGE."
         (cons (make-info-hashtable :comparator #'pkg-name=
                                    :hash-function #'sxhash)
               1))
+  (setf (sb-thread:mutex-name (info-env-mutex *package-names*)) "package names"
+        (sb-thread:mutex-name (info-env-mutex (car *package-nickname-ids*)))
+        "package nicknames")
   (with-package-names (names)
     (dolist (spec *!initial-symbols*)
       (let ((pkg (car spec)) (symbols (cdr spec)))

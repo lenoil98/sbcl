@@ -17,10 +17,9 @@
 
 (in-package "SB-IMPL")
 
-;;; like (DELETE .. :TEST #'EQ):
-;;;   Delete all LIST entries EQ to ITEM (destructively modifying
-;;;   LIST), and return the modified LIST.
 (defun delq (item list)
+  "Delete all LIST entries EQ to ITEM (destructively modifying LIST),
+and return the modified LIST."
   (declare (explicit-check))
   (let ((list list))
     (do ((x list (cdr x))
@@ -32,14 +31,12 @@
                  (rplacd splice (cdr x))))
             (t (setq splice x)))))) ; Move splice along to include element.
 
-;;; like (POSITION .. :TEST #'EQ):
-;;;   Return the position of the first element EQ to ITEM.
 (defun posq (item list)
-  (do ((i list (cdr i))
-       (j 0 (1+ j)))
-      ((null i))
-    (when (eq (car i) item)
-      (return j))))
+  "Return the position of the first element EQ to ITEM."
+  (declare (inline position))
+  (position item list :test #'eq))
+
+(defun interned-symbol-p (x) (and (symbolp x) (symbol-package x)))
 
 ;;;; variables initialization and shutdown sequences
 
@@ -151,8 +148,8 @@ these hooks.")
     `(let* ((,size ,initial-size)
             (,string (make-array ,size :element-type ',element-type))
             (,pointer 0))
-       (declare (type (integer 0 ,sb-xc:array-dimension-limit) ,size)
-                (type (integer 0 ,(1- sb-xc:array-dimension-limit)) ,pointer)
+       (declare (type (integer 0 ,array-dimension-limit) ,size)
+                (type (integer 0 ,(1- array-dimension-limit)) ,pointer)
                 (type (simple-array ,element-type (*)) ,string))
        (flet ((push-char (char)
                 (declare (optimize (sb-c::insert-array-bounds-checks 0)))
@@ -184,12 +181,7 @@ unspecified."
   ;; Needless to say, this also excludes some internal bits, but
   ;; getting there is too much detail when "unspecified" says what
   ;; is important -- unpredictable, but harmless.
-  `(sb-thread::with-recursive-lock ((hash-table-lock ,hash-table))
-     ,@body))
-
-(defmacro with-locked-system-table ((hash-table) &body body)
-  `(sb-thread::with-recursive-system-lock
-       ((hash-table-lock ,hash-table))
+  `(sb-thread:with-recursive-lock ((hash-table-lock ,hash-table))
      ,@body))
 
 (defmacro find-package-restarts ((package-designator &optional reader)
@@ -289,3 +281,20 @@ unspecified."
          `(defvar ,name ,@(when valuep (list value))))
         ((:final)
          `',name))))
+
+(define-load-time-global *deprecated-exports* nil)
+
+(defun deprecate-export (package symbol state version)
+  (declare (type deprecation-state state)
+           (type string version)
+           (type symbol symbol))
+  (setf (getf (getf *deprecated-exports* package) symbol)
+        (cons state version)))
+
+(defun check-deprecated-export (package symbol)
+  (let ((state (getf (getf *deprecated-exports* package) symbol)))
+    (when state
+      (deprecation-warn (car state) "SBCL" (cdr state) 'symbol
+                        (format nil "~A:~A" (package-name package) symbol)
+                        (list symbol))
+      t)))

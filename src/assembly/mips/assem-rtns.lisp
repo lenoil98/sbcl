@@ -155,7 +155,7 @@
 (define-assembly-routine
     (unwind
      (:return-style :none)
-     (:translate %continue-unwind)
+     (:translate %unwind)
      (:policy :fast-safe))
     ((:arg block (any-reg descriptor-reg) a0-offset)
      (:arg start (any-reg descriptor-reg) ocfp-offset)
@@ -214,5 +214,6 @@
   (loadw catch catch catch-block-previous-catch-slot)
 
   EXIT
-  (inst j (make-fixup 'unwind :assembly-routine))
-  (move target catch t))
+  (inst li target (make-fixup 'unwind :assembly-routine))
+  (inst j target)
+  (inst move target catch))

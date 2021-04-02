@@ -51,12 +51,6 @@
  ;; our dialect
  :sbcl
 
- ;; Douglas Thomas Crosher's conservative generational GC (the only one
- ;; we currently support for X86).
- ;; :gencgc used to be here; CSR moved it into
- ;; local-target-features.lisp-expr via make-config.sh, as alpha,
- ;; sparc and ppc ports don't currently support it. -- CSR, 2002-02-21
-
  ;;
  ;; features present in this particular build
  ;;
@@ -159,13 +153,6 @@
  ;;
  ; :cycle-counter
 
- ;; Allow the main dynamic space to be allocated anywhere
- ;; by the OS kernel regardless of the configuration-time value
- ;; of dynamic-space-start.
- ;; The downside is the potential need for startup-time relocation.
- ;; Enabled by default if supported
- ; :relocatable-heap
-
  ;; Build with support for an additional dynamic heap
  ;; differing from the main dynamic heap in two ways:
  ;;  1. it is guaranteed to reside below 4GB so that all pointers
@@ -220,17 +207,6 @@
  ;; primitive, on other platforms we don't have this luxury.
  ;;
  ; :sb-futex
-
- ;; On some operating systems the FS segment register (used for SBCL's
- ;; thread local storage) is not reliably preserved in signal
- ;; handlers, so we need to restore its value from the pthread thread
- ;; local storage.
- ; :restore-fs-segment-register-from-tls
-
- ;; On some x86oid operating systems (darwin) SIGTRAP is not reliably
- ;; delivered for the INT3 instruction, so we use the UD2 instruction
- ;; which generates SIGILL instead.
- ; :ud2-breakpoints
 
  ;; Support for detection of unportable code (when applied to the
  ;; COMMON-LISP package, or SBCL-internal pacakges) or bad-neighbourly
@@ -314,19 +290,6 @@
  ;; (Replaces use of SIG_STOP_FOR_GC.)
  ; :sb-safepoint
 
- ;; When compiling with safepoints, the INTERRUPT-THREAD mechanism can
- ;; also use safepoints to roll the target thread to a point at which it
- ;; can be interrupted safely, instead of using a signal for this
- ;; purpose.  Enable this feature in addition to :SB-SAFEPOINT to enable
- ;; such behaviour.
- ;; (Replaces use of SIGPIPE, except to wake up syscalls.)
- ; :sb-thruption
-
- ;; When compiling with safepoints and thruptions, the TIMER facility
- ;; can replace its use of setitimer with a background thread.
- ;; (Replaces use of SIGALRM.)
- ; :sb-wtimer
-
  ;;
  ;; miscellaneous notes on other things which could have special significance
  ;; in the *FEATURES* list
@@ -370,14 +333,12 @@
  ;;      any Intel 386 or better, or compatibles like the AMD K6 or K7
  ;;   :x86-64
  ;;      any x86-64 CPU running in 64-bit mode
- ;;   :alpha
- ;;      DEC/Compaq Alpha CPU
  ;;   :sparc
  ;;      any Sun UltraSPARC (possibly also non-Ultras -- currently untested)
  ;;   :ppc
  ;;      any PowerPC CPU
- ;;   :hppa
- ;;      any PA-RISC CPU
+ ;;   :ppc64
+ ;;      64-bit PowerPC CPU, ISA 2.06 (POWER7) or later
  ;;   :mips
  ;;      any MIPS CPU (in little-endian mode with :little-endian)
  ;;   :arm
@@ -394,11 +355,10 @@
  ;; properties derived from the machine architecture
  ;;
  ;;   :64-bit
- ;;     means (= sb-vm:n-word-bits 64) currently true for x86-64 and arm64
+ ;;     means (= sb-vm:n-word-bits 64) currently true for x86-64, arm64, riscv64, ppc64
  ;;
  ;;   :64-bit-registers
- ;;     means (= sb-vm:n-machine-word-bits 64) currently true for alpha,
- ;;     arm64, and x86-64.
+ ;;     means (= sb-vm:n-machine-word-bits 64), yet (= sb-vm:n-word-bits 32) currently true for alpha
  ;;
  ;;   :control-stack-grows-downward-not-upward
  ;;     On the X86, the Lisp control stack grows downward. On the
@@ -411,9 +371,6 @@
  ;;   understand very well. As of sbcl-0.7.1.40 things like that are
  ;;   just parameterized by #+X86, but it'd probably be better to
  ;;   use new flags like :CONTROL-STACK-CONTAINS-C-STACK.
- ;;
- ;;   :stack-allocatable-closures
- ;;     The compiler can allocate dynamic-extent closures on stack.
  ;;
  ;;   :alien-callbacks
  ;;     Alien callbacks have been implemented for this platform.
@@ -436,9 +393,5 @@
  ;;   :darwin     = We're intended to run under Darwin (including MacOS X).
  ;;   :sunos      = We're intended to run under Solaris user environment
  ;;                 with the SunOS kernel.
- ;;   :hpux       = We're intended to run under HP-UX 11.11 or later
  ;;   :win32      = We're intended to under some version of Microsoft Windows.
- ;; (No others are supported by SBCL as of 1.0.8, but :hpux or :irix
- ;; support could be ported from CMU CL if anyone is sufficiently
- ;; motivated to do so.)
  )

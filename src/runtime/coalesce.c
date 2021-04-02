@@ -26,12 +26,13 @@
 #include "immobile-space.h"
 #include "hopscotch.h"
 #include "code.h"
+#include "getallocptr.h"
 
 static boolean gcable_pointer_p(lispobj pointer)
 {
 #ifdef LISP_FEATURE_CHENEYGC
    return pointer >= (lispobj)current_dynamic_space
-       && pointer < (lispobj)dynamic_space_free_pointer;
+       && pointer < (lispobj)get_alloc_pointer();
 #endif
 #ifdef LISP_FEATURE_GENCGC
    return find_page_index((void*)pointer) >= 0 || immobile_space_p(pointer);
@@ -152,29 +153,22 @@ static void coalesce_obj(lispobj* where, struct hopscotch_table* ht)
 static uword_t coalesce_range(lispobj* where, lispobj* limit, uword_t arg)
 {
     struct hopscotch_table* ht = (struct hopscotch_table*)arg;
-    lispobj layout, bitmap, *next;
+    lispobj layout, *next;
     sword_t nwords, i;
 
     for ( ; where < limit ; where = next ) {
-        lispobj header = *where;
-        if (is_cons_half(header)) {
-            coalesce_obj(where+0, ht);
-            coalesce_obj(where+1, ht);
-            next = where + 2;
-        } else {
-            int widetag = header_widetag(header);
+        lispobj word = *where;
+        if (is_header(word)) {
+            int widetag = header_widetag(word);
             nwords = sizetab[widetag](where);
             next = where + nwords;
             switch (widetag) {
             case INSTANCE_WIDETAG: // mixed boxed/unboxed objects
-#ifdef LISP_FEATURE_COMPACT_INSTANCE_HEADER
             case FUNCALLABLE_INSTANCE_WIDETAG:
-#endif
-                layout = instance_layout(where);
-                bitmap = LAYOUT(layout)->bitmap;
-                for(i=1; i<nwords; ++i)
-                    if (layout_bitmap_logbitp(i-1, bitmap))
-                        coalesce_obj(where+i, ht);
+                layout = layout_of(where);
+                struct bitmap bitmap = get_layout_bitmap(LAYOUT(layout));
+                for (i=0; i<(nwords-1); ++i)
+                    if (bitmap_logbitp(i, bitmap)) coalesce_obj(where+1+i, ht);
                 continue;
             case CODE_HEADER_WIDETAG:
                 nwords = code_header_words((struct code*)where);
@@ -185,6 +179,10 @@ static uword_t coalesce_range(lispobj* where, lispobj* limit, uword_t arg)
             }
             for(i=1; i<nwords; ++i)
                 coalesce_obj(where+i, ht);
+        } else {
+            coalesce_obj(where+0, ht);
+            coalesce_obj(where+1, ht);
+            next = where + 2;
         }
     }
     return 0;
@@ -205,7 +203,7 @@ void coalesce_similar_objects()
     coalesce_range((lispobj*)READ_ONLY_SPACE_START,
                    (lispobj*)READ_ONLY_SPACE_END,
                    arg);
-    coalesce_range((lispobj*)STATIC_SPACE_START,
+    coalesce_range((lispobj*)STATIC_SPACE_OBJECTS_START,
                    (lispobj*)STATIC_SPACE_END,
                    arg);
 #endif
@@ -216,7 +214,7 @@ void coalesce_similar_objects()
 #ifdef LISP_FEATURE_GENCGC
     walk_generation(coalesce_range, -1, arg);
 #else
-    coalesce_range(current_dynamic_space, dynamic_space_free_pointer, arg);
+    coalesce_range(current_dynamic_space, get_alloc_pointer(), arg);
 #endif
     hopscotch_destroy(&ht);
 }

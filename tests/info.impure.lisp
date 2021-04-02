@@ -109,7 +109,7 @@
     (assert (member 'happiness *recognized-declarations*))
     (proclaim '(declaration happiness))
     (assert (equal *recognized-declarations* saved)) ; not pushed again
-    (setf (info :declaration :recognized 'happiness) nil)
+    (setf (info :declaration :known 'happiness) nil)
     (assert (not (member 'happiness *recognized-declarations*)))))
 
 (test-util:with-test (:name :recognized-decl-not-also-type)
@@ -178,7 +178,7 @@
         (let ((val (format nil "value for ~D" num)))
           (setq iv1 (quick-packed-info-insert iv1 num val)
                 iv2 (%packed-info-insert ; not PACKED-INFO-INSERT
-                     iv2 +no-auxilliary-key+ num val))
+                     iv2 +no-auxiliary-key+ num val))
           (assert (equalp iv1 iv2))))
       ;; the first and only info descriptor should be full
       (assert (not (info-quickly-insertable-p iv1))))))
@@ -501,7 +501,7 @@
   ;; Precompute random generalized function names for testing, some of which
   ;; are "simple" (per the taxonomy of globaldb) and some hairy.
   (let ((work (coerce (loop repeat 10000
-                            nconc (list `(sb-pcl::slow-method ,(gensym)) ; simple name
+                            nconc (list `(setf ,(gensym)) ; simple name
                                          (gensym))) ; very simple name
                       'vector))
         (n-threads 10) readers writers fdefn-results random-results)

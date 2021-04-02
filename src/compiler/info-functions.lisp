@@ -76,7 +76,10 @@
 
         (unless (eq :function kind)
           (assert-it)
-          (setf (info :function :kind name) :function)))))
+          ;; There's no reason to store (:FUNCTION :KIND) for names which
+          ;; could only be of kind :FUNCTION if anything.
+          (unless (pcl-methodfn-name-p name)
+            (setf (info :function :kind name) :function))))))
 
   ;; scrubbing old data II: dangling forward references
   ;;
@@ -85,8 +88,9 @@
   ;; in EVAL-WHEN (:COMPILE) inside something like DEFSTRUCT, in which
   ;; case it's reasonable style. Either way, NAME is no longer a free
   ;; function.)
-  (when (boundp '*free-funs*)       ; when compiling
-    (remhash name *free-funs*))
+  (when (boundp '*ir1-namespace*)       ; when compiling
+    (unless (block-compile *compilation*)
+      (remhash name (free-funs *ir1-namespace*))))
 
   (values))
 
@@ -148,7 +152,9 @@
 ;;; was explicit. See SAVE-INLINE-EXPANSION-P for why we care.
 ;;; (Essentially, once stored then always stored, lest inconsistency result)
 ;;; If we have just a DXABLE-ARGS, or nothing at all, return NIL and NIL.
-(declaim (ftype (sfunction ((or symbol cons)) (values list boolean))
+;;; If called on a string or anything that is not a function designator,
+;;; return NIL and NIL.
+(declaim (ftype (sfunction (t) (values list boolean))
                 fun-name-inline-expansion))
 (defun fun-name-inline-expansion (fun-name)
   (multiple-value-bind (answer winp) (info :function :inlining-data fun-name)
@@ -171,7 +177,7 @@
 ;;;; ANSI Common Lisp functions which are defined in terms of the info
 ;;;; database
 
-(defun sb-xc:macro-function (symbol &optional env)
+(defun macro-function (symbol &optional env)
   "If SYMBOL names a macro in ENV, returns the expansion function,
 else returns NIL. If ENV is unspecified or NIL, use the global environment
 only."
@@ -182,15 +188,15 @@ only."
      (multiple-value-bind (kind def)
          (sb-interpreter:find-lexical-fun env symbol)
        (when def
-         (return-from sb-xc:macro-function (when (eq kind :macro) def)))))
+         (return-from macro-function (when (eq kind :macro) def)))))
     (lexenv
      (let ((def (cdr (assoc symbol (lexenv-funs env)))))
        (when def
-         (return-from sb-xc:macro-function
+         (return-from macro-function
            (when (typep def '(cons (eql macro))) (cdr def)))))))
   (values (info :function :macro-function symbol)))
 
-(defun (setf sb-xc:macro-function) (function symbol &optional environment)
+(defun (setf macro-function) (function symbol &optional environment)
   (declare (symbol symbol) (type function function))
   (when environment
     ;; Note: Technically there could be an ENV optional argument to SETF
@@ -209,7 +215,7 @@ only."
     #-sb-xc-host (install-guard-function symbol `(:macro ,symbol)))
   function)
 
-(defun sb-xc:compiler-macro-function (name &optional env)
+(defun compiler-macro-function (name &optional env)
   "If NAME names a compiler-macro in ENV, return the expansion function, else
 return NIL. Can be set with SETF when ENV is NIL."
   (legal-fun-name-or-type-error name)
@@ -228,7 +234,7 @@ return NIL. Can be set with SETF when ENV is NIL."
     (values (info :function :compiler-macro-function name))))
 
 ;;; FIXME: we don't generate redefinition warnings for these.
-(defun (setf sb-xc:compiler-macro-function) (function name &optional env)
+(defun (setf compiler-macro-function) (function name &optional env)
   (declare (type (or symbol list) name)
            (type (or function null) function))
   (when env

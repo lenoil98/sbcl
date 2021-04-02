@@ -17,11 +17,25 @@
 ;;;; utilities used during code generation
 
 ;;; the number of bytes used by the code object header
+
+#-sb-xc-host
 (defun component-header-length (&optional
                                 (component *component-being-compiled*))
   (let* ((2comp (component-info component))
          (constants (ir2-component-constants 2comp)))
     (ash (align-up (length constants) code-boxed-words-align) sb-vm:word-shift)))
+
+;;; KLUDGE: the assembler can not emit backpatches comprising jump tables without
+;;; knowing the boxed code header length. But there is no compiler IR2 metaobject,
+;;; for SB-FASL:*ASSEMBLER-ROUTINES*. We have to return a fixed answer for that.
+#+sb-xc-host
+(defun component-header-length ()
+  (if (boundp '*component-being-compiled*)
+      (let ((component *component-being-compiled*))
+        (let* ((2comp (component-info component))
+               (constants (ir2-component-constants 2comp)))
+          (ash (align-up (length constants) code-boxed-words-align) sb-vm:word-shift)))
+      (* sb-vm:n-word-bytes 4)))
 
 ;;; the size of the NAME'd SB in the currently compiled component.
 ;;; This is useful mainly for finding the size for allocating stack
@@ -86,9 +100,6 @@
            (block-home-lambda
             (block-next (component-head *component-being-compiled*))))
           (or (> speed compilation-speed) (> space compilation-speed))))
-(defun default-segment-inst-hook ()
-  (and *compiler-trace-output*
-       #'trace-instruction))
 
 ;;; Some platforms support unboxed constants immediately following the boxed
 ;;; code header. Such platform must implement supporting 4 functions:
@@ -114,22 +125,58 @@
 ;;; to get handles (as returned by sb-vm:inline-constant-value) from constant
 ;;; descriptors.
 ;;;
-#+(or x86 x86-64 arm64)
+#+(or arm64 mips ppc ppc64 x86 x86-64)
 (defun register-inline-constant (&rest constant-descriptor)
-  (declare (dynamic-extent constant-descriptor))
+  ;; N.B.: Please do not think yourself so clever as to declare DYNAMIC-EXTENT on
+  ;; CONSTANT-DESCRIPTOR. Giving the list indefinite extent allows backends to simply
+  ;; return it as the key to the hash-table in the most trivial possible implementation.
+  ;; The cost of listifying a &REST arg is unnoticeable here.
   (let ((asmstream *asmstream*)
         (constant (sb-vm:canonicalize-inline-constant constant-descriptor)))
-    (ensure-gethash
-     constant
-     (asmstream-constant-table asmstream)
-     (multiple-value-bind (label value) (sb-vm:inline-constant-value constant)
-       (vector-push-extend (cons constant label)
-                           (asmstream-constant-vector asmstream))
-       value))))
-#-(or x86 x86-64 arm64)
+    (values ; kill the second value
+     (ensure-gethash
+      constant
+      (asmstream-constant-table asmstream)
+      (multiple-value-bind (label value) (sb-vm:inline-constant-value constant)
+        (vector-push-extend (cons constant label)
+                            (asmstream-constant-vector asmstream))
+        value)))))
+#-(or arm64 mips ppc ppc64 x86 x86-64)
 (progn (defun sb-vm:sort-inline-constants (constants) constants)
        (defun sb-vm:emit-inline-constant (&rest args)
          (error "EMIT-INLINE-CONSTANT called with ~S" args)))
+;;; Emit the subset of inline constants which represent jump tables
+;;; and remove those constants so that they don't get emitted again.
+(defun emit-jump-tables ()
+  ;; Other backends will probably need relative jump tables instead
+  ;; of absolute tables because of the problem of needing to load
+  ;; the LIP register prior to loading an arbitrary PC.
+  (let* ((asmstream *asmstream*)
+         (constants (asmstream-constant-vector asmstream))
+         (section (asmstream-data-section asmstream))
+         (nwords 0))
+    (collect ((jump-tables) (other))
+      (dovector (constant constants)
+        ;; Constant is ((category . data) . label)
+        (cond ((eq (caar constant) :jump-table)
+               (incf nwords (length (cdar constant)))
+               (jump-tables constant))
+              (t
+               (other constant))))
+      ;; Preface the unboxed data with a count of jump-table words,
+      ;; including the count itself as 1 word.
+      ;; On average this will add another padding word half of the time
+      ;; depending on the number of boxed constants. We could reduce space
+      ;; by storing one bit in the header indicating whether or not there
+      ;; is a jump table. I don't think that's worth the trouble.
+      (emit section `(.lispword ,(1+ nwords)))
+      (when (plusp nwords)
+        (dolist (constant (jump-tables))
+          (sb-vm:emit-inline-constant section (car constant) (cdr constant)))
+        (let ((nremaining (length (other))))
+          (adjust-array constants nremaining
+                        :fill-pointer nremaining
+                        :initial-contents (other)))))))
 ;;; Return T if and only if there were any constants emitted.
 (defun emit-inline-constants ()
   (let* ((asmstream *asmstream*)
@@ -219,6 +266,7 @@
 ;; Collect "static" count of number of times each vop is employed.
 ;; (as opposed to "dynamic" - how many times its code is hit at runtime)
 (defglobal *static-vop-usage-counts* nil)
+(defparameter *do-instcombine-pass* t)
 
 (defun generate-code (component)
   (when *compiler-trace-output*
@@ -226,11 +274,36 @@
             "~|~%assembly code for ~S~2%"
             component))
   (let* ((prev-env nil)
+         ;; The first function's alignment word is zero-filled, but subsequent
+         ;; ones can use a NOP which helps the disassembler not lose sync.
+         (filler-pattern 0)
          (asmstream (make-asmstream))
+         (coverage-map)
          (*asmstream* asmstream))
 
+    (declare (ignorable coverage-map))
     (emit (asmstream-elsewhere-section asmstream)
           (asmstream-elsewhere-label asmstream))
+
+    #-(or x86 x86-64)
+    (let ((path->index (make-hash-table :test 'equal)))
+      ;; Pre-scan for MARK-COVERED vops and collect the set of
+      ;; distinct source paths that occur. Delay adding the coverage map to
+      ;; the boxed constant vector until all vop generators have run, because
+      ;; they can use EMIT-CONSTANT to add more constants,
+      ;; while the coverage map has to be the very last entry in the vector.
+      (do-ir2-blocks (block component)
+        (do ((vop (ir2-block-start-vop block) (vop-next vop)))
+            ((null vop))
+          (when (eq (vop-name vop) 'mark-covered)
+            (setf (vop-codegen-info vop)
+                  (list (ensure-gethash (car (vop-codegen-info vop))
+                                        path->index
+                                        (hash-table-count path->index)))))))
+      (when (plusp (hash-table-count path->index))
+        (setf coverage-map (make-array (hash-table-count path->index)))
+        (maphash (lambda (path index) (setf (aref coverage-map index) path))
+                 path->index)))
 
     (do-ir2-blocks (block component)
       (let ((1block (ir2-block-block block)))
@@ -242,20 +315,23 @@
             ;; on 8 byte boundaries we cannot guarantee proper loop alignment
             ;; there (yet.)  Only x86-64 does something with ALIGNP, but
             ;; it may be useful in the future.
+            ;; FIXME: see comment in ASSEMBLE-SECTIONS - we *can* enforce larger
+            ;; alignment than the size of a cons cell.
             (let ((alignp (let ((cloop (block-loop 1block)))
                             (when (and cloop
                                        (loop-tail cloop)
                                        (not (loop-info cloop)))
                               ;; Mark the loop as aligned by saving the IR1 block aligned.
                               (setf (loop-info cloop) 1block)
-                              t))))
+                              filler-pattern))))
+              (setf filler-pattern :long-nop)
               (emit-block-header (block-label 1block)
                                  (ir2-block-%trampoline-label block)
                                  (ir2-block-dropped-thru-to block)
                                  alignp)))
           (let ((env (block-physenv 1block)))
             (unless (eq env prev-env)
-              (let ((lab (gen-label)))
+              (let ((lab (gen-label "physenv elsewhere start")))
                 (setf (ir2-physenv-elsewhere-start (physenv-info env))
                       lab)
                 (emit (asmstream-elsewhere-section asmstream) lab))
@@ -264,7 +340,7 @@
           ((null vop))
         (let ((gen (vop-info-generator-function (vop-info vop))))
           (awhen *static-vop-usage-counts*
-            (let ((name (vop-info-name (vop-info vop))))
+            (let ((name (vop-name vop)))
               (incf (gethash name it 0))))
           (assemble (:code vop)
             (cond ((not gen)
@@ -281,12 +357,33 @@
                   (t
                    (funcall gen vop)))))))
 
-    ;; Truncate the final assembly code buffer to length
-    (sb-assem::truncate-section-to-length (asmstream-code-section asmstream))
+    (when *do-instcombine-pass*
+      #+x86-64
+      (sb-assem::combine-instructions (asmstream-code-section asmstream)))
 
-    (coverage-mark-lowering-pass component asmstream)
+    ;; Jump tables precede the coverage mark bytes to simplify locating
+    ;; them in trans_code().
+    (emit-jump-tables)
+    ;; Todo: can we implement the flow-based aspect of coverage mark compression
+    ;; in IR2 instead of waiting until assembly generation?
+    #+(or x86 x86-64) (coverage-mark-lowering-pass component asmstream)
+    #-(or x86 x86-64)
+    (when coverage-map
+      #+darwin-jit
+      (vector-push-extend (make-constant (make-array (length coverage-map)
+                                                     :element-type '(unsigned-byte 8)
+                                                     :initial-element #xFF))
+                          (ir2-component-constants (component-info component)))
+      (vector-push-extend (make-constant (cons 'coverage-map coverage-map))
+                          (ir2-component-constants (component-info component)))
+      ;; The mark vop can store the low byte from either ZERO-TN or NULLL-TN
+      ;; to avoid loading a constant. Either one won't match #xff.
+      #-darwin-jit
+      (emit (asmstream-data-section asmstream)
+            `(.skip ,(length coverage-map) #xff)))
 
     (emit-inline-constants)
+
     (let* ((info (component-info component))
            (simple-fun-labels
             (mapcar #'entry-info-offset (ir2-component-entries info)))
@@ -300,8 +397,7 @@
           (assemble-sections asmstream
                              simple-fun-labels
                              (make-segment :header-skew skew
-                                           :run-scheduler (default-segment-run-scheduler)
-                                           :inst-hook (default-segment-inst-hook)))
+                                           :run-scheduler (default-segment-run-scheduler)))
         (values segment text-length fun-table
                 (asmstream-elsewhere-label asmstream) fixup-notes)))))
 
@@ -330,36 +426,38 @@
         ;; vector of lists of original source paths covered
         (src-paths (make-array 10 :fill-pointer 0))
         (previous-mark))
-    (dolist (buffer (reverse (sb-assem::section-buf-chain
-                              (asmstream-code-section asmstream))))
-      (dotimes (i (length buffer))
-        (let ((item (svref buffer i)))
-          (typecase item
-           (label
-            (when (label-usedp item) ; control can transfer to here
-              (setq previous-mark nil)))
-           (function ; this can do anything, who knows
-            (setq previous-mark nil))
-           (t
-            (let ((mnemonic (first item)))
-              (when (vop-p mnemonic)
-                (pop item)
-                (setq mnemonic (first item)))
-              (cond ((branch-opcode-p mnemonic) ; control flow kills mark combining
-                     (setq previous-mark nil))
-                    ((eq mnemonic '.coverage-mark)
-                     (let ((path (second item)))
-                       (cond ((not previous-mark) ; record a new path
-                              (let ((mark-index
-                                     (vector-push-extend (list path) src-paths)))
-                                ;; have the backend lower it into a real instruction
-                                (replace-coverage-instruction buffer i label mark-index))
-                              (setq previous-mark t))
-                             (t ; record that the already-emitted mark pertains
-                                ; to an additional source path
-                              (push path (elt src-paths (1- (fill-pointer src-paths))))
-                              ;; turn this line into a (virtual) no-op
-                              (rplaca item '.comment))))))))))))
+    (do ((statement (stmt-next (section-start (asmstream-code-section asmstream)))
+                    (stmt-next statement)))
+        ((null statement))
+      (dolist (item (ensure-list (stmt-labels statement)))
+        (when (label-usedp item) ; control can transfer to here
+          (setq previous-mark nil)))
+      (let ((mnemonic (stmt-mnemonic statement)))
+        (typecase mnemonic
+         (function ; this can do anything, who knows
+          (setq previous-mark nil))
+         (string) ; a comment can be ignored
+         (t
+          (cond ((branch-opcode-p mnemonic) ; control flow kills mark combining
+                 (setq previous-mark nil))
+                ((eq mnemonic '.coverage-mark)
+                 (let ((path (car (stmt-operands statement))))
+                   (cond ((not previous-mark) ; record a new path
+                          (let ((mark-index
+                                 (vector-push-extend (list path) src-paths)))
+                            ;; have the backend lower it into a real instruction
+                            (replace-coverage-instruction statement label mark-index))
+                            (setq previous-mark statement))
+                           (t ; record that the already-emitted mark pertains
+                            ;; to an additional source path
+                            (push path (elt src-paths (1- (fill-pointer src-paths))))
+                            ;; Clobber this statement. Do not try to remove it and
+                            ;; combine its labels into the previous statement.
+                            ;; Doing that could move a label into an earlier IR2 block
+                            ;; which crashes when dumping locations.
+                            (setf (stmt-mnemonic statement) nil
+                                  (stmt-operands statement) nil))))))))))
+
     ;; Allocate space in the data section for coverage marks
     (let ((mark-index (length src-paths)))
       (when (plusp mark-index)

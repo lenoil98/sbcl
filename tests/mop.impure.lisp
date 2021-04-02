@@ -15,6 +15,7 @@
 ;;;; However, this seems a good a way as any of ensuring that we have
 ;;;; no regressions.
 
+(load "compiler-test-util.lisp")
 (defpackage "MOP-TEST"
   (:use "CL" "SB-MOP" "ASSERTOID" "TEST-UTIL"))
 
@@ -177,10 +178,19 @@
 
 ;;; BUG 338: "MOP specializers as type specifiers"
 ;;;  (reported by Bruno Haible sbcl-devel 2004-06-11)
-(let* ((m (defmethod eql-specialized-method ((x (eql 4.0))) 3.0))
-       (spec (first (sb-mop:method-specializers m))))
-  (assert (not (typep 1 spec)))
-  (assert (typep 4.0 spec)))
+(with-test (:name :eql-specializer-as-type)
+  (let* ((m (defmethod eql-specialized-method ((x (eql 4.0))) 3.0))
+         (spec (first (sb-mop:method-specializers m))))
+    (declare (notinline typep)) ; in case of SSC (sufficiently/super smart compiler)
+    (assert (not (typep 1 spec)))
+    (assert (typep 4.0 spec))
+    ;; TYPEP on spec should not cons. It used to cons 14 words:
+    ;;   6 words for %MAKE-MEMBER-TYPE
+    ;;   4 words for ALLOC-XSET
+    ;;   1 cons in MAKE-EQL-TYPE
+    ;;   1 cons in ADD-TO-XSET
+    #-interpreter
+    (ctu:assert-no-consing (typep 4.0 spec))))
 
 ;;; BUG #334, relating to programmatic addition of slots to a class
 ;;; with COMPUTE-SLOTS.
@@ -303,7 +313,7 @@
                                          &rest initargs)
   (declare (ignore initargs))
   (let ((dsd-class-name (gensym)))
-    (sb-pcl:ensure-class
+    (sb-mop:ensure-class
      dsd-class-name
      :metaclass 'auto-accessors-direct-slot-definition-class
      :direct-superclasses (list (find-class 'standard-direct-slot-definition))
@@ -410,7 +420,7 @@
 ;;; detection of multiple class options in defclass, reported by Bruno Haible
 (defclass option-class (standard-class)
   ((option :accessor cl-option :initarg :my-option)))
-(defmethod sb-pcl:validate-superclass ((c1 option-class) (c2 standard-class))
+(defmethod sb-mop:validate-superclass ((c1 option-class) (c2 standard-class))
   t)
 (multiple-value-bind (result error)
     (ignore-errors (eval '(defclass option-class-instance ()
@@ -685,13 +695,7 @@
                      (slot-value o 'instance))))))
 
 (defgeneric definitely-a-funcallable-instance (x))
-(with-test (:name (set-funcallable-instance-function :typechecking)
-            ;; This is a bit of a problem. SET-FUNCALLABLE-INSTANCE-FUNCTION
-            ;; accepts any funcallable-instance as its first argument,
-            ;; not just a generic-function.
-            ;; But an interpreted function *is* a funcallable-instance
-            ;; See comment in src/pcl/low about possibly tightening this up.
-            :fails-on :interpreter)
+(with-test (:name (set-funcallable-instance-function :typechecking))
   (assert-error (set-funcallable-instance-function
                   (lambda (y) (declare (ignore y)) nil)
                   #'definitely-a-funcallable-instance)
@@ -739,3 +743,29 @@
                            'change-class-test-2)))
     (assert (eql (slot-value new 'b) 20))
     (assert (not (slot-boundp new 'a)))))
+
+(defclass chgclass-dx-test-1 () ())
+(defclass chgclass-dx-test-2 () ())
+(defclass chgclass-dx-test-fin-1 (funcallable-standard-object) ()
+  (:metaclass funcallable-standard-class))
+(defclass chgclass-dx-test-fin-2 (funcallable-standard-object
+                                  chgclass-dx-test-2)
+  ()
+  (:metaclass funcallable-standard-class))
+(defvar *uifdc-called*)
+(defmethod update-instance-for-different-class :before (old (new chgclass-dx-test-2)
+                                                        &rest initargs)
+  (declare (ignore initargs))
+  (setq *uifdc-called* t)
+  (assert (sb-ext:stack-allocated-p old))
+  (when (functionp new)
+    (assert (sb-ext:stack-allocated-p (sb-kernel:%funcallable-instance-fun old)))))
+(with-test (:name :change-class-temp-on-stack)
+  (let ((i (make-instance 'chgclass-dx-test-1))
+        (*uifdc-called* nil))
+    (change-class i 'chgclass-dx-test-2)
+    (assert *uifdc-called*))
+  (let ((i (make-instance 'chgclass-dx-test-fin-1))
+        (*uifdc-called* nil))
+    (change-class i 'chgclass-dx-test-fin-2)
+    (assert *uifdc-called*)))

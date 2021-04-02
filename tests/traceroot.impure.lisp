@@ -15,7 +15,8 @@
 ;;;; and I don't care too much why, since the functionality still works.
 ;;;; It's just that sometimes we get :PINNED as a root instead of
 ;;;; the expected reference to the one and only thread.
-#-(and gencgc sb-thread x86-64) (sb-ext:exit :code 104)
+;;;; And also sb-safepoint gets a crash in C.
+#-(and gencgc sb-thread (not sb-safepoint) (or ppc64 x86-64)) (sb-ext:exit :code 104)
 
 (setq sb-ext:*evaluator-mode* :compile)
 (defvar *fred*)
@@ -32,17 +33,17 @@
            (ecase root
              (:tls
               (scrubstack)
-              (sb-ext:gc-and-search-roots wp :oldest nil))
+              (sb-ext:search-roots wp :criterion :oldest :gc t :print nil))
              (:bindings ; bind *FRED* again so the old value is on the binding stack
               (let ((*fred* 1))
                 (scrubstack)
-                (sb-ext:gc-and-search-roots wp :oldest nil)))
+                (sb-ext:search-roots wp :criterion :oldest :gc t :print nil)))
              (:stack
               ; put the OBJ back on the control stack
               ; and also ensure that *FRED* is not a root.
               (setq obj *fred* *fred* nil)
               (scrubstack)
-              (sb-ext:gc-and-search-roots wp :oldest nil)))))
+              (sb-ext:search-roots wp :criterion :oldest :gc t :print nil)))))
       (assert paths)
       (let* ((path (cdar paths))
              (root (car path)))
@@ -55,7 +56,8 @@
           (:bindings
            (assert (typep (cdr path) '(cons (eql *fred*) (cons nil))))))))))
 
-(with-test (:name :stack-indirect)
+(with-test (:name (sb-ext:search-roots :stack-indirect)
+            :fails-on :sunos)
   (let ((wp (make-weak-pointer (list 1 2 3 4))))
     (test1 wp (weak-pointer-value wp) :stack)
     (test1 wp (weak-pointer-value wp) :tls)
@@ -65,12 +67,51 @@
 (defun f0 ()
   (let* ((c (cons 1 2))
          (wp (make-weak-pointer c)))
-    (let ((paths (sb-ext:gc-and-search-roots wp :static nil)))
+    (let ((paths (sb-ext:search-roots wp :criterion :static :gc t :print nil)))
       (assert paths)
       (let* ((path (car paths))
              (nodes (cdr path)))
         (assert (and (sb-int:singleton-p nodes)
                      (string= "main thread" (caar nodes))))))
     c))
-(with-test (:name :stack-direct)
+(with-test (:name (sb-ext:search-roots :stack-direct)
+            :fails-on :sunos)
   (f0))
+
+;;; Employ circumlocution so the file loader doesn't hold on to a string "hi"
+(defvar *string-hi* (make-weak-pointer (concatenate 'string "h" "i")))
+(defstruct s1 foo)
+(defparameter *top*
+  `(p q r w x y ,(make-s1 :foo `#((a b c ,(weak-pointer-value *string-hi*) d))) z))
+
+;;; Sample output:
+;;; Path to "hi":
+;;;  6       1000209AB3 [   1] a package-hashtable
+;;;  1       10048F145F [  29] a (simple-vector 37)
+;;;  1         503B403F [   2] COMMON-LISP-USER::*TOP*
+;;;  0       1004B885B7 [   6] a cons = (P Q R ...) ; = (NTHCDR 6 object)
+;;;  0       1004B88617 [   0] a cons = (# Z)
+;;;  0       1004C1AA53 [   1] a s1
+;;;  0       1004CBB93F [   2] a (simple-vector 1)
+;;;  0       1004D28AE7 [   3] a cons = (A B C ...) ; = (NTHCDR 3 object)
+;;;  0       1004D28B17 [   0] a cons = ("hi" D)
+(with-test (:name :traceroot-collapse-lists)
+  (let* ((string (with-output-to-string (*standard-output*)
+                   (search-roots *string-hi* :print :verbose)))
+         (lines (split-string string #\newline)))
+    (assert
+     (loop for line in lines
+             thereis (search "[   6] a cons = (P Q R ...)" line)))
+    (assert
+     (loop for line in lines
+             thereis (search "[   3] a cons = (A B C ...)" line)))))
+
+(defun something ()
+  (let ((a (make-symbol "x")))
+    (gc) ; cause the symbol to be pinned
+    (make-weak-pointer a)))
+
+(with-test (:name :traceroot-old-pin-no-crash)
+  (let ((wp (something)))
+    (search-roots wp)
+    (something)))

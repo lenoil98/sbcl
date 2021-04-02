@@ -641,7 +641,7 @@
     (assert (equal (check-embedded-thes 0 3  :a 2.5f0) '(:a 2.5f0)))
     (assert (typep (check-embedded-thes 0 3  2 3.5f0) 'type-error))
 
-    (assert (equal (check-embedded-thes 0 1  :a 3.5f0) '(:a 3.5f0)))
+    (assert (equal (check-embedded-thes 0 1  :a 3f0) '(:a 3f0)))
     (assert (typep (check-embedded-thes 0 1  2 2.5d0) 'type-error))
 
     (assert (equal (check-embedded-thes 3 0  2 :a) '(2 :a)))
@@ -955,7 +955,7 @@
 
 ;;;; MUFFLE-CONDITIONS test (corresponds to the test in the manual)
 ; FIXME: make a better test!
-(with-test (:name muffle-conditions :skipped-on (or :alpha :x86-64))
+(with-test (:name muffle-conditions :skipped-on (or :ppc64 :x86-64))
   (multiple-value-bind (fun failure-p warnings style-warnings notes)
       (checked-compile
        '(lambda (x)
@@ -1037,6 +1037,12 @@
     (assert (= 0 (ctu:count-full-calls "FOO-MAYBE-INLINE" fun)))
     (assert (= 1 (ctu:count-full-calls "QUUX-MARKER" fun)))))
 
+(with-test (:name :maybe-inline-let-calls)
+  (checked-compile `(lambda (x)
+                      (declare (optimize (space 0)))
+                      (foo-maybe-inline (let ((z #'foo-maybe-inline))
+                                          (funcall z x))))))
+
 (with-test (:name :bug-405)
   ;; These used to break with a TYPE-ERROR
   ;;     The value NIL is not of type SB-C::PHYSENV.
@@ -1076,7 +1082,16 @@
              (assert (eq 'number (type-error-expected-type e)))
              :error))))))
 
-(with-test (:name :compiled-debug-funs-leak)
+;;; This tested something which is no longer a thing. There was a hash-table
+;;; named *COMPILED-DEBUG-FUNS* which held on to an arbitrary number of code blobs,
+;;; and it was made weak in git rev 9abfd1a2b2 and then removed in rev a2aa5eceb5
+;;; (except for cheneygc - and I'm not entirely sure that there isn't a way to
+;;; remove it from cheneygc as well, but it wasn't interesting).
+;;; So really it's testing nothing, except that maybe it is.
+;;; But the test doesn't pass with parallel-exec because profiling the code causes
+;;; potentially any and every lambda to be retained when a stack sample is taken.
+;;; So I'm not sure whether to delete or disable this. I guess disable.
+(with-test (:name :compiled-debug-funs-leak :fails-on :parallel-test-runner)
   (sb-ext:gc :full t)
   (let ((usage-before (sb-kernel::dynamic-usage)))
     (dotimes (x 10000)
@@ -2254,6 +2269,8 @@
 ;;; check that non-trivial constants are EQ across different files: this is
 ;;; not something ANSI either guarantees or requires, but we want to do it
 ;;; anyways.
+(when (find-symbol "SORT-INLINE-CONSTANTS" "SB-VM")
+  (push :inline-constants *features*))
 (defconstant +share-me-1+ #-inline-constants 123.456d0 #+inline-constants nil)
 (defconstant +share-me-2+ "a string to share")
 (defconstant +share-me-3+ (vector 1 2 3))
@@ -2458,7 +2475,10 @@
     (assert (equal type1 (sb-kernel:%simple-fun-type g)))
     (assert (equal type0 (sb-kernel:%simple-fun-type h)))))
 
-(test-util:with-test (:name :bug-308921)
+;;; I think *CHECK-CONSISTENCY* is confused in the presence of dynamic-extent.
+;;; A simpler example not involving package iteration also fails in COMPILE-FILE:
+;;;   (let ((l (mapcar #'string *features*))) (defun g () l))
+(test-util:with-test (:name :bug-308921 :fails-on :sbcl)
   (let ((*check-consistency* t))
     (ctu:file-compile
      `((let ((exported-symbols-alist
@@ -2598,19 +2618,19 @@
   (declare (ignore a b))
   (multiple-value-call 'list
     'start
-    (sb-c::%more-arg-values context 1 (1- (truly-the fixnum count)))
+    (sb-c:%more-arg-values context 1 (1- (truly-the fixnum count)))
     'end))
 (defun skip-2-passthrough (a b sb-int:&more context count)
   (declare (ignore a b))
   (multiple-value-call 'list
     'start
-    (sb-c::%more-arg-values context 2 (- (truly-the fixnum count) 2))
+    (sb-c:%more-arg-values context 2 (- (truly-the fixnum count) 2))
     'end))
 (defun skip-n-passthrough (n-skip n-copy sb-int:&more context count)
   (assert (>= count (+ n-copy n-skip))) ; prevent crashes
   (multiple-value-call 'list
     'start
-    (sb-c::%more-arg-values context n-skip n-copy)
+    (sb-c:%more-arg-values context n-skip n-copy)
     'end))
 
 ;; %MORE-ARG-VALUES was wrong on x86 and x86-64 with nonzero 'skip'.
@@ -2768,6 +2788,19 @@
        ((function *)                  "(FUNCTION *)")
        ((function (function *))       "(FUNCTION (FUNCTION *))")
        ((function (function (eql 1))) "(FUNCTION (FUNCTION (EQL 1))")))))
+
+(with-test (:name (:compiler-messages function :lambda-list))
+  ;; Previously, function lambda lists were sometimes printed
+  ;; confusingly, e.g.:
+  ;;
+  ;;   (function collection) => #'COLLECTION
+  ;;   ((function t))        => (#'T)
+  ;;
+  (handler-case
+      (sb-c::parse-lambda-list '((function t) . a) :context 'defmethod)
+    (error (condition)
+      (assert (search "illegal dotted lambda list: ((FUNCTION T) . A)"
+                      (princ-to-string condition))))))
 
 (with-test (:name :boxed-ref-setf-special
             :skipped-on :interpreter)
@@ -2951,3 +2984,114 @@
                                       0)
                                      0))))))))
     (assert (eql (funcall f337 17) 0))))
+
+(defstruct dump-me)
+(defmethod make-load-form ((self dump-me) &optional e)
+  (declare (notinline typep) (ignore e))
+  ;; This error in bad usage of TYPEP would cause SB-C::COMPUTE-ENTRY-INFO
+  ;; to encounter another error:
+  ;; The value
+  ;;   #<SB-FORMAT::FMT-CONTROL "bad thing to be a type specifier: ~/SB-IMPL:PRINT-TYPE-SPECIFIER/">
+  ;; is not of type SEQUENCE
+  ;;
+  (if (typep 'foo (cons 1 2))
+      (make-load-form-saving-slots self)
+      ''i-cant-even))
+
+(with-test (:name :failed-dump-fun-source)
+  (with-scratch-file (fasl "fasl")
+    (let ((error-stream (make-string-output-stream)))
+      (multiple-value-bind (fasl warnings errors)
+          (let ((*error-output* error-stream))
+            (compile-file "bad-mlf-test.lisp" :output-file fasl))
+        (assert (and fasl warnings (not errors)))
+        (assert (search "bad thing to be" (get-output-stream-string error-stream)))
+        (load fasl)
+        (assert (eq (zook) 'hi))))))
+
+(with-test (:name :block-compile)
+  (with-scratch-file (fasl "fasl")
+    (compile-file "block-compile-test.lisp" :output-file fasl :block-compile t)
+    (load fasl)
+    ;; Make sure the defuns all get compiled into the same code
+    ;; component.
+    (assert (and (eq (sb-kernel::fun-code-header #'baz2)
+                     (sb-kernel::fun-code-header #'bar2))
+                 (eq (sb-kernel::fun-code-header #'baz2)
+                     (sb-kernel::fun-code-header #'foo2))))))
+
+(with-test (:name (:block-compile :entry-point))
+  (with-scratch-file (fasl "fasl")
+    (compile-file "block-compile-test-2.lisp" :output-file fasl :block-compile t :entry-points '(foo1))
+    (load fasl)
+    ;; Ensure bar1 gets let-converted into FOO1 and disappears.
+    (assert (not (fboundp 'bar1)))
+    (assert (eql (foo1 10 1) 3628800))
+    (let ((code (sb-kernel::fun-code-header #'foo1)))
+      (assert (= (sb-kernel::code-n-entries code) 1))
+      (assert (eq (sb-kernel:%code-entry-point code 0)
+                  #'foo1)))))
+
+(with-test (:name (:block-compile :inline))
+  (with-scratch-file (fasl "fasl")
+    (compile-file "block-compile-test-3.lisp" :output-file fasl :block-compile t)
+    (load fasl)
+    ;; Ensure all functions get inlined properly, so that there are no
+    ;; local calls between them. The result will be that NONE of the
+    ;; functions will share a code component.
+    (let ((components '()))
+      (flet ((frob (fun)
+               (pushnew (sb-kernel::fun-code-header fun) components)))
+        (frob #'inl)
+        (frob #'a)
+        (frob #'foo2)
+        (frob #'bar2))
+      (assert (= (length components) 4)))))
+
+(with-test (:name (:block-compile :start-block/end-block))
+  (with-scratch-file (fasl "fasl")
+    (compile-file "block-compile-test-4.lisp" :output-file fasl :block-compile :specified)
+    (load fasl)
+    (assert (eq (sb-kernel::fun-code-header #'fun1)
+                (sb-kernel::fun-code-header #'fun3)))
+    (assert (not (eq (sb-kernel::fun-code-header #'fun1)
+                     (sb-kernel::fun-code-header #'fun4))))
+    (assert (not (fboundp 'fun2)))))
+
+(with-test (:name (:block-compile :inlined-functions-local-call))
+  (with-scratch-file (fasl "fasl")
+    (compile-file "block-compile-test-5.lisp" :output-file fasl :block-compile :specified)
+    (load fasl)
+    (assert (not (fboundp 'zeta1)))
+    (assert (not (fboundp 'zeta2)))
+    (assert (= (gamma1 4) 10))))
+
+(with-test (:name :symbol-value-constant)
+  (let* ((package-name (gensym "SYMBOL-VALUE-CONSTANT-TEST"))
+         (*package* (make-package package-name :use '(cl))))
+    (ctu:file-compile
+     "(defconstant +constant+
+       (let (*)
+         (if (boundp '+constant+)
+             (symbol-value '+constant+)
+             (complex 0.0 0.0))))"
+     :load t
+     :before-load (lambda ()
+                    (delete-package *package*)
+                    (setf *package* (make-package package-name :use '(cl)))))))
+
+(with-test (:name :block-compile-merge-lambdas)
+  (ctu:file-compile
+   "(let (f) (when f (funcall f)))
+      (let ())"
+   :block-compile t))
+
+
+(with-test (:name :fopcompile-specials)
+  (ctu:file-compile
+   "(locally (declare (special foo)) (print foo))"))
+
+(with-test (:name :local-call-context)
+  (ctu:file-compile
+   "(lambda (&optional b) (declare (type integer b)) b)"
+   :load t))

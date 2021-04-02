@@ -197,6 +197,12 @@
   (checked-compile `(lambda () (make-array 0 :element-type 'string)))
   (checked-compile `(lambda () (make-array '(0 2) :element-type 'string))))
 
+(with-test (:name (make-array standard-char))
+  ;; Maybe this is a kludge, but STANDARD-CHAR should just work,
+  ;; I don't care if #\nul is nonstandard. Because, seriously?
+  (checked-compile '(lambda ()
+                     (make-array 5 :fill-pointer 0 :element-type 'standard-char))))
+
 (with-test (:name :big-array)
   ;; we used to have leakage from cross-compilation hosts of the INDEX
   ;; type, which prevented us from actually using all the large array
@@ -433,8 +439,17 @@
   (checked-compile-and-assert (:optimize '(:safety 0))
       `(lambda (x)
          ;; Strings are null-terminated for C interoperability
-         (char "abcd" x))
+         (char #.(coerce "abcd" 'simple-base-string) x))
     ((4) #\Nul)))
+(defun check-bound-multiple-reads (x i)
+  (let* ((x (truly-the simple-vector x))
+         (l (sb-c::vector-length x)))
+    (sb-kernel:%check-bound x l i)
+    l))
+(compile 'check-bound-multiple-reads)
+(with-test (:name :check-bound-vop-optimize)
+  ;; could have crashed with the bad optimizer
+  (check-bound-multiple-reads #(a b c) 2))
 
 (with-test (:name (adjust-array :transform))
   (checked-compile-and-assert ()
@@ -523,6 +538,24 @@
     (assert (not (array-has-fill-pointer-p (funcall fun nil))))
     (assert (= (length (funcall fun nil)) 3))))
 
+(with-test (:name (make-array :transform :non-constant-fill-pointer))
+  ;; Known adjustable with any fill-pointer can be inlined
+  (let ((fun (checked-compile '(lambda (n fillp)
+                                 (make-array (the (mod 20) n)
+                                             :adjustable t :fill-pointer fillp)))))
+    (assert (not (ctu:find-named-callees fun :name 'sb-kernel:%make-array)))
+    (let ((a (funcall fun 10 3)))
+      (assert (= (length a) 3))
+      (assert (= (array-dimension a 0) 10))))
+  ;; Non-adjustable w/ non-constant numeric fill-pointer can be inlined
+  (let ((fun (checked-compile '(lambda (n)
+                                 (make-array (the (mod 20) n)
+                                             :fill-pointer (floor n 2))))))
+    (assert (not (ctu:find-named-callees fun :name 'sb-kernel:%make-array)))
+    (let ((a (funcall fun 10)))
+      (assert (= (length a) 5))
+      (assert (= (array-dimension a 0) 10)))))
+
 (with-test (:name :check-bound-fixnum-check)
   (checked-compile-and-assert (:optimize :safe)
       `(lambda (x) (aref #100(a) x))
@@ -538,6 +571,10 @@
 (with-test (:name (make-array :strange-type-specifiers))
   (assert (stringp (make-array 10 :element-type (opaque-identity '(base-char)))))
   (assert (stringp (make-array 10 :element-type (opaque-identity '(standard-char)))))
+  ;; If there are no extended characters (as on #-sb-unicode), then EXTENDED-CHAR is
+  ;; the empty type. You'll get exactly what you ask for: an array which can hold
+  ;; nothing. It's not a string, which is the right answer.
+  #+sb-unicode
   (assert (stringp (make-array 10 :element-type (opaque-identity '(extended-char)))))
   (assert (bit-vector-p (make-array 10 :element-type (opaque-identity '(bit))))))
 
@@ -576,3 +613,41 @@
      (equal (sb-kernel:%simple-fun-type fun)
             '(function ((simple-array (unsigned-byte 8) (*)))
               (values (simple-array (unsigned-byte 8) (10 20)) &optional))))))
+
+(with-test (:name :displaced-to-with-intitial)
+  (checked-compile-and-assert
+      ()
+      `(lambda (x)
+         (make-array 1 :displaced-to x :initial-element 1))
+    ((#(0)) (condition 'error)))
+  (assert
+   (nth-value 2
+              (checked-compile
+               `(lambda ()
+                  (lambda (x)
+                    (make-array 1 :displaced-to (the vector x) :initial-contents '(1))))
+               :allow-warnings t))))
+
+(with-test (:name :check-bound-type-error)
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (p)
+                         (unless (svref p 0)
+                           (svref p nil)))
+                      :allow-warnings t))))
+
+(with-test (:name :array-has-fill-pointer-p-folding)
+  (assert (equal (sb-kernel:%simple-fun-type
+                  (checked-compile `(lambda (x)
+                                      (declare ((array * (* *)) x))
+                                      (array-has-fill-pointer-p x))))
+                 `(function ((array * (* *))) (values null &optional)))))
+
+(with-test (:name :array-has-fill-pointer-p-transform)
+  (checked-compile-and-assert
+   ()
+   `(lambda (n)
+      (let ((a (make-array n)))
+        (declare (vector a))
+        (map-into a #'identity a)))
+   ((0) #() :test #'equalp)))

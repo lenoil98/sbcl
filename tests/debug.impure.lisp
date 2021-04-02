@@ -19,6 +19,15 @@
 (when (eq sb-ext:*evaluator-mode* :interpret)
   (sb-ext:exit :code 104))
 
+#+(or x86 x86-64)
+(with-test (:name :legal-bpt-lra-object)
+  (sb-int:binding* ((code (sb-kernel:fun-code-header #'read))
+                    (sap (sb-sys:sap+ (sb-kernel:code-instructions code) 13)) ; random
+                    ((bpt-sap bpt-code-obj) (sb-di::make-bpt-lra sap)))
+    (declare (ignore bpt-sap))
+    ;; This was causing heap corruption
+    (assert (zerop (sb-kernel:code-jump-table-words bpt-code-obj)))))
+
 
 ;;;; Check that we get debug arglists right.
 
@@ -81,18 +90,33 @@
     (assert (search "foo" output))
     (assert (search "returned OK" output))))
 
+;;; The following should not work:
+;;;  (DEFUN G () (M))
+;;;  (DEFMACRO M (&REST r) (format t "M invoked: ~S~%" r))
+;;;  (ENCAPSULATE 'M 'foo (lambda (f &rest r) (format t "encapsulation: ~S ~S~%" f r)))
+;;;  (G)
+;;; If (ENCAPSULATE) were permitted, M's guard trampoline would be replaced by the
+;;; encapsulation which is not meaningful. Most uses of the macro M will NOT invoke
+;;; the encapsulation since we don't store macro functions in the symbol-function location.
+;;; Only a consumer of M being accidentally compiled first and resolving M to an
+;;; fdefinition would see the encapulation. That should just be an error.
+(with-test (:name :no-macro-encapsulation)
+  (assert-error (sb-int:encapsulate 'cond 'tryme
+                                    (lambda (f &rest stuff)
+                                      (declare (ignore f stuff))))))
+
 ;;; bug 379
 (with-test (:name (trace :encapsulate nil)
             :fails-on (or (and :ppc (not :linux)) :sparc :arm64)
-            :broken-on :hppa)
+            :broken-on (or :freebsd))
   (let ((output (with-traced-function (trace-this :encapsulate nil)
                   (assert (eq 'ok (trace-this))))))
     (assert (search "TRACE-THIS" output))
     (assert (search "returned OK" output))))
 
-(with-test (:name (:trace :encapsulate nil :recursive)
+(with-test (:name (trace :encapsulate nil :recursive)
             :fails-on (or (and :ppc (not :linux)) :sparc :arm64)
-            :broken-on :hppa)
+            :broken-on (or :freebsd))
   (let ((output (with-traced-function (trace-fact :encapsulate nil)
                   (assert (= 120 (trace-fact 5))))))
     (assert (search "TRACE-FACT" output))
@@ -153,7 +177,7 @@
     (untrace)
     (assert (>= (count #\Newline (get-output-stream-string s)) 4))))
 
-(with-test (:name :bug-310175 :fails-on (not :stack-allocatable-lists))
+(with-test (:name :bug-310175)
   ;; KLUDGE: Not all DX-enabled platforms DX CONS, and the compiler
   ;; transforms two-arg-LIST* (and one-arg-LIST) to CONS.  Therefore,
   ;; use two-arg-LIST, which should get through to VOP LIST, and thus
@@ -646,7 +670,7 @@
     (sb-sys:with-pinned-objects (code)
       (let* ((base (logandc2 (sb-kernel:get-lisp-obj-address code)
                              sb-vm:lowtag-mask))
-             (limit (+ base (sb-vm::primitive-object-size code))))
+             (limit (+ base (sb-ext:primitive-object-size code))))
         (flet ((properly-tagged-p (ptr)
                  (eql (alien-funcall (extern-alien "properly_tagged_p_internal"
                                                    (function int unsigned unsigned))
@@ -672,3 +696,22 @@
                      (format t "~x -> ~d (~a)~%"
                              ptr index (sb-kernel:make-lisp-obj tagged-fun))))))
             (assert (= count n))))))))
+
+(with-test (:name :repeatable-fasl)
+  (with-scratch-file (output1 "fasl")
+    (compile-file "bug-414.lisp" ; compile this file, why not
+                  ::output-file output1 :verbose nil :print nil)
+    (with-scratch-file (output2 "fasl")
+      (compile-file "bug-414.lisp" ; compile this file, why not
+                    ::output-file output2 :verbose nil :print nil)
+      (with-open-file (fasl1 output1 :element-type '(unsigned-byte 8))
+        (with-open-file (fasl2 output2 :element-type '(unsigned-byte 8))
+          (assert (= (file-length fasl1) (file-length fasl2)))
+          (loop repeat (file-length fasl1)
+                do (assert (= (read-byte fasl1) (read-byte fasl2)))))))))
+
+;; lp#1901781
+(defun ll-unknown (x y) (declare (optimize (debug 0))) (+ x y))
+(compile 'll-unknown)
+(with-test (:name :unknown-lambda-list)
+  (assert (eq (sb-kernel:%fun-lambda-list #'ll-unknown) :unknown)))

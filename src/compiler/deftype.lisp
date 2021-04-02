@@ -9,6 +9,10 @@
 
 (in-package "SB-IMPL")
 
+;;; Has the type system been properly initialized? (I.e. is it OK to
+;;; use it?)
+(!define-load-time-global *type-system-initialized* nil)
+
 (defun constant-type-expander (name expansion)
   (declare (optimize safety))
   ;; Dummy implementation of SET-CLOSURE-NAME for the host.
@@ -37,7 +41,7 @@
                     (let ((expr `(progn ,@forms)))
                       ;; While CONSTANTP works early, %MACROEXPAND does not,
                       ;; so we can't pass ENV because it'd try to macroexpand.
-                      (if (sb-xc:constantp expr) expr)))
+                      (if (constantp expr) expr)))
                 #-sb-xc-host
                 (check-deprecated-type (constant-form-value it))
                 (values `(constant-type-expander ',name ,it) doc

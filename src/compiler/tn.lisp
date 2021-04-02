@@ -216,10 +216,15 @@
 ;;; Create a constant TN. The backend dependent
 ;;; IMMEDIATE-CONSTANT-SC function is used to determine whether the
 ;;; constant has an immediate representation.
-(defun make-constant-tn (constant)
+;;; FIXME: this can create multiple boxed TNs (consuming more than one
+;;; slot in the boxed constant vector) for a given leaf when called by
+;;; EMIT-MOVES-AND-COERCIONS. That's wasteful.
+(defun make-constant-tn (constant &optional force-boxed)
   (declare (type constant constant))
   (or (leaf-info constant)
-      (multiple-value-bind (immed null-offset) (immediate-constant-sc (constant-value constant))
+      (multiple-value-bind (immed null-offset)
+          (immediate-constant-sc (constant-value constant))
+        ;; currently NULL-OFFSET is used only on ARM64
         (if null-offset
             (setf (leaf-info constant)
                   (component-live-tn
@@ -229,13 +234,16 @@
             (let* ((boxed (or (not immed)
                               (boxed-immediate-sc-p immed)))
                    (component (component-info *component-being-compiled*))
-                   ;; If a constant have either an immediate or boxed
+                   ;; If a constant has either an immediate or boxed
                    ;; representation (e.g. double-float) postpone the SC
                    ;; choice until SELECT-REPRESENTATIONS.
-                   (sc (and boxed
-                            (if immed
-                                (svref *backend-sc-numbers* immed)
-                                (sc-or-lose 'constant))))
+                   (sc (cond (boxed
+                              (if immed
+                                  (svref *backend-sc-numbers* immed)
+                                  (sc-or-lose 'constant)))
+                             (force-boxed
+                              (setf immed nil)
+                              (sc-or-lose 'constant))))
                    (res (make-tn 0 :constant (primitive-type (leaf-type constant)) sc)))
               ;; Objects of type SYMBOL can be immediate but they still go in the constants
               ;; because liveness depends on pointer tracing without looking at code-fixups.
@@ -263,7 +271,7 @@
          (constants (ir2-component-constants component)))
     (setf (tn-offset res) (fill-pointer constants)
           (tn-type res) type)
-    (vector-push-extend (cons :load-time-value handle) constants)
+    (vector-push-extend (list :load-time-value handle res) constants)
     (push-in tn-next res (ir2-component-constant-tns component))
     res))
 
@@ -282,6 +290,11 @@
 ;;; Return a load-time constant TN with the specified KIND and INFO.
 ;;; If the desired CONSTANTS entry already exists, then reuse it,
 ;;; otherwise allocate a new load-time constant slot.
+;;; FIXME: this function deserves a comment about why it creates a new TN even
+;;; when KIND + INFO are already found. It's as if we need to maintain a 1:1
+;;; relation between TN and TN-REF for a subset of constants, but it's unclear
+;;; why that should be necessary. The shape of this algorithm suggests more than
+;;; mere oversight, and that it was a deliberate choice.
 (defun make-load-time-constant-tn (kind info)
   (declare (type keyword kind))
   (let* ((component (component-info *component-being-compiled*))
@@ -291,16 +304,16 @@
                        (svref *backend-sc-numbers* sb-vm:constant-sc-number)))
          (constants (ir2-component-constants component)))
     (setf (tn-type res) *universal-type*)
-    (do ((i 0 (1+ i)))
+    (do ((i 1 (1+ i)))
         ((= i (length constants))
          (setf (tn-offset res) i)
-         (vector-push-extend (cons kind info) constants))
+         (vector-push-extend (list kind info res) constants))
       (let ((entry (aref constants i)))
         (when (and (consp entry)
                    (eq (car entry) kind)
-                   (or (eq (cdr entry) info)
+                   (or (eq (cadr entry) info)
                        (and (consp info)
-                            (equal (cdr entry) info))))
+                            (equal (cadr entry) info))))
           (setf (tn-offset res) i)
           (return))))
 
@@ -404,12 +417,12 @@
   (declare (type cblock block))
   (let ((2block (block-info block)))
     (or (ir2-block-%label 2block)
-        (setf (ir2-block-%label 2block) (gen-label)))))
+        (setf (ir2-block-%label 2block) (gen-label "basic block")))))
 (defun block-trampoline (block)
   (declare (type cblock block))
   (let ((2block (block-info block)))
     (or (ir2-block-%trampoline-label 2block)
-        (setf (ir2-block-%trampoline-label 2block) (gen-label)))))
+        (setf (ir2-block-%trampoline-label 2block) (gen-label "trampoline")))))
 
 ;;; Return true if Block is emitted immediately after the block ended by Node.
 (defun drop-thru-p (node block)
@@ -455,8 +468,8 @@
   (declare (type vop vop))
   (do ((ref (vop-refs vop) (tn-ref-next-ref ref)))
       ((null ref))
-    (delete-tn-ref ref))
-
+    (unless (eql (tn-kind (tn-ref-tn ref)) :unused)
+      (delete-tn-ref ref)))
   (let ((prev (vop-prev vop))
         (next (vop-next vop))
         (block (vop-block vop)))
@@ -467,7 +480,7 @@
         (setf (vop-prev next) prev)
         (setf (ir2-block-last-vop block) prev)))
 
-  (values))
+  nil)
 
 ;;; Return a list of N normal TNs of the specified primitive type.
 (defun make-n-tns (n ptype)

@@ -222,13 +222,15 @@
   (:args (symbol :scs (descriptor-reg)))
   (:results (res :scs (any-reg)))
   (:result-types positive-fixnum)
+  (:args-var args)
   (:generator 2
     ;; The symbol-hash slot of NIL holds NIL because it is also the
-    ;; cdr slot, so we have to strip off the two low bits to make sure
+    ;; car slot, so we have to strip off the two low bits to make sure
     ;; it is a fixnum.  The lowtag selection magic that is required to
     ;; ensure this is explained in the comment in objdef.lisp
     (loadw res symbol symbol-hash-slot other-pointer-lowtag)
-    (inst clrrwi res res n-fixnum-tag-bits)))
+    (unless (not-nil-tn-ref-p args)
+      (inst clrrwi res res n-fixnum-tag-bits))))
 
 ;;;; Fdefinition (fdefn) objects.
 
@@ -266,7 +268,7 @@
       (inst addi lip function
             (- (ash simple-fun-insts-offset word-shift) fun-pointer-lowtag))
       (inst beq normal-fn)
-      (inst lr lip (make-fixup 'closure-tramp :assembly-routine))
+      (load-asm-rtn-addr lip 'closure-tramp)
       (emit-label normal-fn)
       (storew lip fdefn fdefn-raw-addr-slot other-pointer-lowtag)
       (storew function fdefn fdefn-fun-slot other-pointer-lowtag)
@@ -280,7 +282,7 @@
   (:results (result :scs (descriptor-reg)))
   (:generator 38
     (storew null-tn fdefn fdefn-fun-slot other-pointer-lowtag)
-    (inst lr temp (make-fixup 'undefined-tramp :assembly-routine))
+    (load-asm-rtn-addr temp 'undefined-tramp)
     (storew temp fdefn fdefn-raw-addr-slot other-pointer-lowtag)
     (move result fdefn)))
 
@@ -296,53 +298,10 @@
 (define-vop (dynbind)
   (:args (val :scs (any-reg descriptor-reg))
          (symbol :scs (descriptor-reg)))
-  (:temporary (:sc non-descriptor-reg :offset nl3-offset) pa-flag)
   (:temporary (:scs (descriptor-reg)) temp tls-index)
   (:generator 5
      (loadw tls-index symbol symbol-tls-index-slot other-pointer-lowtag)
-     (inst cmpwi tls-index 0)
-     (inst bne TLS-VALID)
-
-     ;; No TLS slot allocated, so allocate one.
-     ;; FIXME: this is a ridiculous number of instructions to emit inline.
-     (pseudo-atomic (pa-flag)
-       (without-scheduling ()
-         (assemble ()
-           (inst li temp (+ (static-symbol-offset '*tls-index-lock*)
-                            (ash symbol-value-slot word-shift)
-                            (- other-pointer-lowtag)))
-           OBTAIN-LOCK
-           (inst lwarx tls-index null-tn temp)
-           (inst cmpwi tls-index 0)
-           (inst bne OBTAIN-LOCK)
-           (inst stwcx. thread-base-tn null-tn temp)
-           (inst bne OBTAIN-LOCK)
-           (inst isync)
-
-           ;; Check to see if the TLS index was set while we were waiting.
-           (loadw tls-index symbol symbol-tls-index-slot other-pointer-lowtag)
-           (inst cmpwi tls-index 0)
-           (inst bne RELEASE-LOCK)
-
-           (load-symbol-value tls-index *free-tls-index*)
-           ;; FIXME: Check for TLS index overflow.
-           (inst addi tls-index tls-index n-word-bytes)
-           (store-symbol-value tls-index *free-tls-index*)
-           (inst addi tls-index tls-index (- n-word-bytes))
-           (storew tls-index symbol symbol-tls-index-slot other-pointer-lowtag)
-
-           ;; The sync instruction doesn't need to happen if we branch
-           ;; directly to RELEASE-LOCK as we didn't do any stores in that
-           ;; case.
-           (inst sync)
-           RELEASE-LOCK
-           (inst stwx zero-tn null-tn temp)
-
-           ;; temp is a boxed register, but we've been storing crap in it.
-           ;; fix it before we leave pseudo-atomic.
-           (inst li temp 0))))
-
-     TLS-VALID
+     (inst twi :eq tls-index 0)
      (inst lwzx temp thread-base-tn tls-index)
      (inst addi bsp-tn bsp-tn (* binding-size n-word-bytes))
      (storew temp bsp-tn (- binding-value-slot binding-size))
@@ -463,18 +422,15 @@
 
 ;;;; Instance hackery:
 
-(define-vop (instance-length)
+(define-vop ()
   (:policy :fast-safe)
   (:translate %instance-length)
   (:args (struct :scs (descriptor-reg)))
-  (:temporary (:scs (non-descriptor-reg)) temp)
   (:results (res :scs (unsigned-reg)))
   (:result-types positive-fixnum)
   (:generator 4
-    (loadw temp struct 0 instance-pointer-lowtag)
-    ;; shift right 8 and mask 15 low bits =
-    ;; rotate left 24, take bit indices 17 through 31.
-    (inst rlwinm res temp (- 32 n-widetag-bits) 17 31)))
+    (loadw res struct 0 instance-pointer-lowtag)
+    (inst srwi res res instance-length-shift)))
 
 (define-vop (instance-index-ref word-index-ref)
   (:policy :fast-safe)
@@ -493,6 +449,15 @@
   (:translate %instance-cas)
   (:variant instance-slots-offset instance-pointer-lowtag)
   (:arg-types instance tagged-num * *))
+(define-vop (%raw-instance-cas/word %instance-cas)
+  (:args (object)
+         (index)
+         (old-value :scs (unsigned-reg))
+         (new-value :scs (unsigned-reg)))
+  (:arg-types * tagged-num unsigned-num unsigned-num)
+  (:results (result :scs (unsigned-reg) :from :load))
+  (:result-types unsigned-num)
+  (:translate %raw-instance-cas/word))
 
 
 ;;;; Code object frobbing.

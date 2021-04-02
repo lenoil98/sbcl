@@ -65,7 +65,7 @@
 
   (/show0 "entering !COLD-INIT")
   (setf (symbol-function '%failed-aver) #'!cold-failed-aver)
-  (!cold-init-hash-table-methods) ; needed by MAKE-READTABLE
+  (!readtable-cold-init)
   (setq *readtable* (make-readtable)
         *print-length* 6 *print-level* 3)
   (setq *error-output* (!make-cold-stderr-stream)
@@ -73,7 +73,13 @@
                       *trace-output* *error-output*)
   (/show "testing '/SHOW" *print-length* *print-level*) ; show anything
   (unless (!c-runtime-noinform-p)
-    (write-string "COLD-INIT... "))
+    ;; I'd like FORMAT to remain working in cold-init, where it does work,
+    ;; hence the conditional.
+    #+(or x86 x86-64) (format t "COLD-INIT... ")
+    #-(or x86 x86-64) (write-string "COLD-INIT... "))
+  (!cold-init-hash-table-methods)
+  ;; And now *CURRENT-THREAD* and *HANDLER-CLUSTERS*
+  (sb-thread::init-main-thread)
 
   ;; Assert that FBOUNDP doesn't choke when its answer is NIL.
   ;; It was fine if T because in that case the legality of the arg is certain.
@@ -83,21 +89,12 @@
   ;; Anyone might call RANDOM to initialize a hash value or something;
   ;; and there's nothing which needs to be initialized in order for
   ;; this to be initialized, so we initialize it right away.
-  ;; Indeed, INIT-INITIAL-THREAD needs a random number.
   (show-and-call !random-cold-init)
 
-  ;; Ensure that *CURRENT-THREAD* and *HANDLER-CLUSTERS* have sane values.
-  ;; create_thread_struct() assigned NIL/unbound-marker respectively.
-  (sb-thread::init-initial-thread)
-  (show-and-call sb-kernel::!target-error-cold-init)
-
-  ;; Putting data in a synchronized hashtable (*PACKAGE-NAMES*)
-  ;; requires that the main thread be properly initialized.
-  (show-and-call thread-init-or-reinit)
   ;; Printing of symbols requires that packages be filled in, because
   ;; OUTPUT-SYMBOL calls FIND-SYMBOL to determine accessibility.
   (show-and-call !package-cold-init)
-  (setq *print-pprint-dispatch* (sb-pretty::make-pprint-dispatch-table))
+  (setq *print-pprint-dispatch* (sb-pretty::make-pprint-dispatch-table nil nil nil))
   ;; Because L-T-V forms have not executed, CHOOSE-SYMBOL-OUT-FUN doesn't work.
   (setf (symbol-function 'choose-symbol-out-fun)
         (lambda (&rest args) (declare (ignore args)) #'output-preserve-symbol))
@@ -127,7 +124,6 @@
   (show-and-call !early-type-cold-init)
   (show-and-call !late-type-cold-init)
   (show-and-call !alien-type-cold-init)
-  (show-and-call !target-type-cold-init)
   ;; FIXME: It would be tidy to make sure that that these cold init
   ;; functions are called in the same relative order as the toplevel
   ;; forms of the corresponding source files.
@@ -161,10 +157,10 @@
       (%defun name (fdefinition name) inline-expansion dxable-args)))
 
   (unless (!c-runtime-noinform-p)
-    (write `("Length(TLFs)=" ,(length *!cold-toplevels*)) :escape nil)
-    (terpri))
-  ;; only the basic external formats are present at this point.
-  (setq sb-impl::*default-external-format* :latin-1)
+    #+(or x86 x86-64) (format t "[Length(TLFs)=~D]~%" (length *!cold-toplevels*))
+    #-(or x86 x86-64)
+    (progn (write `("Length(TLFs)=" ,(length *!cold-toplevels*)) :escape nil)
+           (terpri)))
 
   (loop with *package* = *package* ; rebind to self, as if by LOAD
         for index-in-cold-toplevels from 0
@@ -178,12 +174,12 @@
         (function
          (funcall toplevel-thing))
         ((cons (eql :load-time-value))
-            (setf (svref *!load-time-values* (third toplevel-thing))
-                  (funcall (second toplevel-thing))))
+         (setf (svref *!load-time-values* (third toplevel-thing))
+               (funcall (second toplevel-thing))))
         ((cons (eql :load-time-value-fixup))
          (destructuring-bind (object index value) (cdr toplevel-thing)
            (aver (typep object 'code-component))
-           (aver (eq (code-header-ref object index) (make-unbound-marker)))
+           (aver (unbound-marker-p (code-header-ref object index)))
            (setf (code-header-ref object index) (svref *!load-time-values* value))))
         ((cons (eql defstruct))
          (apply 'sb-kernel::%defstruct (cdr toplevel-thing)))
@@ -199,7 +195,7 @@
   ;; Now that L-T-V forms have executed, the symbol output chooser works.
   (setf (symbol-function 'choose-symbol-out-fun) real-choose-symbol-out-fun)
 
-  (show-and-call time-reinit)
+  #+win32 (show-and-call reinit-internal-real-time)
 
   ;; Set sane values again, so that the user sees sane values instead
   ;; of whatever is left over from the last DECLAIM/PROCLAIM.
@@ -215,12 +211,12 @@
   ;; run the PROCLAIMs.
   (show-and-call !late-proclaim-cold-init)
 
+  (show-and-call !loader-cold-init)
   (show-and-call os-cold-init-or-reinit)
   (show-and-call !pathname-cold-init)
 
   (show-and-call stream-cold-init-or-reset)
   (/show "Enabled buffered streams")
-  (show-and-call !loader-cold-init)
   (show-and-call !foreign-cold-init)
   #-(and win32 (not sb-thread))
   (show-and-call signal-cold-init-or-reinit)
@@ -228,14 +224,6 @@
   (show-and-call float-cold-init-or-reinit)
 
   (show-and-call !class-finalize)
-
-  ;; Install closures as guards on some early PRINT-OBJECT methods so that
-  ;; THREAD and RESTART print nicely prior to the real methods being installed.
-  (dovector (method (cdr (assoc 'print-object sb-pcl::*!trivial-methods*)))
-    (unless (car method)
-      (let ((classoid (find-classoid (third method))))
-        (rplaca method
-                (lambda (x) (classoid-typep (layout-of x) classoid x))))))
 
   ;; The reader and printer are initialized very late, so that they
   ;; can do hairy things like invoking the compiler as part of their
@@ -254,7 +242,7 @@
   (setq *print-level* nil *print-length* nil) ; restore defaults
 
   ;; Enable normal (post-cold-init) behavior of INFINITE-ERROR-PROTECT.
-  (setf sb-kernel::*maximum-error-depth* 10)
+  (setf sb-kernel:*maximum-error-depth* 10)
   (/show0 "enabling internal errors")
   (setf (extern-alien "internal_errors_enabled" int) 1)
   (setf (symbol-function '%failed-aver) real-failed-aver-fun)
@@ -269,14 +257,10 @@
       (logically-readonlyize (sb-c::sc-move-vops sc))
       (logically-readonlyize (sb-c::sc-move-costs sc))))
 
-  ; hppa heap is segmented, lisp and c uses a stub to call eachother
-  #+hpux (%primitive sb-vm::setup-return-from-lisp-stub)
   ;; The system is finally ready for GC.
   (/show0 "enabling GC")
   (setq *gc-inhibit* nil)
-  (/show0 "doing first GC")
-  (gc :full t)
-  (/show0 "back from first GC")
+  #+sb-thread (finalizer-thread-start)
 
   ;; The show is on.
   (/show0 "going into toplevel loop")
@@ -330,49 +314,42 @@ Consequences are unspecified if serious conditions occur during EXIT
 excepting errors from *EXIT-HOOKS*, which cause warnings and stop
 execution of the hook that signaled, but otherwise allow the exit
 process to continue normally."
-  (if (or abort *exit-in-process*)
+  (if (or abort *exit-in-progress*)
       (os-exit (or code 1) :abort t)
       (let ((code (or code 0)))
         (with-deadline (:seconds nil :override t)
           (sb-thread:grab-mutex *exit-lock*))
-        (setf *exit-in-process* code
+        (setf *exit-in-progress* code
               *exit-timeout* timeout)
         (throw '%end-of-the-world t)))
   (critically-unreachable "After trying to die in EXIT."))
 
 ;;;; initialization functions
 
-(defun thread-init-or-reinit ()
-  (sb-thread::init-job-control)
-  (sb-thread::get-foreground))
-
-(defun reinit ()
-  #+win32
-  (setf sb-win32::*ansi-codepage* nil)
-  (setf *default-external-format* nil)
-  (setf sb-alien::*default-c-string-external-format* nil)
+(defun reinit (total)
   ;; WITHOUT-GCING implies WITHOUT-INTERRUPTS.
   (without-gcing
+    ;; Until *CURRENT-THREAD* has been set, nothing the slightest bit complicated
+    ;; can be called, as pretty much anything can assume that it is set.
+    (when total ; newly started process, and not a failed save attempt
+      (sb-thread::init-main-thread))
+    ;; Initializing the standard streams calls ALLOC-BUFFER which calls FINALIZE
     (finalizers-reinit)
-    ;; Create *CURRENT-THREAD* first, since initializing a stream calls
-    ;; ALLOC-BUFFER which calls FINALIZE which acquires **FINALIZER-STORE-LOCK**
-    ;; which needs a valid thread in order to grab a mutex.
-    (sb-thread::init-initial-thread)
-    ;; Initialize streams first, so that any errors can be printed later
+    ;; Initialize streams next, so that any errors can be printed
     (stream-reinit t)
     (os-cold-init-or-reinit)
-    (thread-init-or-reinit)
     #-(and win32 (not sb-thread))
     (signal-cold-init-or-reinit)
     (setf (extern-alien "internal_errors_enabled" int) 1)
     (float-cold-init-or-reinit))
   (gc-reinit)
   (foreign-reinit)
-  (time-reinit)
+  #+win32 (reinit-internal-real-time)
   ;; If the debugger was disabled in the saved core, we need to
   ;; re-disable ldb again.
   (when (eq *invoke-debugger-hook* 'sb-debug::debugger-disabled-hook)
     (sb-debug::disable-debugger))
+  #+sb-thread (finalizer-thread-start)
   (call-hooks "initialization" *init-hooks*))
 
 ;;;; some support for any hapless wretches who end up debugging cold

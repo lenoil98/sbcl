@@ -49,6 +49,19 @@
            (- list-pointer-lowtag)))
       0))
 
+;;; the address of the linkage table entry for table index I.
+(defun linkage-table-entry-address (i)
+  (ecase linkage-table-growth-direction
+    (:up   (+ (* i linkage-table-entry-size) linkage-table-space-start))
+    (:down (- linkage-table-space-end (* (1+ i) linkage-table-entry-size)))))
+
+(defun linkage-table-index-from-address (addr)
+  (ecase linkage-table-growth-direction
+    (:up
+     (floor (- addr linkage-table-space-start) linkage-table-entry-size))
+    (:down
+     (1- (floor (- linkage-table-space-end addr) linkage-table-space-end)))))
+
 (defconstant-eqx +all-static-fdefns+
     #.(concatenate 'vector +c-callable-fdefns+ +static-fdefns+) #'equalp)
 
@@ -134,27 +147,19 @@
 
 ;;; Return a list of TNs that can be used to represent an unknown-values
 ;;; continuation within a function.
-(defun make-unknown-values-locations (&optional unused-count)
-  (declare (ignorable unused-count))
-  (list (make-stack-pointer-tn)
-        (cond #+x86-64 ;; needs support from receive-unknown-values
+(defun make-unknown-values-locations (&optional unused-count unused-sp)
+  (declare (ignorable unused-count unused-sp))
+  (list (cond #+x86-64
+              ;; needs support from receive-unknown-values, push-values, %more-arg-values
+              (unused-sp
+               (sb-c::make-unused-tn))
+              (t
+               (make-stack-pointer-tn)))
+        (cond #+x86-64
               (unused-count
                (sb-c::make-unused-tn))
               (t
                (make-normal-tn *fixnum-primitive-type*)))))
-
-;;; This function is called by the ENTRY-ANALYZE phase, allowing
-;;; VM-dependent initialization of the IR2-COMPONENT structure. We
-;;; push placeholder entries in the CONSTANTS to leave room for
-;;; additional noise in the code object header.
-(defun select-component-format (component)
-  (declare (type component component))
-  (let* ((2comp (component-info component))
-         (n-entries (length (sb-c::ir2-component-entries 2comp)))
-         (consts (ir2-component-constants 2comp)))
-    (dotimes (i (+ code-constants-offset (* sb-vm:code-slots-per-simple-fun n-entries)))
-      (vector-push-extend nil consts)))
-  (values))
 
 (defun error-call (vop error-code &rest values)
   "Cause an error.  ERROR-CODE is the error to cause."
@@ -171,6 +176,23 @@
   (:generator 0
     (emit-safepoint)))
 
+;;; Does the TN definitely hold *any* of the 4 pointer types
+(defun pointer-tn-ref-p (tn-ref)
+  (and (sc-is (tn-ref-tn tn-ref) descriptor-reg)
+       (tn-ref-type tn-ref)
+       (not (types-equal-or-intersect
+             (tn-ref-type tn-ref)
+             (specifier-type '(or fixnum
+                               #+64-bit single-float
+                               character))))))
+
+;;; Does the TN definitely hold any of the 3 non-list pointer types
+(defun headered-object-pointer-tn-ref-p (tn-ref)
+  (and (pointer-tn-ref-p tn-ref)
+       (not (types-equal-or-intersect (tn-ref-type tn-ref)
+                                      (specifier-type 'list)))))
+
+;;; Does the TN definitely hold an OTHER pointer
 (defun other-pointer-tn-ref-p (tn-ref)
   (and (sc-is (tn-ref-tn tn-ref) descriptor-reg)
        (tn-ref-type tn-ref)
@@ -183,8 +205,35 @@
                                instance
                                character))))))
 
-(defun compute-object-header (size widetag)
-  (logior (case widetag
-            (#.fdefn-widetag 0)
-            (t (ash (1- size) n-widetag-bits)))
-          widetag))
+(defun not-nil-tn-ref-p (tn-ref)
+  (and (tn-ref-type tn-ref)
+       (not (types-equal-or-intersect (tn-ref-type tn-ref)
+                                      (specifier-type '(eql nil))))))
+
+(defun length-field-shift (widetag)
+  (if (= widetag instance-widetag)
+      instance-length-shift
+      n-widetag-bits))
+
+(defconstant array-rank-byte-pos 16)
+(defconstant array-rank-mask 255)
+;;; Rank is encoded as a (UNSIGNED-BYTE 8) minus one.
+;;; Initialization of simple rank 1 array header words is completely unaffected-
+;;; they store 0 for the rank, which is the correct encoding for 1.
+;;; The encoding 1 means 2, encoding 2 means 3, and so on.
+;;; Decoding is just an addition and bitwise AND.
+(defun encode-array-rank (rank)
+  (declare (type (unsigned-byte 8) rank))
+  (logand (1- rank) array-rank-mask))
+
+(defun compute-object-header (nwords widetag)
+  (let ((array-header-p
+         (or (= widetag simple-array-widetag)
+             (>= widetag complex-base-string-widetag))))
+    (logior (if array-header-p
+                (let ((rank (- nwords array-dimensions-offset)))
+                  (ash (encode-array-rank rank) array-rank-byte-pos))
+                (case widetag
+                  (#.fdefn-widetag 0)
+                  (t (ash (1- nwords) (length-field-shift widetag)))))
+            widetag)))

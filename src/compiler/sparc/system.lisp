@@ -49,6 +49,30 @@
 
     DONE))
 
+(define-vop ()
+  (:translate sb-c::%structure-is-a)
+  (:args (x :scs (descriptor-reg)))
+  (:arg-types * (:constant t))
+  (:policy :fast-safe)
+  (:conditional)
+  ;; "extra" info in conditional vops follows the 2 super-magical info args
+  (:info target not-p test-layout)
+  (:temporary (:sc unsigned-reg) this-id temp)
+  (:generator 4
+    (let ((offset (+ (ash (+ (get-dsd-index layout sb-kernel::id-word0)
+                             instance-slots-offset)
+                          word-shift)
+                     (ash (- (layout-depthoid test-layout) 2) 2)
+                     (- instance-pointer-lowtag))))
+      (inst ld this-id x offset)
+      (if (or (typep (layout-id test-layout) '(and (signed-byte 8) (not (eql 0))))
+              (not (sb-c::producing-fasl-file)))
+          (inst li temp (layout-id test-layout))
+          (inst load-layout-id temp test-layout))
+      (inst cmp this-id temp)
+      (inst b (if not-p :ne :eq) target)
+      (inst nop))))
+
 (define-vop (%other-pointer-widetag)
   (:translate %other-pointer-widetag)
   (:policy :fast-safe)
@@ -66,16 +90,6 @@
   (:result-types positive-fixnum)
   (:generator 6
     (load-type result function (- fun-pointer-lowtag))))
-
-(define-vop (fun-header-data)
-  (:translate fun-header-data)
-  (:policy :fast-safe)
-  (:args (x :scs (descriptor-reg)))
-  (:results (res :scs (unsigned-reg)))
-  (:result-types positive-fixnum)
-  (:generator 6
-    (loadw res x 0 fun-pointer-lowtag)
-    (inst srl res res n-widetag-bits)))
 
 (define-vop (get-header-data)
   (:translate get-header-data)
@@ -220,3 +234,10 @@
   (:translate spin-loop-hint)
   (:policy :fast-safe)
   (:generator 0))
+
+(define-vop (sb-c::mark-covered)
+ (:info index)
+ (:generator 4
+   ;; Can't convert index to a code-relative index until the boxed header length
+   ;; has been determined.
+   (inst store-coverage-mark index)))

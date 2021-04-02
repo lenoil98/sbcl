@@ -45,7 +45,7 @@
 ;; these abstractions are provided as soon as the raw slots defs are.
 (def!type sb-vm:word () `(unsigned-byte ,sb-vm:n-word-bits))
 (def!type sb-vm:signed-word () `(signed-byte ,sb-vm:n-word-bits))
-(defconstant +layout-all-tagged+ -1)
+(defconstant +layout-all-tagged+ (ash -1 sb-vm:instance-data-start))
 
 ;; information about how a slot of a given DSD-RAW-TYPE is to be accessed
 (defstruct (raw-slot-data
@@ -74,7 +74,7 @@
        (defun raw-slot-data-accessor-name (rsd)
          (%simple-fun-name (raw-slot-data-accessor-fun rsd))))
 
-#-sb-fluid (declaim (freeze-type raw-slot-data))
+(declaim (freeze-type raw-slot-data))
 
 ;; Simulate DEFINE-LOAD-TIME-GLOBAL - always bound in the image
 ;; but not eval'd in the compiler.
@@ -99,19 +99,20 @@
                    ;; Ignore the :ACCESSOR-NAME initarg
                    ,@args :allow-other-keys t))))
     (let ((double-float-alignment
-            ;; white list of architectures that can load unaligned doubles:
-            #+(or x86 x86-64 ppc arm64 riscv) 1
-            ;; at least sparc, mips and alpha can't:
-            #-(or x86 x86-64 ppc arm64 riscv) 2))
+           ;; alignment in machine words of double-float slots.
+           ;; For 8 byte words, this should be 1 since double-floats are 8 bytes.
+           ;; It can be 1 if the word size is 4 bytes and the machine permits
+           ;; double-floats to be unnaturally aligned (x86 and ppc).
+           (or #+(or x86 x86-64 ppc ppc64 arm64 riscv) 1
+               ;; other architectures align double-floats to twice the
+               ;; machine word size
+               2)))
      (setq *raw-slot-data*
       (vector
        (make-raw-slot-data :raw-type 'sb-vm:word
                            :accessor-name '%raw-instance-ref/word
                            :init-vop 'sb-vm::raw-instance-init/word
                            :n-words 1)
-       ;; If this list of architectures is changed, then also change the test
-       ;; for :DEFINE-STRUCTURE-SLOT-ADDRESSOR in raw-slots-interleaved.impure
-       #-(or alpha hppa sparc)
        (make-raw-slot-data :raw-type 'sb-vm:signed-word
                            :accessor-name '%raw-instance-ref/signed-word
                            :init-vop 'sb-vm::raw-instance-init/signed-word
@@ -170,15 +171,13 @@
 ;; [If the compiler were smarter about doing fewer memory accesses,
 ;; there would be no need at all for the LAYOUT - if it had already been
 ;; accessed, it shouldn't be another memory read]
-;;
-(defmacro do-instance-tagged-slot ((index-var thing &key layout
-                                                    ((:bitmap bitmap-expr)) (pad t))
+;; Another use-case for LAYOUT is more esoteric, when 'editcore' manipulates
+;; objects in a foreign core.
+(defmacro do-instance-tagged-slot ((index-var thing &key ((:layout layout-expr)) (pad t))
                                    &body body)
-  (with-unique-names (instance bitmap limit)
+  (with-unique-names (instance layout limit)
     `(let* ((,instance ,thing)
-            (,bitmap ,(or bitmap-expr
-                          `(layout-bitmap
-                            ,(or layout `(%instance-layout ,instance)))))
+            (,layout ,(or layout-expr `(%instance-layout ,instance)))
             (,limit ,(if pad
                          ;; target instances have an odd number of payload words.
                          `(logior (%instance-length ,instance) #-sb-xc-host 1)
@@ -186,5 +185,9 @@
        (do ((,index-var sb-vm:instance-data-start (1+ ,index-var)))
            ((>= ,index-var ,limit))
          (declare (type index ,index-var))
-         (when (logbitp ,index-var ,bitmap)
+         (when #+sb-xc-host (logbitp ,index-var (layout-bitmap ,layout))
+               #-sb-xc-host
+               (multiple-value-bind (word bit) (floor ,index-var sb-vm:n-word-bits)
+                 (logbitp bit (%raw-instance-ref/word
+                               ,layout (+ (type-dd-length layout) word))))
            ,@body)))))

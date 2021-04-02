@@ -139,7 +139,8 @@
 ;;;; The allocated space is stored in RESULT-TN with the lowtag LOWTAG
 ;;;; applied.  The amount of space to be allocated is SIZE bytes (which
 ;;;; must be a multiple of the lisp object size).
-(defmacro allocation (result-tn size lowtag &key stack-p temp-tn)
+(defun allocation (type size lowtag result-tn &key stack-p temp-tn)
+  (declare (ignorable type))
   #+gencgc
   ;; A temp register is needed to do inline allocation.  TEMP-TN, in
   ;; this case, can be any register, since it holds a double-word
@@ -147,8 +148,8 @@
   (assert temp-tn)
   ;; We assume we're in a pseudo-atomic so the pseudo-atomic bit is
   ;; set.
-  `(cond
-     (,stack-p
+  (cond
+     (stack-p
       ;; Stack allocation
       ;;
       ;; The control stack grows up, so round up CSP to a
@@ -158,24 +159,24 @@
       ;; space.
 
       ;; Make sure the temp-tn is a non-descriptor register!
-      (aver (and ,temp-tn (sc-is ,temp-tn non-descriptor-reg)))
+      (aver (and temp-tn (sc-is temp-tn non-descriptor-reg)))
 
       ;; temp-tn is csp-tn rounded up to a multiple of 8 (lispobj size)
-      (align-csp ,temp-tn)
+      (align-csp temp-tn)
       ;; For the benefit of future historians, this is how CMUCL does the
       ;; align-csp (I think their version is branch free only because
       ;; they simply don't worry about zeroing the pad word):
       #+nil (inst add ,temp-tn csp-tn sb-vm:lowtag-mask)
       #+nil (inst andn ,temp-tn sb-vm:lowtag-mask)
 
-      ;; Set the result to temp-tn, with appropriate lowtag
-      (inst or ,result-tn csp-tn ,lowtag)
+      ;; Set the result to csp-tn, with appropriate lowtag
+      (inst or result-tn csp-tn lowtag)
 
       ;; Allocate the desired space on the stack.
       ;;
       ;; FIXME: Can't allocate on stack if SIZE is too large.
       ;; Need to rearrange this code.
-      (inst add csp-tn ,size))
+      (inst add csp-tn size))
 
      #-gencgc
      ;; Normal allocation to the heap -- cheneygc version.
@@ -184,17 +185,17 @@
      ;; If the lowtag also has a 1 bit in the same position, we're all set.
      ;;
      ;; See comment in PSEUDO-ATOMIC-FLAG.
-     ((logbitp (1- n-lowtag-bits) ,lowtag)
-      (inst or ,result-tn alloc-tn ,lowtag)
-      (inst add alloc-tn ,size))
+     ((logbitp (1- n-lowtag-bits) lowtag)
+      (inst or result-tn alloc-tn lowtag)
+      (inst add alloc-tn size))
      ;;
      ;; Otherwise, we need to zap out the lowtag from alloc-tn, and then
      ;; or in the lowtag.
      #-gencgc
      (t
-      (inst andn ,result-tn alloc-tn lowtag-mask)
-      (inst or ,result-tn ,lowtag)
-      (inst add alloc-tn ,size))
+      (inst andn result-tn alloc-tn lowtag-mask)
+      (inst or result-tn lowtag)
+      (inst add alloc-tn size))
 
      ;; Normal allocation to the heap -- gencgc version.
      ;;
@@ -203,9 +204,8 @@
      ;; it.
      #+gencgc
      (t
-      (inst li ,temp-tn (make-fixup "gc_alloc_region" :foreign))
-      (loadw ,result-tn ,temp-tn 0)     ;boxed_region.free_pointer
-      (loadw ,temp-tn ,temp-tn 1)       ;boxed_region.end_addr
+      (loadw result-tn null-tn 0 (- nil-value boxed-region)) ; free_pointer
+      (loadw temp-tn null-tn 1 (- nil-value boxed-region))   ; end_addr
 
       (without-scheduling ()
         (let ((done (gen-label))
@@ -214,43 +214,40 @@
           ;; free pointer should not point past the end of the
           ;; current region.  If it does, a full alloc needs to be
           ;; done.
-          (inst add ,result-tn ,size)
+          (inst add result-tn size)
 
           ;; result-tn points to the new end of region.  Did we go
           ;; past the actual end of the region?  If so, we need a
           ;; full alloc.
-          (inst cmp ,result-tn ,temp-tn)
+          (inst cmp result-tn temp-tn)
           (if (member :sparc-v9 *backend-subfeatures*)
               (inst b :gtu full-alloc :pn)
               (inst b :gtu full-alloc))
-          (inst nop)
-          ;; Inline allocation worked, so update the free pointer
-          ;; and go.  Should really do a swap instruction here to
-          ;; swap memory with a register.
-
-          ;; Kludge: We ought to have two distinct FLAG-TN and TEMP-TN
-          ;; here, to avoid the SUB and the TEMP-TN reload which is
-          ;; causing it.  PPC gets it right.
-          (inst li ,temp-tn (make-fixup "gc_alloc_region" :foreign))
-          (storew ,result-tn ,temp-tn 0)
-
-          (inst b done)
-          (inst sub ,result-tn ,size)
-
-          (emit-label full-alloc)
-          ;; Full alloc via trap to the C allocator.  Tell the
-          ;; allocator what the result-tn and size are, using the
-          ;; OR instruction.  Then trap to the allocator.
-          (inst or zero-tn ,result-tn ,size)
-          ;; DFL: Not certain why we use two kinds of traps: T for p/a
-          ;; and UNIMP for all other traps.  But the C code in the runtime
-          ;; for the UNIMP case is a lot nicer, so I'm hooking into that.
-          ;; (inst t :t allocation-trap)
-          (inst unimp allocation-trap)
-
+          ;; New algorithm: no taken branches in the fast case, utilize
+          ;; the branch delay slot to write back the free-pointer
+          ;; (on overflow restore it the trap handler to a good value),
+          ;; and fold the lowtag addition into the size subtraction.
+          (storew result-tn null-tn 0 (- nil-value boxed-region))
+          ;; Compute the base pointer and add lowtag.
+          (cond ((integerp size)
+                 (inst sub result-tn (- size lowtag)))
+                (t
+                 (inst sub result-tn size)
+                 (inst or result-tn lowtag)))
           (emit-label done)
-          ;; Set lowtag appropriately
-          (inst or ,result-tn ,lowtag))))))
+          (assemble (:elsewhere)
+            (without-scheduling ()
+              ;; Encode the RESULT-TN, SIZE, and TYPE in an OR instruction
+              ;; which is never executed.
+              (inst or (make-random-tn :sc (sc-or-lose 'unsigned-reg)
+                                       :kind :normal
+                                       :offset (if (eq type 'list) 1 0))
+                    result-tn size)
+              (emit-label FULL-ALLOC)
+              ;; Trap into the C allocator
+              (inst unimp allocation-trap)
+              (inst b done)
+              (inst or result-tn lowtag))))))))
 
 (defmacro with-fixed-allocation ((result-tn temp-tn type-code size)
                                  &body body)
@@ -264,7 +261,7 @@
   (once-only ((result-tn result-tn) (temp-tn temp-tn)
               (type-code type-code) (size size))
     `(pseudo-atomic ()
-       (allocation ,result-tn (pad-data-block ,size) other-pointer-lowtag
+       (allocation nil (pad-data-block ,size) other-pointer-lowtag ,result-tn
                    :temp-tn ,temp-tn)
        (inst li ,temp-tn (compute-object-header ,size ,type-code))
        (storew ,temp-tn ,result-tn 0 other-pointer-lowtag)

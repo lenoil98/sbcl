@@ -66,26 +66,34 @@
                            (load-fresh-line)
                            (format t "~{~S~^, ~}~%" results))
                          (eval-tlf form index)))
-                   (return))))))
-        (if pathname
-            (let* ((info (sb-c::make-file-source-info
-                          pathname (stream-external-format stream)))
-                   (sb-c::*source-info* info))
-              (setf (sb-c::source-info-stream info) stream)
-              (sb-c::do-forms-from-info ((form current-index) info
-                                         'sb-c::input-error-in-load)
-                (sb-c::with-source-paths
-                  (sb-c::find-source-paths form current-index)
-                  (eval-form form current-index))))
-            (let ((sb-c::*source-info* nil))
-              (loop for form =
-                    (handler-case (read stream nil *eof-object*)
-                      ((or reader-error end-of-file) (c)
-                        (error 'sb-c::input-error-in-load :stream stream
-                                                          :condition c)))
-                    until (eq form *eof-object*)
-                    do (sb-c::with-source-paths
-                         (eval-form form nil))))))))
+                    (return))))))
+       (let ((sb-c::*current-path* nil)
+             (sb-impl::*eval-source-info* nil)
+             (sb-impl::*eval-tlf-index* nil)
+             (sb-impl::*eval-source-context* nil))
+         (locally (declare (optimize (sb-c::type-check 0)))
+           (setf sb-c::*current-path* (make-unbound-marker)))
+         (if pathname
+             (let* ((info (sb-c::make-file-source-info
+                           pathname (stream-external-format stream)))
+                    (sb-c::*source-info* info))
+               (locally (declare (optimize (sb-c::type-check 0)))
+                 (setf sb-c::*current-path* (make-unbound-marker)))
+               (setf (sb-c::source-info-stream info) stream)
+               (sb-c:do-forms-from-info ((form current-index) info
+                                          'sb-c::input-error-in-load)
+                 (sb-c::with-source-paths
+                   (sb-c::find-source-paths form current-index)
+                   (eval-form form current-index))))
+             (let ((sb-c::*source-info* nil))
+               (loop for form =
+                     (handler-case (read stream nil *eof-object*)
+                       ((or reader-error end-of-file) (c)
+                         (error 'sb-c::input-error-in-load :stream stream
+                                                           :condition c)))
+                     until (eq form *eof-object*)
+                     do (sb-c::with-source-paths
+                          (eval-form form nil)))))))))
   t)
 
 ;;;; LOAD itself
@@ -283,7 +291,7 @@
 (declaim (code-component *assembler-routines*))
 
 (defun calc-asm-routine-bounds ()
-  (loop for v being each hash-value of (car (%code-debug-info *assembler-routines*))
+  (loop for v being each hash-value of (%code-debug-info *assembler-routines*)
         minimize (car v) into min
         maximize (cadr v) into max
         ;; min/max are inclusive byte ranges, but return the answer
@@ -294,7 +302,7 @@
 (defvar *!initial-assembler-routines*)
 
 (defun get-asm-routine (name &optional indirect &aux (code *assembler-routines*))
-  (awhen (the list (gethash (the symbol name) (car (%code-debug-info code))))
+  (awhen (the list (gethash (the symbol name) (%code-debug-info code)))
     (sap-int (sap+ (code-instructions code)
                    (if indirect
                        ;; Return the address containing the routine address
@@ -307,14 +315,14 @@
          (size (%code-text-size code))
          (vector (the simple-vector *!initial-assembler-routines*))
          (count (length vector))
-         (ht (make-hash-table :test 'eq)))
+         (ht (make-hash-table))) ; keys are symbols
     (rplaca (%code-debug-info code) ht)
     (dotimes (i count)
       (destructuring-bind (name . offset) (svref vector i)
         (let ((next-offset (if (< (1+ i) count) (cdr (svref vector (1+ i))) size)))
           (aver (> next-offset offset))
           ;; store inclusive bounds on PC offset range and the function index
-          (setf (gethash name ht) (list* offset (1- next-offset) i)))))))
+          (setf (gethash name ht) (list* offset (1- next-offset) (1+ i))))))))
 
 (defun !warm-load (file)
   (restart-case (let ((sb-c::*source-namestring*

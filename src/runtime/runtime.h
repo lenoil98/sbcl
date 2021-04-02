@@ -15,7 +15,9 @@
 #ifndef _SBCL_RUNTIME_H_
 #define _SBCL_RUNTIME_H_
 
-#if defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_SB_THREAD)
+#include "lispobj.h"
+
+#ifdef LISP_FEATURE_WIN32
 # include "pthreads_win32.h"
 #else
 # include <signal.h>
@@ -28,28 +30,30 @@
 #include <inttypes.h>
 
 #if defined(LISP_FEATURE_SB_THREAD)
-#define thread_self() pthread_self()
-#define thread_equal(a,b) pthread_equal(a,b)
-#define thread_kill pthread_kill
 
 #ifdef LISP_FEATURE_WIN32
-#define thread_sigmask _sbcl_pthread_sigmask
+#define thread_sigmask sb_pthread_sigmask
+// wrap CriticalSection operators in a function returning 0 to satisfy assertions
+static inline int cs_mutex_lock(void* l) { EnterCriticalSection(l); return 0; }
+static inline int cs_mutex_unlock(void* l) { LeaveCriticalSection(l); return 0; }
+#define thread_mutex_lock(l) cs_mutex_lock(l)
+#define thread_mutex_unlock(l) cs_mutex_unlock(l)
 #else
+#define thread_self() pthread_self()
+#define thread_equal(a,b) pthread_equal(a,b)
 #define thread_sigmask pthread_sigmask
-#endif
-
 #define thread_mutex_lock(l) pthread_mutex_lock(l)
 #define thread_mutex_unlock(l) pthread_mutex_unlock(l)
+#endif
+
 #else
+// not SB_THREAD
 #define thread_self() 0
 #define thread_equal(a,b) ((a)==(b))
-#define thread_kill kill_safely
 #define thread_sigmask sigprocmask
 #define thread_mutex_lock(l) 0
 #define thread_mutex_unlock(l) 0
 #endif
-
-void os_link_runtime();
 
 #if defined(LISP_FEATURE_SB_SAFEPOINT)
 
@@ -81,13 +85,6 @@ void gc_state_unlock();
  * The next few defines serve as configuration -- edit them inline if
  * you are a developer and want to affect FSHOW behaviour.
  */
-
-/* Block blockable interrupts for each SHOW, if not 0.
- * (On Windows, this setting has no effect.)
- *
- * In principle, this is a "configuration option", but I am not aware of
- * any reason why or when it would be advantageous to disable it. */
-#define QSHOW_SIGNAL_SAFE 1
 
 /* Enable extra-verbose low-level debugging output for signals? (You
  * probably don't want this unless you're trying to debug very early
@@ -167,19 +164,6 @@ extern int gencgc_verbose;
 
 void dyndebug_init(void);
 
-#if QSHOW_SIGNAL_SAFE == 1 && !defined(LISP_FEATURE_WIN32)
-
-extern sigset_t blockable_sigset;
-
-#define QSHOW_BLOCK                                             \
-        sigset_t oldset;                                        \
-        thread_sigmask(SIG_BLOCK, &blockable_sigset, &oldset)
-#define QSHOW_UNBLOCK thread_sigmask(SIG_SETMASK,&oldset,0)
-#else
-#define QSHOW_BLOCK
-#define QSHOW_UNBLOCK
-#endif
-
 /* The following macros duplicate the expansion of odxprint, because the
  * extra level of parentheses around `args' prevents us from
  * implementing FSHOW in terms of odxprint directly.  (They also differ
@@ -202,24 +186,6 @@ extern sigset_t blockable_sigset;
 # define FSHOW_SIGNAL(args)
 #endif
 
-/* KLUDGE: These are in theory machine-dependent and OS-dependent, but
- * in practice the "foo int" definitions work for all the machines
- * that SBCL runs on as of 0.6.7. If we port to the Alpha or some
- * other non-32-bit machine we'll probably need real machine-dependent
- * and OS-dependent definitions again. */
-/* even on alpha, int happens to be 4 bytes.  long is longer. */
-/* FIXME: these names really shouldn't reflect their length and this
-   is not quite right for some of the FFI stuff */
-#if defined(LISP_FEATURE_WIN32)&&defined(LISP_FEATURE_X86_64)
-typedef unsigned long long u64;
-typedef signed long long s64;
-#else
-typedef unsigned long u64;
-typedef signed long s64;
-#endif
-typedef unsigned int u32;
-typedef signed int s32;
-
 #ifdef _WIN64
 #define AMD64_SYSV_ABI __attribute__((sysv_abi))
 #else
@@ -228,33 +194,7 @@ typedef signed int s32;
 
 #include <sys/types.h>
 
-#if defined(LISP_FEATURE_SB_THREAD)
-typedef pthread_t os_thread_t;
-#else
-typedef pid_t os_thread_t;
-#endif
-
-#ifndef LISP_FEATURE_ALPHA
-typedef uintptr_t uword_t;
-typedef intptr_t  sword_t;
-#else
-/* The alpha32 port uses non-intptr-sized words */
-typedef u32 uword_t;
-typedef s32 sword_t;
-#endif
-
-/* FIXME: we do things this way because of the alpha32 port.  once
-   alpha64 has arrived, all this nastiness can go away */
-#if 64 == N_WORD_BITS
-#define LOW_WORD(c) ((uintptr_t)c)
 #define OBJ_FMTX PRIxPTR
-typedef uintptr_t lispobj;
-#else
-#define OBJ_FMTX "x"
-#define LOW_WORD(c) ((long)(c) & 0xFFFFFFFFL)
-/* fake it on alpha32 */
-typedef unsigned int lispobj;
-#endif
 
 static inline int
 lowtag_of(lispobj obj)
@@ -292,37 +232,37 @@ static inline int instancep(lispobj obj) {
 static inline int functionp(lispobj obj) {
     return lowtag_of(obj) == FUN_POINTER_LOWTAG;
 }
+static inline int other_pointer_p(lispobj obj) {
+    return lowtag_of(obj) == OTHER_POINTER_LOWTAG;
+}
 static inline int simple_vector_p(lispobj obj) {
-    return lowtag_of(obj) == OTHER_POINTER_LOWTAG &&
+    return other_pointer_p(obj) &&
            widetag_of((lispobj*)(obj-OTHER_POINTER_LOWTAG)) == SIMPLE_VECTOR_WIDETAG;
 }
-
-static inline uword_t instance_length(lispobj header)
-{
-  return HeaderValue(header) & SHORT_HEADER_MAX_WORDS;
-}
-
-/* Define an assignable instance_layout() macro taking a native pointer */
-#ifndef LISP_FEATURE_COMPACT_INSTANCE_HEADER
-# define instance_layout(instance_ptr) (instance_ptr)[1]
-#elif defined(LISP_FEATURE_64_BIT) && defined(LISP_FEATURE_LITTLE_ENDIAN)
-  // so that this stays an lvalue, it can't be cast to lispobj
-# define instance_layout(instance_ptr) ((uint32_t*)(instance_ptr))[1]
-#else
-# error "No instance_layout() defined"
-#endif
 
 /* Is the Lisp object obj something with pointer nature (as opposed to
  * e.g. a fixnum or character or unbound marker)? */
 static inline int
 is_lisp_pointer(lispobj obj)
 {
-#if N_WORD_BITS == 64
+#ifdef LISP_FEATURE_PPC64
+    return (obj & 5) == 4;
+#elif N_WORD_BITS == 64
     return (obj & 3) == 3;
 #else
     return obj & 1;
 #endif
 }
+
+/* The standard pointer tagging scheme admits an optimization that cuts the number
+ * of instructions down when testing for either 'a' or 'b' (or both) being a tagged
+ * pointer, because the bitwise OR of two pointers is considered a pointer.
+ * This trick is inadmissible for the PPC64 lowtag arrangement */
+#ifdef LISP_FEATURE_PPC64
+#define at_least_one_pointer_p(a,b) (is_lisp_pointer(a) || is_lisp_pointer(b))
+#else
+#define at_least_one_pointer_p(a,b) (is_lisp_pointer(a|b))
+#endif
 
 #include "fixnump.h"
 
@@ -353,21 +293,18 @@ native_pointer(lispobj obj)
 static inline lispobj
 make_lispobj(void *o, int low_tag)
 {
-    return LOW_WORD(o) | low_tag;
+    return (lispobj)o | low_tag;
 }
 
-#define MAKE_FIXNUM(n) (n << N_FIXNUM_TAG_BITS)
-static inline lispobj
-make_fixnum(uword_t n) // '<<' on negatives is _technically_ undefined behavior
-{
-    return MAKE_FIXNUM(n);
-}
+#define make_fixnum(n) ((uword_t)(n) << N_FIXNUM_TAG_BITS)
 
 static inline sword_t
 fixnum_value(lispobj n)
 {
     return (sword_t)n >> N_FIXNUM_TAG_BITS;
 }
+
+lispobj symbol_function(lispobj* symbol);
 
 #include "align.h"
 
@@ -386,6 +323,16 @@ fixnum_value(lispobj n)
 #endif
 typedef int boolean;
 
+// other_immediate_lowtag_p is the least strict of the tests for whether a word
+// is potentially an object header, merely checking whether the bits fit the general
+// pattern of header widetags without regard for whether some headered object type
+// could in fact have those exact low bits. Specifically, this falsely returns 1
+// for UNBOUND_MARKER_WIDETAG, CHARACTER_WIDETAG, and on 64-bit machines,
+// SINGLE_FLOAT_WIDETAG; as well as unallocated and unused widetags (e.g. LRA on x86)
+// none of which denote the start of a headered object.
+// The ambiguous cases are for words would start a cons - the three mentioned above.
+// Other cases (NO_TLS_VALUE_MARKER_WIDETAG and other things) do not cause a problem
+// in practice because they can't be the first word of a lisp object.
 static inline boolean
 other_immediate_lowtag_p(lispobj header)
 {
@@ -393,21 +340,32 @@ other_immediate_lowtag_p(lispobj header)
     return (lowtag_of(header) & 3) == OTHER_IMMEDIATE_0_LOWTAG;
 }
 
+// widetag_lowtag encodes in the sign bit whether the byte corresponds
+// to a headered object, and in the low bits the lowtag of a tagged pointer
+// pointing to this object, be it headered or a cons.
+extern unsigned char widetag_lowtag[256];
+#define LOWTAG_FOR_WIDETAG(x) (widetag_lowtag[x] & LOWTAG_MASK)
+
+// is_header() and is_cons_half() are logical complements when invoked
+// on the first word of any lisp object. However, given a word which is
+// only *potentially* the first word of a lisp object, they can both be false.
+// In ambiguous root detection, is_cons_half() is to be used, as it is the more
+// stringent check. The set of valid bit patterns in the low byte of the car
+// of a cons is smaller than the set of patterns accepted by !is_header().
+static inline int is_header(lispobj potential_header_word) {
+    return widetag_lowtag[potential_header_word & WIDETAG_MASK] & 0x80;
+}
+
 static inline int
 is_cons_half(lispobj obj)
 {
-    /* A word that satisfies other_immediate_lowtag_p is a headered object
-     * and can not be half of a cons, except that widetags which satisfy
-     * other_immediate and are Lisp immediates can be half of a cons */
-    return !other_immediate_lowtag_p(obj)
+    if (fixnump(obj) || is_lisp_pointer(obj)) return 1;
+    int widetag = header_widetag(obj);
+    return widetag == CHARACTER_WIDETAG ||
 #if N_WORD_BITS == 64
-        || ((uword_t)IMMEDIATE_WIDETAGS_MASK >> (header_widetag(obj) >> 2)) & 1;
-#else
-      /* The above bit-shifting approach is not applicable
-       * since we can't employ a 64-bit unsigned integer constant. */
-      || header_widetag(obj) == CHARACTER_WIDETAG
-      || header_widetag(obj) == UNBOUND_MARKER_WIDETAG;
+           widetag == SINGLE_FLOAT_WIDETAG ||
 #endif
+           widetag == UNBOUND_MARKER_WIDETAG;
 }
 
 /* KLUDGE: As far as I can tell there's no ANSI C way of saying
@@ -513,9 +471,8 @@ extern struct lisp_startup_options lisp_startup_options;
 #define BOXED_NWORDS(obj) ((HeaderValue(obj) & 0x7FFFFF) | 1)
 
 /* Medium-sized payload count is expressed in 15 bits. Objects in this category
- * may reside in immobile space: CLOSURE, INSTANCE, FUNCALLABLE-INSTANCE.
- * The single data bit is used as a closure's NAMED flag,
- * or an instance's "special GC strategy" flag.
+ * may reside in immobile space: CLOSURE, FUNCALLABLE-INSTANCE.
+ * The single data bit is used as a closure's NAMED flag.
  *
  * Header:  gen# |  data |     size |    tag
  *         -----   -----    -------   ------

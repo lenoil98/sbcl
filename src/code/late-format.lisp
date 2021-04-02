@@ -15,18 +15,28 @@
 ;;; control string in a loop, not to avoid re-tokenizing all strings that
 ;;; happen to be STRING= to that string.
 ;;; (Might we want to bypass the cache when compile-time tokenizing?)
-(defun-cached (tokenize-control-string
-               :hash-bits 7
-               :hash-function #+sb-xc-host
-                              (lambda (x) (declare (ignore x)) 1)
-                              #-sb-xc-host #'pointer-hash)
-    ;; Due to string mutability, the comparator is STRING=
-    ;; even though the hash is address-based.
-    ((string string=))
-  (declare (simple-string string))
+#+sb-xc-host
+(defun tokenize-control-string (string)
   (combine-directives
    (%tokenize-control-string string 0 (length string) nil)
    t))
+#-sb-xc-host
+(defun-cached (tokenize-control-string
+               :memoizer memoize
+               :hash-bits 7
+               :hash-function #'pointer-hash)
+              ((string eq))
+  (declare (simple-string string))
+  (macrolet ((compute-it ()
+               `(combine-directives
+                 (%tokenize-control-string string 0 (length string) nil)
+                 t)))
+    (if (logtest (get-header-data string)
+                 ;; shareable = readonly
+                 (logior sb-vm:+vector-shareable+
+                         sb-vm:+vector-shareable-nonstd+))
+        (memoize (compute-it))
+        (compute-it))))
 
 ;;; If at some point I can figure out how to *CORRECTLY* utilize
 ;;; non-simple strings, then the INDEX and END will bound the parse.
@@ -1065,9 +1075,9 @@
 ;;;; format directives and support functions for justification
 
 (defconstant-eqx !illegal-inside-justification
-  (mapcar (lambda (x) (directive-bits (parse-directive x 0 nil)))
-          '("~:>" "~:@>"
-            "~:T" "~:@T"))
+  '#.(mapcar (lambda (x) (directive-bits (parse-directive x 0 nil)))
+             '("~:>" "~:@>"
+               "~:T" "~:@T"))
   #'equal)
 
 ;;; Reject ~W, ~_, ~I and certain other specific values of modifier+character.
@@ -1269,7 +1279,7 @@
          (block nil
            ,@(when newline-segment-p
                `((setf newline-segment
-                       (with-simple-output-to-string (stream)
+                       (%with-output-to-string (stream)
                          ,@(expand-directive-list (pop segments))))
                  ,(expand-bind-defaults
                       ((extra 0)
@@ -1277,7 +1287,7 @@
                       (directive-params first-semi)
                     `(setf extra-space ,extra line-len ,line-len))))
            ,@(mapcar (lambda (segment)
-                       `(push (with-simple-output-to-string (stream)
+                       `(push (%with-output-to-string (stream)
                                 ,@(expand-directive-list segment))
                               segments))
                      segments))
@@ -1382,12 +1392,13 @@
     (values (nreverse symbols)
             (possibly-base-stringize new-string))))
 
+(push '("SB-FORMAT" tokens) *!removable-symbols*)
 (sb-xc:defmacro tokens (string)
   (declare (string string))
   (multiple-value-bind (symbols new-string) (extract-user-fun-directives string)
     (if symbols
-        `(load-time-value (make-fmt-control ,new-string ',symbols) t)
-        (possibly-base-stringize string))))
+        (make-fmt-control-proxy new-string symbols)
+        (possibly-base-stringize new-string))))
 
 ;;; compile-time checking for argument mismatch.  This code is
 ;;; inspired by that of Gerd Moellmann, and comes decorated with
@@ -1425,7 +1436,7 @@
                    ((not (directive-colonp close))
                     (values 0 0 directives))
                    ((directive-atsignp justification)
-                    (values 0 sb-xc:call-arguments-limit directives))
+                    (values 0 call-arguments-limit directives))
                    ;; FIXME: here we could assert that the
                    ;; corresponding argument was a list.
                    (t (values 1 1 remaining))))))
@@ -1461,7 +1472,7 @@
                  ;; a format control (either a function or a string).
                  (if (directive-atsignp iteration)
                      (values (if (zerop posn) 1 0)
-                             sb-xc:call-arguments-limit
+                             call-arguments-limit
                              remaining)
                      ;; FIXME: the argument corresponding to this
                      ;; directive must be a list.
@@ -1472,7 +1483,7 @@
                (loop
                 (let ((directive (pop directives)))
                   (when (null directive)
-                    (return (values min (min max sb-xc:call-arguments-limit))))
+                    (return (values min (min max call-arguments-limit))))
                   (when (format-directive-p directive)
                     (incf-both (count :arg (directive-params directive)
                                       :key #'cdr))
@@ -1497,7 +1508,7 @@
                          (cond
                            ((directive-atsignp directive)
                             (incf min)
-                            (setq max sb-xc:call-arguments-limit))
+                            (setq max call-arguments-limit))
                            (t (incf-both 2))))
                         (t (throw 'give-up-format-string-walk nil))))))))))
         (catch 'give-up-format-string-walk

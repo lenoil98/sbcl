@@ -148,7 +148,8 @@
                   t)
                  ((eq (block-flag current-block) flag)
                   t)
-                 ((eq (block-flag current-block) cycle))
+                 ((eq (block-flag current-block) cycle)
+                  nil)
                  ;; Don't go back past START-BLOCK.
                  ((not (eq current-block start-block))
                   (setf (block-flag current-block) cycle)
@@ -413,25 +414,23 @@
                  ((eq (car before-stack) (car after-stack))
                   (binding* ((moved-count (mismatch before-stack after-stack)
                                           :exit-if-null)
-                             ((moved qmoved)
+                             (moved
                               (loop for moved-lvar in before-stack
                                     repeat moved-count
-                                    collect moved-lvar into moved
-                                    collect `',moved-lvar into qmoved
-                                    finally (return (values moved qmoved))))
-                             (q-last-moved (car (last qmoved)))
+                                    collect moved-lvar))
                              ((nil last-nipped rest)
                               (find-popped (nthcdr moved-count before-stack)
                                            (nthcdr moved-count after-stack))))
                     (cleanup-code
-                     `(%nip-values ',last-nipped ,q-last-moved
-                       ,@qmoved))
+                     `(%nip-values ,(opaquely-quote last-nipped)
+                                   ,(opaquely-quote (car (last moved)))
+                                   ,@(mapcar #'opaquely-quote moved)))
                     (discard (nconc moved rest) after-stack)))
                  (t
                   (multiple-value-bind (popped last-popped rest)
                       (find-popped before-stack after-stack)
                     (declare (ignore popped))
-                    (cleanup-code `(%pop-values ',last-popped))
+                    (cleanup-code `(%pop-values ,(opaquely-quote last-popped)))
                     (discard rest after-stack)))))
              (dummy-allocations (before-stack after-stack)
                (loop
@@ -439,7 +438,7 @@
                   for lvar in after-stack
                   unless (memq lvar before-stack)
                   do (cleanup-code
-                      `(%dummy-dx-alloc ',lvar ',previous-lvar)))))
+                      `(%dummy-dx-alloc ,(opaquely-quote lvar) ,(opaquely-quote previous-lvar))))))
       (let* ((end-stack (ir2-block-end-stack (block-info block1)))
              (start-stack (ir2-block-start-stack (block-info block2)))
              (pruned-start-stack (ordered-list-intersection

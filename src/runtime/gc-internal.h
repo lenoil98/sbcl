@@ -45,8 +45,6 @@ extern struct weak_pointer *weak_pointer_chain; /* in gc-common.c */
 // For those of us who are too memory-impaired to know how to use the value:
 //  - it is the amount to ADD to a tagged simple-fun pointer to get its entry address
 //  - or the amount to SUBTRACT from an entry address to get a tagged fun pointer
-// I almost might prefer two accessors named tagged_fun_to_fun_entry() and
-// and fun_entry_to_tagged_fun() instead of the manifest constant.
 #if defined(LISP_FEATURE_SPARC) || defined(LISP_FEATURE_ARM) || defined(LISP_FEATURE_RISCV)
 #define FUN_RAW_ADDR_OFFSET 0
 #else
@@ -61,21 +59,46 @@ extern struct weak_pointer *weak_pointer_chain; /* in gc-common.c */
 #define FUN_SELF_FIXNUM_TAGGED 0
 #endif
 
-// Return only the lisp-visible vector header flag bits bits,
-// masking out subtype_VectorWeakVisited.
-#define vector_subtype(header) (HeaderValue(header) & 7)
-// Test for presence of a bit in vector's header.
-// As a special case, if 'val' is 0, then test for all bits clear.
-#define is_vector_subtype(header, val) \
-  (subtype_##val ? (HeaderValue(header) & subtype_##val) : \
-   !(HeaderValue(header) & 7))
+/*
+ * Predicates rather than bit extractors should be used to test the flags
+ * in a vector header, because:
+ *
+ * - while trying to place the flags into a different header byte, I found it
+ *   unobvious whether to treat flags as part of the "Header data" (which is a
+ *   3-byte or 7-byte wide field starting at bit 8) versus the entire "Header word".
+ *   So e.g. if the Lisp VECTOR-WEAK value were redefined to #x0100, which would
+ *   place a 1 bit into byte index 3 (using SET-HEADER-DATA), it isn't clear that
+ *   "vector_flags(vector) == vectorWeak" is the proper test, because vector_flags()
+ *   could reasonably be defined to right-shift by 0, 8, or 16 bits.
+ *   (i.e. leave the bits where they are, but mask out the widetag; or make them
+ *   act like "Header data"; or right-align as if we had Lisp bitfield extractors)
+ *   Looked at differently, the natural values for the first 3 flag bits should be
+ *   1, 2, and 4 but this would force you to write expressions such as:
+ *    (SET-HEADER-DATA V (ASH SB-VM:VECTOR-HASHING-FLAG SB-VM:VECTOR-FLAG-BITS-SHIFT))
+ *   which looks to be terribly inconvenient for Lisp.
+ *   Alternatively, the constants can be defined as their "natural" values for C
+ *   which would have flag_VectorWeak = 0x010000, but then you need the inverse
+ *   shift in Lisp which expects SET-HEADER-DATA to get #x0100 as the argument.
+ *   Hypothetically, that is.
+ *
+ * - With smarter macros it ought to be possible to avoid 8-byte loads and shifts.
+ *   They would need to be endian-aware, which I didn't want to do just yet.
+ */
+#define vector_flagp(header, val) ((int)header & (flag_##val << N_WIDETAG_BITS))
+#define vector_flags_zerop(header) ((int)(header) & 0x0700) == 0
+// True if flags are zero, also testing the widetag at the same time.
+#define ordinary_simple_vector_p(header) ((int)(header) & 0x07ff) == SIMPLE_VECTOR_WIDETAG
+// Return true if vector is a weak vector that is not a hash-table <k,v> vector.
+#define vector_is_weak_not_hashing_p(header) \
+  ((int)(header) & ((flag_VectorWeak|flag_VectorHashing) << N_WIDETAG_BITS)) == \
+    (flag_VectorWeak << N_WIDETAG_BITS)
 
 // Mask out the fullcgc mark bit when asserting header validity
 #define UNSET_WEAK_VECTOR_VISITED(v) \
   gc_assert((v->header & 0xffff) == \
-    (((subtype_VectorWeakVisited|subtype_VectorWeak) << N_WIDETAG_BITS) \
+    (((flag_VectorWeakVisited|flag_VectorWeak) << N_WIDETAG_BITS) \
      | SIMPLE_VECTOR_WIDETAG)); \
-  v->header ^= subtype_VectorWeakVisited << N_WIDETAG_BITS
+  v->header ^= flag_VectorWeakVisited << N_WIDETAG_BITS
 
 /* values for the *_alloc_* parameters, also see the commentary for
  * struct page in gencgc-internal.h. These constants are used in gc-common,
@@ -85,12 +108,23 @@ extern struct weak_pointer *weak_pointer_chain; /* in gc-common.c */
 /* Note: MAP-ALLOCATED-OBJECTS expects this value to be 1 */
 #define BOXED_PAGE_FLAG       1
 #define UNBOXED_PAGE_FLAG     2
+/* CONS_PAGE_FLAG doesn't get stored in the page table, though I am considering
+ * doing that. If conses went on segregated pages, then testing for a valid
+ * conservative root on a cons page is as simple as seeing whether the address
+ * is correctly aligned and lowtagged.
+ * Also, we could reserve bytes at the end of each page to act as a mark bitmap
+ * which is useful since conses are headerless objects, and one GC strategy
+ * demands mark bitmaps which are currently placed in a side table.
+ * That would unfortunately complicate the task of allocating a huge list,
+ * because hitting the line of demarcation between conses and the mark bits would
+ * require chaining the final cons to another page of conses and so on. */
+#define CONS_PAGE_FLAG        4
 #define OPEN_REGION_PAGE_FLAG 8
 #define CODE_PAGE_TYPE        (BOXED_PAGE_FLAG|UNBOXED_PAGE_FLAG)
 
 extern sword_t (*sizetab[256])(lispobj *where);
 #define OBJECT_SIZE(header,where) \
-  (is_cons_half(header)?2:sizetab[header_widetag(header)](where))
+  (is_header(header)?sizetab[header_widetag(header)](where):CONS_SIZE)
 
 lispobj *gc_search_space3(void *pointer, lispobj *start, void *limit);
 static inline lispobj *gc_search_space(lispobj *start, void *pointer) {
@@ -124,69 +158,8 @@ instance_scan(void (*proc)(lispobj*, sword_t, uword_t),
               lispobj bitmap, uword_t arg);
 
 extern int simple_fun_index(struct code*, struct simple_fun*);
-extern lispobj simple_fun_name(struct simple_fun*);
-
-#ifdef LISP_FEATURE_COMPACT_INSTANCE_HEADER
-static inline lispobj funinstance_layout(lispobj* funinstance_ptr) { // native ptr
-    return instance_layout(funinstance_ptr);
-}
-static inline lispobj function_layout(lispobj* fun_ptr) { // native ptr
-    return instance_layout(fun_ptr);
-}
-static inline void set_function_layout(lispobj* fun_ptr, lispobj layout) {
-    instance_layout(fun_ptr) = layout;
-}
-#else
-static inline lispobj funinstance_layout(lispobj* instance_ptr) { // native ptr
-    // first 4 words are: header, trampoline, fin-fun, layout
-    return instance_ptr[3];
-}
-// No layout in simple-fun or closure, because there are no free bits
-static inline lispobj
-function_layout(lispobj __attribute__((unused)) *fun_ptr) { // native ptr
-    return 0;
-}
-static inline void set_function_layout(lispobj __attribute__((unused)) *fun_ptr,
-                                       lispobj __attribute__((unused)) layout) {
-    lose("Can't assign layout");
-}
-#endif
-
-#include "genesis/bignum.h"
-extern boolean positive_bignum_logbitp(int,struct bignum*);
-
-#ifdef LISP_FEATURE_IMMOBILE_CODE
-
-/* The callee_lispobj of an fdefn is the value in the 'raw_addr' slot to which
- * control transfer occurs, but cast as a simple-fun or code component.
- * It can momentarily disagree with the 'fun' slot when assigning a new value.
- * Pointer tracing should almost always examine both slots, as scav_fdefn() does.
- * If the raw_addr value points to read-only space, the callee is just raw_addr
- * itself, which either looks like a simple-fun or a fixnum depending on platform.
- * It is not critical that this exceptional situation be consistent by having
- * a pointer lowtag because it only affects print_otherptr() and verify_space()
- * neither of which materially impact garbage collection. */
 
 extern lispobj fdefn_callee_lispobj(struct fdefn *fdefn);
-extern lispobj virtual_fdefn_callee_lispobj(struct fdefn *fdefn,uword_t);
-
-#else
-
-static inline lispobj points_to_asm_routine_p(uword_t ptr) {
-# if defined(LISP_FEATURE_IMMOBILE_SPACE)
-    extern uword_t asm_routines_start, asm_routines_end;
-    // Lisp assembly routines are in varyobj space, not readonly space
-    return asm_routines_start <= ptr && ptr < asm_routines_end;
-# else
-    return READ_ONLY_SPACE_START <= ptr && ptr < READ_ONLY_SPACE_END;
-# endif
-}
-static inline lispobj fdefn_callee_lispobj(struct fdefn *fdefn) {
-    return (lispobj)fdefn->raw_addr -
-      (points_to_asm_routine_p((uword_t)fdefn->raw_addr) ? 0 : FUN_RAW_ADDR_OFFSET);
-}
-
-#endif
 
 boolean valid_widetag_p(unsigned char widetag);
 

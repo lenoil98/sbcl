@@ -16,36 +16,27 @@
 #include <string.h>
 #include "genesis/static-symbols.h"
 
-extern void get_current_sigmask(sigset_t *sigset);
+extern void sigset_tostring(const sigset_t *sigset, char* result, int result_length);
 
-/* Set all deferrable signals into *s. */
-extern void sigaddset_deferrable(sigset_t *s);
 /* Set all blockable signals into *s. */
 extern void sigaddset_blockable(sigset_t *s);
-/* Set all gc signals into *s. */
-extern void sigaddset_gc(sigset_t *s);
 
 extern sigset_t deferrable_sigset;
 extern sigset_t blockable_sigset;
 extern sigset_t gc_sigset;
 
 extern boolean deferrables_blocked_p(sigset_t *sigset);
-extern boolean blockables_blocked_p(sigset_t *sigset);
-extern boolean gc_signals_blocked_p(sigset_t *sigset);
 
 extern void check_deferrables_blocked_or_lose(sigset_t *sigset);
-extern void check_blockables_blocked_or_lose(sigset_t *sigset);
-extern void check_gc_signals_blocked_or_lose(sigset_t *sigset);
 
 extern void check_deferrables_unblocked_or_lose(sigset_t *sigset);
-extern void check_blockables_unblocked_or_lose(sigset_t *sigset);
 extern void check_gc_signals_unblocked_or_lose(sigset_t *sigset);
 
 extern void block_deferrable_signals(sigset_t *old);
 extern void block_blockable_signals(sigset_t *old);
 
-extern void unblock_deferrable_signals(sigset_t *where, sigset_t *old);
-extern void unblock_gc_signals(sigset_t *where, sigset_t *old);
+extern void unblock_deferrable_signals(sigset_t *where);
+extern void unblock_gc_signals(void);
 
 extern void maybe_save_gc_mask_and_block_deferrables(sigset_t *sigset);
 
@@ -74,12 +65,7 @@ extern void maybe_save_gc_mask_and_block_deferrables(sigset_t *sigset);
  *
  * -- NS 2007-01-29
  */
-union interrupt_handler {
-    lispobj lisp;
-    void (*c)(int, siginfo_t*, os_context_t*);
-};
-
-extern union interrupt_handler interrupt_handlers[NSIG];
+extern lispobj lisp_sig_handlers[NSIG];
 
 struct interrupt_data {
     /* signal information for pending signal.  pending_signal=0 when there
@@ -117,9 +103,6 @@ extern void interrupt_handle_now(int, siginfo_t*, os_context_t*);
 extern void interrupt_handle_pending(os_context_t*);
 extern void interrupt_internal_error(os_context_t*, boolean continuable);
 extern boolean handle_guard_page_triggered(os_context_t *,os_vm_address_t);
-extern boolean maybe_defer_handler(void *handler, struct interrupt_data *data,
-                                   int signal, siginfo_t *info,
-                                   os_context_t *context);
 
 #ifdef DO_PENDING_INTERRUPT
 #define do_pending_interrupt ((void(*)(void))SYMBOL(DO_PENDING_INTERRUPT)->value)
@@ -132,13 +115,7 @@ extern void do_pending_interrupt(void);
 extern void sig_stop_for_gc_handler(int, siginfo_t*, os_context_t*);
 #endif
 typedef void (*interrupt_handler_t)(int, siginfo_t *, os_context_t *);
-extern void undoably_install_low_level_interrupt_handler (
-                        int signal,
-                        interrupt_handler_t handler);
-extern uword_t install_handler(int signal,
-                               interrupt_handler_t handler,
-                               lispobj ohandler,
-                               int synchronous);
+extern void ll_install_handler(int signal, interrupt_handler_t handler);
 
 /* The void* casting here avoids having to mess with the various types
  * of function argument lists possible for signal handlers:
@@ -160,7 +137,7 @@ extern void lower_thread_control_stack_guard_page(struct thread *th);
 extern void reset_thread_control_stack_guard_page(struct thread *th);
 
 #if defined(LISP_FEATURE_SB_SAFEPOINT) && !defined(LISP_FEATURE_WIN32)
-# ifdef LISP_FEATURE_SB_THRUPTION
+# ifdef LISP_FEATURE_SB_SAFEPOINT
 void thruption_handler(int signal, siginfo_t *info, os_context_t *context);
 # endif
 #endif

@@ -19,7 +19,7 @@
 ;; this stuff is split out into its own file.  Also, it lets the
 ;; INTERPRETED-FUNCTION type be declared before it is used in
 ;; compiler/main and code/deftypes-for-target.
-(sb-kernel::!defstruct-with-alternate-metaclass
+(sb-kernel:!defstruct-with-alternate-metaclass
  interpreted-function
  ;; DEBUG-NAME and DEBUG-LAMBDA-LIST are initially a copies of the proper
  ;; ones, but is analogous to SIMPLE-FUN-NAME and ARGLIST in the sense that it
@@ -32,15 +32,6 @@
  :metaclass-name static-classoid
  :metaclass-constructor make-static-classoid
  :dd-type funcallable-structure)
-
-;; INTERPRETED-FUNCTION can not subclassed at runtime.
-;; For one, DEFSTRUCT-WITH-ALTERNATE-METACLASS does not exist in the target,
-;; and DEFSTRUCT would have to allow SB-KERNEL:FUNCALLABLE-STRUCTURE as
-;; the :TYPE option to avoid mismatch, which it does not; nor is there any
-;; way to allow it with DEFCLASS.  But, KLUDGE - loading the cross-compiler
-;; seals the class before the run of the cross-compiler gets to doing the declaim
-;; because 'target-misc' is cross-compiled before 'early-full-eval' is.
-(declaim (freeze-type interpreted-function))
 
 (defun make-interpreted-function
       (&key name lambda-list env declarations documentation body source-location

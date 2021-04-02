@@ -263,3 +263,142 @@
                      (warnings-in-subforms (progn 1) (progn 2))
                      (progn 3))))
                  '((1 2 0) (2 2 0) (1 1 2 0) (2 1 2 0)))))
+
+;;; Tests of EXPAND-SYMBOL-CASE.
+;;; The logic of converting the case to use symbol-hash is valid
+;;; even if the architecture would not do that.
+;;; Use a simple hash function so that the binning can be directly
+;;; controlled by the test.
+(defun wonky-hash (x) (char-code (char (string (the symbol x)) 0)))
+
+;;; Test bin merging with two different scenarios because it matters
+;;; whether a bin in which collisions occur is numerically lower than
+;;; or higher than a bin already emitted into the COND.
+(with-test (:name :symbol-case-complicated :skipped-on (not (or :x86 :x86-64)))
+  (let ((tests '((:foo a b c d) (:bar e f |a|)))
+        (fun
+         (checked-compile
+          `(lambda (x)
+             ,(sb-impl:expand-symbol-case
+               'x
+               '(((or (eql s 'a) (eql s 'b) (eql s 'c) (eql s 'd)) nil :foo)
+                 ((or (eql s 'e) (eql s 'f) (eql s '|a|)) nil :bar))
+               '(a b c d e f |a|)
+               nil
+               'wonky-hash 1)))))
+    (loop for (expect . inputs) in tests
+          do (dolist (input inputs)
+               (assert (eql (funcall fun input) expect)))))
+
+  (let ((tests '((:foo f e d c) (:bar b a |d|)))
+        (fun
+         (checked-compile
+          `(lambda (x)
+             ,(sb-impl:expand-symbol-case
+               'x
+               '(((or (eql s 'f) (eql s 'e) (eql s 'd) (eql s 'c)) nil :foo)
+                 ((or (eql s 'b) (eql s 'a) (eql s '|d|)) nil :bar))
+               '(a b c d e f |d|)
+               nil
+               'wonky-hash 1)))))
+    (loop for (expect . inputs) in tests
+          do (dolist (input inputs)
+               (assert (eql (funcall fun input) expect))))))
+
+(with-test (:name :symbol-case-clause-ordering)
+  (let ((f (checked-compile
+            '(lambda (x) (case x ((a z) 1) ((y b w) 2) ((b c) 3)))
+            :allow-style-warnings t)))
+    (assert (eql (funcall f 'b) 2))))
+
+(defun contains-if (predicate tree)
+  (let (seen)
+    (nsubst-if nil
+               (lambda (x)
+                 (when (funcall predicate x)
+                   (setq seen t))
+                 nil)
+               tree)
+    seen))
+
+(defun contains (item tree)
+  (contains-if (lambda (node) (eq node item)) tree))
+
+(defun uses-symbol-hash-p (tree)
+  (contains-if (lambda (x)
+                 (and (symbolp x)
+                      (or (string= x "SYMBOL-HASH")
+                          (string= x "SYMBOL-HASH*"))))
+               tree))
+
+(with-test (:name :symbol-case-conservatively-fail)
+  (assert (not (uses-symbol-hash-p
+                (handler-bind ((style-warning #'muffle-warning))
+                  (macroexpand-1 '(case x ((a b c) 1) ((e d f) 2) (a 3)))))))
+  (assert (uses-symbol-hash-p
+           (macroexpand-1 '(case x ((a b c) 1) ((e d f) 2))))))
+
+(with-test (:name :typecase-to-case)
+  (let ((expansion
+         (macroexpand-1 '(typecase x
+                          ((member a b c) 1)
+                          ((member d e f) 2)))))
+    (assert (uses-symbol-hash-p expansion))))
+
+(with-test (:name :symbol-case-default-form)
+  (let ((f (checked-compile
+            '(lambda (x)
+              (case x ((a b c) 1) ((d e f) 2) (t #*10101))))))
+    (assert (equal (funcall f 30) #*10101))))
+
+(with-test (:name :memq-as-case)
+  (let* ((f (checked-compile
+             '(lambda (x)
+               (if (sb-int:memq x '(a b c d e f g h i j k l m n o p)) 1 2))))
+         (code (sb-kernel:fun-code-header f))
+         (constant
+           (sb-kernel:code-header-ref
+            code
+            (+ sb-vm:code-constants-offset sb-vm:code-slots-per-simple-fun))))
+    ;; should have a vector of symbols, not references to each symbol
+    (assert (vectorp constant))
+    (assert (eql (funcall f 'j) 1))
+    (assert (eql (funcall f 42) 2)))
+
+  (let* ((f (checked-compile
+             '(lambda (x)
+               (or (member x '(a b c d e f g h i j k nil t l m n o p) :test 'eq)
+                   -1))))
+         (code (sb-kernel:fun-code-header f))
+         (constant1
+           (sb-kernel:code-header-ref
+            code
+            (+ sb-vm:code-constants-offset sb-vm:code-slots-per-simple-fun)))
+         (constant2
+           (sb-kernel:code-header-ref
+            code
+            (+ (1+ sb-vm:code-constants-offset) sb-vm:code-slots-per-simple-fun))))
+    ;; These accesses are safe because if the transform happened,
+    ;; there should be 2 constants, and if it didn't, then at least 2 constants.
+    (assert (and (vectorp constant1) (vectorp constant2)))
+    (assert (equal (funcall f 'o) '(o p)))
+    (assert (eql (funcall f 42) -1))))
+
+;;; There was a minor glitch in the typecase->case optimizer causing
+;;; duplicate layouts to appear, but the correct clause was picked
+;;; by good fortune. Assert that there are no duplicates now.
+#+#.(cl:if (cl:gethash 'sb-c:multiway-branch-if-eq sb-c::*backend-template-names*)
+         '(:and)
+         '(:or))
+(with-test (:name :sealed-struct-typecase-map)
+  (let (all-layouts)
+    (sb-int:dovector (bin (subseq (sb-impl::build-sealed-struct-typecase-map
+                                   '((sb-kernel:ansi-stream synonym-stream
+                                      sb-sys:fd-stream broadcast-stream
+                                      two-way-stream concatenated-stream echo-stream)
+                                     (broadcast-stream)))
+                                  1))
+      (dolist (cell bin)
+        (let ((layout (car cell)))
+          (assert (not (member layout all-layouts)))
+          (push layout all-layouts))))))

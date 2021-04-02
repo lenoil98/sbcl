@@ -25,6 +25,7 @@
             )
   (:temporary (:sc any-reg :offset rsi-offset) rsi)
   (:temporary (:sc any-reg :offset rdi-offset) rdi)
+  (:temporary (:sc descriptor-reg) temp-qword)
   (:ignore r-moved-ptrs)
   (:generator 1
     (move rdi last-nipped-ptr)
@@ -33,12 +34,13 @@
     (inst sub rdi n-word-bytes)
     (inst cmp rsp-tn rsi)
     (inst jmp :a DONE)
-    (inst std)
     LOOP
-    (inst movs :qword)
+    (inst mov temp-qword (ea rsi))
+    (inst mov (ea rdi) temp-qword)
+    (inst sub rsi n-word-bytes)
+    (inst sub rdi n-word-bytes)
     (inst cmp rsp-tn rsi)
-    (inst jmp :be LOOP)
-    (inst cld)
+    (inst jmp :be loop)
     DONE
     (inst lea rsp-tn (ea n-word-bytes rdi))
     (inst sub rdi rsi)
@@ -59,7 +61,8 @@
   (:results (start :from :load) (count))
   (:info nvals)
   (:generator 20
-    (move start rsp-tn)
+    (unless (eq (tn-kind start) :unused)
+      (move start rsp-tn))
     (do ((val vals (tn-ref-across val)))
         ((null val))
       (inst push (let ((value (encode-value-if-immediate (tn-ref-tn val))))
@@ -83,7 +86,9 @@
   (:save-p :compute-only)
   (:generator 0
     (move list arg)
-    (move start rsp-tn)                 ; WARN pointing 1 below
+
+    (unless (eq (tn-kind start) :unused)
+      (move start rsp-tn))               ; WARN pointing 1 below
 
     LOOP
     (inst cmp list nil-value)
@@ -142,8 +147,10 @@
     (if (location= loop-index num)
         (inst shl num (- word-shift n-fixnum-tag-bits))
         (inst lea loop-index (ea nil num (ash 1 (- word-shift n-fixnum-tag-bits)))))
-    (inst mov start rsp-tn)
-    (inst jrcxz DONE)  ; check for 0 count?
+    (unless (eq (tn-kind start) :unused)
+      (inst mov start rsp-tn))
+    (inst test rcx-tn rcx-tn)
+    (inst jmp :z DONE)  ; check for 0 count?
 
     (inst sub rsp-tn loop-index)
     (inst sub src loop-index)

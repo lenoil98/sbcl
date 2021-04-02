@@ -14,16 +14,12 @@
 
 ;;; various environment inquiries
 
-(defparameter *features*
-   ;; The :SB-XC keyword indicates the build phase and is not intended
-   ;; to persist into the target.
-   ;; GCC_TLS is not a Lisp feature- it's just freeloading off the means
-   ;; by which additional #defines get into "genesis/config.h".
-   ;; Literally nothing except C code tests for it.
-   '#.(remove-if (lambda (x) (member x '(:sb-xc :gcc-tls)))
-                 sb-xc:*features*)
+;;; This is a tentative list of target features; many are removed later.
+;;; :SB-XC is removed now, because it is plain wrong unless cross-compiling.
+(defparameter *features* '#.(remove :sb-xc sb-xc:*features*)
   "a list of symbols that describe features provided by the
    implementation")
+(defconstant !sbcl-architecture #.(sb-cold::target-platform-keyword))
 
 (defun machine-instance ()
   "Return a string giving the name of the local machine."
@@ -259,3 +255,24 @@ version 1[.0.0...] or greater."
   (declare (type (or null string) string))
   (push (list string name doc-type) sb-pcl::*!docstrings*)
   string)
+
+(in-package "SB-LOCKLESS")
+(defstruct (list-node
+            (:conc-name nil)
+            (:constructor %make-sentinel-node ())
+            (:copier nil))
+  (%node-next nil))
+
+;;; Specialized list variants will be created for
+;;;  fixnum, integer, real, string, generic "comparable"
+;;; but the node type and list type is the same regardless of key type.
+(defstruct (linked-list
+            (:constructor %make-lfl
+                          (head inserter deleter finder inequality equality))
+            (:conc-name list-))
+  (head       nil :type list-node :read-only t)
+  (inserter   nil :type function :read-only t)
+  (deleter    nil :type function :read-only t)
+  (finder     nil :type function :read-only t)
+  (inequality nil :type function :read-only t)
+  (equality   nil :type function :read-only t))

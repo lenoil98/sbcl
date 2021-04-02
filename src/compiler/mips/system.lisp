@@ -57,6 +57,28 @@
 
     DONE))
 
+(define-vop ()
+  (:translate sb-c::%structure-is-a)
+  (:args (x :scs (descriptor-reg)))
+  (:arg-types * (:constant t))
+  (:policy :fast-safe)
+  (:conditional)
+  ;; "extra" info in conditional vops follows the 2 super-magical info args
+  (:info target not-p test-layout)
+  (:temporary (:sc unsigned-reg) this-id test-id)
+  (:generator 4
+    (let ((label (register-inline-constant :layout-id test-layout))
+          (offset (+ (ash (+ (get-dsd-index layout sb-kernel::id-word0)
+                             instance-slots-offset)
+                          word-shift)
+                     (ash (- (layout-depthoid test-layout) 2) 2)
+                     (- instance-pointer-lowtag))))
+      (inst lw test-id sb-vm::code-tn label)
+      (inst lw this-id x offset)
+      (inst nop)
+      (inst* (if not-p 'bne 'beq) this-id test-id target)
+      (inst nop))))
+
 (define-vop (%other-pointer-widetag)
   (:translate %other-pointer-widetag)
   (:policy :fast-safe)
@@ -75,16 +97,6 @@
   (:generator 6
     (load-type result function (- fun-pointer-lowtag))
     (inst nop)))
-
-(define-vop (fun-header-data)
-  (:translate fun-header-data)
-  (:policy :fast-safe)
-  (:args (x :scs (descriptor-reg)))
-  (:results (res :scs (unsigned-reg)))
-  (:result-types positive-fixnum)
-  (:generator 6
-    (loadw res x 0 fun-pointer-lowtag)
-    (inst srl res res n-widetag-bits)))
 
 (define-vop (get-header-data)
   (:translate get-header-data)
@@ -126,12 +138,11 @@
   (:translate pointer-hash)
   (:args (ptr :scs (any-reg descriptor-reg)))
   (:results (res :scs (any-reg descriptor-reg)))
+  (:temporary (:scs (non-descriptor-reg)) temp)
   (:policy :fast-safe)
   (:generator 1
-    ;; FIXME: It would be better if this would mask the lowtag,
-    ;; and shift the result into a positive fixnum like on x86.
-    (inst sll res ptr 3)
-    (inst srl res res 1)))
+    (inst li temp (lognot fixnum-tag-mask))
+    (inst and res ptr temp)))
 
 
 ;;;; Allocation
@@ -251,3 +262,10 @@
   (:translate spin-loop-hint)
   (:policy :fast-safe)
   (:generator 0))
+
+(define-vop (sb-c::mark-covered)
+ (:info index)
+ (:generator 4
+   ;; Can't convert index to a code-relative index until the boxed header length
+   ;; has been determined.
+   (inst store-coverage-mark index)))

@@ -17,114 +17,10 @@
 
 ;;;; float predicates and environment query
 
-#-sb-fluid
-(declaim (maybe-inline float-denormalized-p float-infinity-p float-nan-p
-                       float-trapping-nan-p))
-
-(defun float-denormalized-p (x)
-  "Return true if the float X is denormalized."
-  (number-dispatch ((x float))
-    ((single-float)
-     (and (zerop (ldb sb-vm:single-float-exponent-byte (single-float-bits x)))
-          (not (zerop x))))
-    ((double-float)
-     (and (zerop (ldb sb-vm:double-float-exponent-byte
-                      (double-float-high-bits x)))
-          (not (zerop x))))
-    #+(and long-float x86)
-    ((long-float)
-     (and (zerop (ldb sb-vm:long-float-exponent-byte (long-float-exp-bits x)))
-          (not (zerop x))))))
-
-(defmacro define-float-inf-or-nan-test
-    (name doc single double #+(and long-float x86) long)
-  `(defun ,name (x) ,doc
-     (number-dispatch ((x float))
-       ((single-float)
-        (let ((bits (single-float-bits x)))
-          (and (> (ldb sb-vm:single-float-exponent-byte bits)
-                  sb-vm:single-float-normal-exponent-max)
-               ,single)))
-       ((double-float)
-        #+64-bit
-        ;; With 64-bit words, all the FOO-float-byte constants need to be reworked
-        ;; to refer to a byte position in the whole word. I think we can reasonably
-        ;; get away with writing the well-known values here.
-        (let ((bits (double-float-bits x)))
-          (and (> (ldb (byte 11 52) bits) sb-vm:double-float-normal-exponent-max)
-               ,double))
-        #-64-bit
-        (let ((hi (double-float-high-bits x))
-              (lo (double-float-low-bits x)))
-          (declare (ignorable lo))
-          (and (> (ldb sb-vm:double-float-exponent-byte hi)
-                  sb-vm:double-float-normal-exponent-max)
-               ,double)))
-       #+(and long-float x86)
-       ((long-float)
-        (let ((exp (long-float-exp-bits x))
-              (hi (long-float-high-bits x))
-              (lo (long-float-low-bits x)))
-          (declare (ignorable lo))
-          (and (> (ldb sb-vm:long-float-exponent-byte exp)
-                  sb-vm:long-float-normal-exponent-max)
-               ,long))))))
-
-;; Infinities and NANs have the maximum exponent
-(define-float-inf-or-nan-test float-infinity-or-nan-p nil
-    t t #+(and long-float x86) t)
-
-;; Infinity has 0 for the significand
-(define-float-inf-or-nan-test float-infinity-p
-  "Return true if the float X is an infinity (+ or -)."
-  (zerop (ldb sb-vm:single-float-significand-byte bits))
-
-  #+64-bit (zerop (ldb (byte 52 0) bits))
-  #-64-bit (zerop (logior (ldb sb-vm:double-float-significand-byte hi) lo))
-
-  #+(and long-float x86)
-  (and (zerop (ldb sb-vm:long-float-significand-byte hi))
-       (zerop lo)))
-
-;; NaNs have nonzero for the significand
-(define-float-inf-or-nan-test float-nan-p
-  "Return true if the float X is a NaN (Not a Number)."
-  (not (zerop (ldb sb-vm:single-float-significand-byte bits)))
-
-  #+64-bit (not (zerop (ldb (byte 52 0) bits)))
-  #-64-bit (not (zerop (logior (ldb sb-vm:double-float-significand-byte hi) lo)))
-
-  #+(and long-float x86)
-  (or (not (zerop (ldb sb-vm:long-float-significand-byte hi)))
-      (not (zerop lo))))
-
-(define-float-inf-or-nan-test float-trapping-nan-p
-  "Return true if the float X is a trapping NaN (Not a Number)."
-  ;; HPPA (and apparently MIPS) have trapping NaNs (SNaNs) with the
-  ;; trapping-nan-bit SET.  PPC, SPARC, Alpha, and x86 (and presumably
-  ;; x86-64, ARM, and ARM64) have trapping NaNs (SNaNs) with the
-  ;; trapping-nan-bit CLEAR.  Note that the given implementation
-  ;; considers infinities to be FLOAT-TRAPPING-NAN-P on most
-  ;; architectures.
-
-  ;; SINGLE-FLOAT
-  #+(or mips hppa) (logbitp 22 bits)
-  #-(or mips hppa) (not (logbitp 22 bits))
-
-  ;; DOUBLE-FLOAT
-  #+(or mips hppa) (logbitp 19 hi)
-  #+(and (not (or mips hppa)) 64-bit) (not (logbitp 51 bits))
-  #+(and (not (or mips hppa)) (not 64-bit)) (not (logbitp 19 hi))
-
-  ;; LONG-FLOAT (this code is dead anyway)
-  #+(and long-float x86)
-  (zerop (logand (ldb sb-vm:long-float-significand-byte hi)
-                 (ash 1 30))))
-
 ;;; If denormalized, use a subfunction from INTEGER-DECODE-FLOAT to find the
 ;;; actual exponent (and hence how denormalized it is), otherwise we just
 ;;; return the number of digits or 0.
-#-sb-fluid (declaim (maybe-inline float-precision))
+(declaim (maybe-inline float-precision))
 (defun float-precision (f)
   "Return a non-negative number of significant digits in its float argument.
   Will be less than FLOAT-DIGITS if denormalized or zero."
@@ -189,7 +85,7 @@
     #+long-float
     (long-float sb-vm:long-float-digits)))
 
-#-sb-fluid (declaim (inline float-digits float-radix))
+(declaim (inline float-digits float-radix))
 
 (defun float-digits (f)
   (declare (explicit-check))
@@ -209,7 +105,6 @@
 (defconstant-eqx float-decoding-error "Can't decode NaN or infinity: ~S."
   #'string=)
 
-#-sb-fluid
 (declaim (maybe-inline integer-decode-single-float
                        integer-decode-double-float))
 
@@ -395,7 +290,7 @@
     ((long-float)
      (integer-decode-long-float x))))
 
-#-sb-fluid (declaim (maybe-inline decode-single-float decode-double-float))
+(declaim (maybe-inline decode-single-float decode-double-float))
 
 ;;; Handle the denormalized case of DECODE-SINGLE-FLOAT. We call
 ;;; INTEGER-DECODE-SINGLE-DENORM and then make the result into a float.
@@ -517,7 +412,7 @@
 
 ;;;; SCALE-FLOAT
 
-#-sb-fluid (declaim (maybe-inline scale-single-float scale-double-float))
+(declaim (maybe-inline scale-single-float scale-double-float))
 
 ;;; Handle float scaling where the X is denormalized or the result is
 ;;; denormalized or underflows to 0.
@@ -816,8 +711,8 @@
     ((integer) number)
     ((ratio) (values (truncate (numerator number) (denominator number))))
     (((foreach single-float double-float #+long-float long-float))
-     (if (and (<= (float sb-xc:most-negative-fixnum number) number)
-              (< number (float sb-xc:most-positive-fixnum number)))
+     (if (and (<= (float most-negative-fixnum number) number)
+              (< number (float most-positive-fixnum number)))
          (truly-the fixnum (%unary-truncate number))
          (multiple-value-bind (bits exp) (integer-decode-float number)
            (let ((res (ash bits exp)))
@@ -828,8 +723,8 @@
 ;;; Specialized versions for floats.
 (macrolet ((def (type name)
              `(defun ,name (number)
-                (if (and (<= ,(coerce sb-xc:most-negative-fixnum type) number)
-                         (< number ,(coerce sb-xc:most-positive-fixnum type)))
+                (if (and (<= ,(coerce most-negative-fixnum type) number)
+                         (< number ,(coerce most-positive-fixnum type)))
                     (truly-the fixnum (,name number))
                     ;; General -- slow -- case.
                     (multiple-value-bind (bits exp) (integer-decode-float number)
@@ -853,9 +748,9 @@
     ((integer) number)
     ((ratio) (values (round (numerator number) (denominator number))))
     (((foreach single-float double-float #+long-float long-float))
-     (if (< (float sb-xc:most-negative-fixnum number)
+     (if (< (float most-negative-fixnum number)
             number
-            (float sb-xc:most-positive-fixnum number))
+            (float most-positive-fixnum number))
          (truly-the fixnum (%unary-round number))
          (multiple-value-bind (bits exp) (integer-decode-float number)
            (let* ((shifted (ash bits exp))
@@ -871,12 +766,21 @@
                  (- rounded)
                  rounded)))))))
 
+#-round-float
 (defun %unary-ftruncate (number)
   (number-dispatch ((number real))
     ((integer) (float number))
     ((ratio) (float (truncate (numerator number) (denominator number))))
     (((foreach single-float double-float #+long-float long-float))
      (%unary-ftruncate number))))
+
+(declaim (inline first-bit-set))
+(defun first-bit-set (x)
+  #+x86-64
+  (truly-the (values (mod #.sb-vm:n-word-bits) &optional)
+             (%primitive sb-vm::unsigned-word-find-first-bit (the word x)))
+  #-x86-64
+  (1- (integer-length (logand x (- x)))))
 
 (defun rational (x)
   "RATIONAL produces a rational number for any real numeric argument. This is
@@ -890,9 +794,84 @@
            0
            (let ((int (if (minusp x) (- bits) bits)))
              (if (minusp exp)
-                 (integer-/-integer int (ash 1 (- exp)))
+                 ;; Instead of division (which also involves GCD)
+                 ;; find the first set bit of the numerator and shift accordingly,
+                 ;; as the denominator is a power of two.
+                 (let* ((pexp (- exp))
+                        (set (first-bit-set bits))
+                        (shifted (ash int (- set))))
+                   (if (> pexp set)
+                       (%make-ratio shifted
+                                    (let ((shift (- pexp set)))
+                                      (if (< shift sb-vm:n-fixnum-bits)
+                                          (ash 1 shift)
+                                          (bignum-ashift-left-fixnum 1 shift))))
+                       (ash int exp)))
                  (ash int exp))))))
     ((rational) x)))
+
+#+64-bit
+(defun float-bignum-= (float bignum)
+  (declare (optimize speed))
+  (number-dispatch ((float))
+    (((foreach single-float double-float))
+     (multiple-value-bind (bits exp) (integer-decode-float float)
+       (if (or (eql bits 0)
+               (minusp exp))
+           nil
+           (let ((int (if (minusp float) (- bits) bits)))
+             (and (= (truly-the bignum-length (bignum-integer-length bignum))
+                     (+ (integer-length bits) exp))
+                  (sb-bignum::bignum-lower-bits-zero-p bignum exp)
+                  (= int
+                     (truly-the fixnum
+                                (sb-bignum::last-bignum-part=>fixnum exp bignum))))))))))
+
+#+64-bit
+(defun float-bignum-< (float bignum)
+  (declare (optimize speed))
+  (number-dispatch ((float))
+    (((foreach single-float double-float))
+     (multiple-value-bind (bits exp) (integer-decode-float float)
+       (if (or (eql bits 0)
+               (minusp exp))
+           (bignum-plus-p bignum)
+           (let ((int (if (minusp float) (- bits) bits))
+                 (length-diff (- (truly-the bignum-length (bignum-integer-length bignum))
+                                 (+ (integer-length bits) exp))))
+             (cond
+               ((plusp length-diff) (bignum-plus-p bignum))
+               ((minusp length-diff) (minusp float))
+               (t
+                (let ((diff (- (truly-the fixnum
+                                          (sb-bignum::last-bignum-part=>fixnum exp bignum))
+                               int)))
+                  (cond ((plusp diff) t)
+                        ((minusp diff) nil)
+                        (t
+                         (not (sb-bignum::bignum-lower-bits-zero-p bignum exp)))))))))))))
+
+#+64-bit
+(defun float-bignum-> (float bignum)
+  (declare (optimize speed))
+  (number-dispatch ((float))
+    (((foreach single-float double-float))
+     (multiple-value-bind (bits exp) (integer-decode-float float)
+       (if (or (eql bits 0)
+               (minusp exp))
+           (not (bignum-plus-p bignum))
+           (let ((int (if (minusp float) (- bits) bits))
+                 (length-diff (- (truly-the bignum-length (bignum-integer-length bignum))
+                                 (+ (integer-length bits) exp))))
+             (cond
+               ((plusp length-diff) (not (bignum-plus-p bignum)))
+               ((minusp length-diff) (not (minusp float)))
+               (t
+                (let ((diff (- (truly-the fixnum
+                                          (sb-bignum::last-bignum-part=>fixnum exp bignum))
+                               int)))
+                  (cond ((plusp diff) nil)
+                        ((minusp diff) t)))))))))))
 
 ;;; This algorithm for RATIONALIZE, due to Bruno Haible, is included
 ;;; with permission.

@@ -11,6 +11,19 @@
 
 (in-package "SB-IMPL")
 
+(defmacro sb-xc:declaim (&rest declaration-specifiers)
+  #+(or sb-devel sb-fluid)
+  (setq declaration-specifiers
+        (remove-if (lambda (declaration-specifier)
+                     (member (first declaration-specifier)
+                             '(#+sb-fluid inline
+                               #+sb-fluid maybe-inline
+                               #+sb-fluid sb-ext:freeze-type
+                               #+sb-devel start-block
+                               #+sb-devel end-block)))
+                   declaration-specifiers))
+  `(cl:declaim ,@declaration-specifiers))
+
 ;;; The STRUCTURE!OBJECT abstract class is the base of the hierarchy
 ;;; of objects that need to be identifiable as SBCL system objects
 ;;; in the host Lisp. This type does not exist in the target.
@@ -18,13 +31,9 @@
 
 (declaim (declaration truly-dynamic-extent))
 
-;;; MAYBE-INLINE and FREEZE-TYPE declarations can be safely ignored
+;;; MAYBE-INLINE, FREEZE-TYPE, and block compilation declarations can be safely ignored
 ;;; (possibly at some cost in efficiency).
-(declaim (declaration freeze-type maybe-inline))
-
-;;; INHIBIT-WARNINGS declarations can be safely ignored (although we
-;;; may then have to wade through some irrelevant warnings).
-(declaim (declaration inhibit-warnings))
+(declaim (declaration freeze-type maybe-inline start-block end-block))
 
 ;;; SB-C::LAMBDA-LIST declarations can be ignored.
 ;;; Cross-compilation does not rely on introspection for anything.
@@ -106,21 +115,6 @@
 ;;; ZEROP is needer sooner than the rest of the cross-float. (Not sure why exactly)
 (declaim (inline zerop))
 (defun zerop (x) (if (rationalp x) (= x 0) (xfloat-zerop x)))
-;;; Same thing with FLOOR
-(macrolet ((define (name float-fun)
-             `(progn
-                (declaim (inline ,name))
-                (defun ,name (number &optional (divisor 1))
-                  (if (and (rationalp number) (rationalp divisor))
-                      (,(intern (string name) "CL") number divisor)
-                      (,float-fun number divisor)))
-                (defun ,float-fun (number divisor)
-                  (declare (ignore number divisor))
-                  (error "Unimplemented")))))
-  (define floor xfloat-floor)
-  (define ceiling xfloat-ceiling)
-  (define truncate xfloat-truncate)
-  (define round xfloat-round))
 
 (defmethod make-load-form ((self target-num) &optional env)
   (declare (ignore env))

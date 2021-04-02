@@ -21,7 +21,7 @@
 #include "genesis/primitive-objects.h"
 #include "genesis/hash-table.h"
 #include "genesis/package.h"
-#include "pseudo-atomic.h" // for get_alloc_pointer()
+#include "getallocptr.h" // for get_alloc_pointer()
 
 lispobj *
 search_read_only_space(void *pointer)
@@ -36,11 +36,24 @@ search_read_only_space(void *pointer)
 lispobj *
 search_static_space(void *pointer)
 {
-    lispobj *start = (lispobj *)STATIC_SPACE_START;
+    lispobj *start = (lispobj *)STATIC_SPACE_OBJECTS_START;
     lispobj *end = static_space_free_pointer;
     if ((pointer < (void *)start) || (pointer >= (void *)end))
         return NULL;
     return gc_search_space(start, pointer);
+}
+
+lispobj *search_all_gc_spaces(void *pointer)
+{
+    lispobj *start;
+    if (((start = search_dynamic_space(pointer)) != NULL) ||
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
+        ((start = search_immobile_space(pointer)) != NULL) ||
+#endif
+        ((start = search_static_space(pointer)) != NULL) ||
+        ((start = search_read_only_space(pointer)) != NULL))
+        return start;
+    return NULL;
 }
 
 static int __attribute__((unused)) strcmp_ucs4_ascii(uint32_t* a, unsigned char* b,
@@ -67,6 +80,15 @@ static int __attribute__((unused)) strcmp_ucs4_ascii(uint32_t* a, unsigned char*
     return a[i] - b[i]; // same return convention as strcmp()
 }
 
+struct symbol_search {
+    char *name;
+    boolean ignore_case;
+};
+static uword_t search_symbol_aux(lispobj* start, lispobj* end, uword_t arg)
+{
+    struct symbol_search* ss = (struct symbol_search*)arg;
+    return (uword_t)search_for_symbol(ss->name, (lispobj)start, (lispobj)end, ss->ignore_case);
+}
 lispobj* search_for_symbol(char *name, lispobj start, lispobj end, boolean ignore_case)
 {
     lispobj* where = (lispobj*)start;
@@ -74,6 +96,16 @@ lispobj* search_for_symbol(char *name, lispobj start, lispobj end, boolean ignor
     struct symbol *symbol;
     lispobj namelen = make_fixnum(strlen(name));
 
+#ifdef LISP_FEATURE_GENCGC
+    // This function was never safe to use on pages that were dirtied with unboxed words.
+    // It has become even less safe now that don't prezero most pages during GC,
+    // because we will certainly encounter remnants of forwarding pointers etc.
+    // So if the specified range is all of dynamic space, defer to the space walker.
+    if (start == DYNAMIC_SPACE_START && end == (uword_t)get_alloc_pointer()) {
+        struct symbol_search ss = {name, ignore_case};
+        return (lispobj*)walk_generation(search_symbol_aux, -1, (uword_t)&ss);
+    }
+#endif
     while (where < limit) {
         lispobj word = *where;
         if (header_widetag(word) == SYMBOL_WIDETAG &&

@@ -32,7 +32,6 @@
 ;;; this end, we convert source forms to strings so that source forms
 ;;; that contain IR1 references (e.g. %DEFUN) don't hold onto the IR.
 (defstruct (compiler-error-context
-            #-no-ansi-print-object
             (:print-object (lambda (x stream)
                              (print-unreadable-object (x stream :type t))))
             (:copier nil))
@@ -54,8 +53,9 @@
   initialized
   ;; the original source part of the source path
   (original-source-path nil :type list)
-  ;; the lexenv active at the time
-  (lexenv nil :type (or null lexenv)))
+  ;; lexenv-handled-conditions of the lexenv active at the time
+  (handled-conditions nil))
+(declaim (freeze-type compiler-error-context))
 
 ;;; Delay computing some source information, since it may not actually be ever used
 (defun compiler-error-context-original-source (context)
@@ -80,11 +80,16 @@
           (args (compiler-error-context-format-args context)))
       (collect ((full nil cons)
                 (short nil cons))
-        (let ((forms (source-path-forms path))
-              (n 0))
-          (dolist (src (if (member (first forms) args)
-                           (rest forms)
-                           forms))
+        (let* ((forms (source-path-forms path))
+               (n 0)
+               (forms (if (member (first forms) args)
+                          (rest forms)
+                          forms))
+               (transforms (memq 'transformed forms))
+               (forms (if transforms
+                          (cdr transforms)
+                          forms)))
+          (dolist (src forms)
             (if (>= n *enclosing-source-cutoff*)
                 (short (stringify-form (if (consp src)
                                            (car src)
@@ -265,12 +270,15 @@
                       (nth-value 1 (find-source-root tlf *source-info*))
                       :path path
                       :original-source-path (source-path-original-source path)
-                      :lexenv (cond ((node-p context)
-                                     (node-lexenv context))
-                                    ((lvar-annotation-p context)
-                                     (lvar-annotation-lexenv context))
-                                    ((boundp '*lexenv*)
-                                     *lexenv*)))
+                      :handled-conditions
+                      (let ((lexenv (cond ((node-p context)
+                                           (node-lexenv context))
+                                          ((lvar-annotation-p context)
+                                           (lvar-annotation-lexenv context))
+                                          ((boundp '*lexenv*)
+                                           *lexenv*))))
+                        (and lexenv
+                             (lexenv-handled-conditions lexenv))))
                      nil)))))))))
 
 ;;;; printing error messages
@@ -575,10 +583,10 @@ has written, having proved that it is unreachable."))
 ;;; the compiler, hence the BOUNDP check.
 (defun note-undefined-reference (name kind)
   #+sb-xc-host
-  ;; Whitelist functions are looked up prior to UNCROSS,
+  ;; Allowlist functions are looked up prior to UNCROSS,
   ;; so that we can distinguish CL:SOMEFUN from SB-XC:SOMEFUN.
   (when (and (eq kind :function)
-             (gethash name sb-cold:*undefined-fun-whitelist*))
+             (gethash name sb-cold:*undefined-fun-allowlist*))
     (return-from note-undefined-reference (values)))
   (setq name (uncross name))
   (unless (and
@@ -637,7 +645,7 @@ has written, having proved that it is unreachable."))
 ;; The current approach is reliable, at a cost of ~3 words per function.
 ;;
 (defun warn-if-compiler-macro-dependency-problem (name)
-  (unless (sb-xc:compiler-macro-function name)
+  (unless (compiler-macro-function name)
     (let ((status (car (info :function :emitted-full-calls name)))) ; TODO use emitted-full-call-count?
       (when (and (integerp status) (oddp status))
         ;; Show the total number of calls, because otherwise the warning

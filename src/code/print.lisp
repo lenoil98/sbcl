@@ -54,7 +54,7 @@ Does not affect the cases that are already controlled by *PRINT-LENGTH*")
    style conditional newlines are turned on, and all indentations are
    turned off. If NIL, never use miser mode.")
 (defvar *print-pprint-dispatch*
-  (sb-pretty::make-pprint-dispatch-table) ; for type-correctness
+  (sb-pretty::make-pprint-dispatch-table nil nil nil) ; for type-correctness
   "The pprint-dispatch-table that controls how to pretty-print objects.")
 (defparameter *suppress-print-errors* nil
   "Suppress printer errors when the condition is of the type designated by this
@@ -193,7 +193,7 @@ variable: an unreadable object representing the error is printed instead.")
      (multiple-value-bind (fun pretty)
          (and *print-pretty* (pprint-dispatch object))
        (if pretty
-           (with-simple-output-to-string (stream)
+           (%with-output-to-string (stream)
               (sb-pretty::with-pretty-stream (stream)
                 (funcall fun stream object)))
            (let ((buffer-size (approx-chars-in-repr object)))
@@ -206,7 +206,7 @@ variable: an unreadable object representing the error is printed instead.")
                                (finite-base-string-output-stream-pointer stream)))))))
     ;; Could do something for other numeric types, symbols, ...
     (t
-     (with-simple-output-to-string (stream)
+     (%with-output-to-string (stream)
        (output-object object stream)))))
 
 ;;; Estimate the number of chars in the printed representation of OBJECT.
@@ -218,7 +218,7 @@ variable: an unreadable object representing the error is printed instead.")
   ;; This is exact for bases which are exactly a power-of-2, or an overestimate
   ;; otherwise, as mandated by the finite output stream.
   (let ((bits-per-char
-         (aref #.(sb-xc:coerce
+         (aref #.(coerce
                   ;; base 2 or base 3  = 1 bit per character
                   ;; base 4 .. base 7  = 2 bits per character
                   ;; base 8 .. base 15 = 3 bits per character, etc
@@ -271,8 +271,7 @@ variable: an unreadable object representing the error is printed instead.")
                    (write-char #\space stream))
                  ;; Nor here.
                  (write-char #\{ stream)
-                 (write (get-lisp-obj-address object) :stream stream
-                                                      :radix nil :base 16)
+                 (%output-integer-in-base (get-lisp-obj-address object) 16 stream)
                  (write-char #\} stream))))
         (cond ((print-pretty-on-stream-p stream)
                ;; Since we're printing prettily on STREAM, format the
@@ -343,7 +342,7 @@ variable: an unreadable object representing the error is printed instead.")
                (if (eq initiate :initiate)
                    (let ((*circularity-hash-table*
                           (make-hash-table :test 'eq)))
-                     (check-it (make-broadcast-stream))
+                     (check-it *null-broadcast-stream*)
                      (let ((*circularity-counter* 0))
                        (check-it stream)))
                    ;; otherwise
@@ -371,18 +370,25 @@ variable: an unreadable object representing the error is printed instead.")
 ;;; just not for OBJECT itself.
 (defun output-ugly-object (stream object)
   (when (%instancep object)
-    (let* ((layout (layout-of object))
-           (classoid (layout-classoid layout)))
-      ;; If an instance has no layout, it has no PRINT-OBJECT method.
-      ;; Additionally, if the object is an obsolete CONDITION, don't crash.
-      ;; (There is no update-instance protocol for conditions)
-      (when (or (sb-kernel::undefined-classoid-p classoid)
-                (and (layout-invalid layout)
-                     (logtest (layout-%bits layout) +condition-layout-flag+)))
-        ;; not only is this unreadable, it's unprintable too.
+    (let ((layout (%instance-layout object)))
+      ;; If an instance has no layout, do something sensible. Can't compare layout
+      ;; to 0 using EQ or EQL because that would be tautologically NIL as per fndb.
+      ;; This is better than declaring EQ or %INSTANCE-LAYOUT notinline.
+      (unless (logtest (get-lisp-obj-address layout) sb-vm:widetag-mask)
         (return-from output-ugly-object
           (print-unreadable-object (object stream :identity t)
-            (format stream "UNPRINTABLE instance of ~W" classoid))))))
+            (prin1 'instance stream))))
+      (let ((classoid (layout-classoid layout)))
+        ;; Additionally, don't crash if the object is an obsolete thing with
+        ;; no update protocol.
+        (when (or (sb-kernel::undefined-classoid-p classoid)
+                  (and (layout-invalid layout)
+                       (logtest (layout-flags layout)
+                                (logior +structure-layout-flag+
+                                        +condition-layout-flag+))))
+          (return-from output-ugly-object
+            (print-unreadable-object (object stream :identity t)
+              (format stream "UNPRINTABLE instance of ~W" classoid)))))))
   (print-object object stream))
 
 ;;;; symbols
@@ -484,16 +490,19 @@ variable: an unreadable object representing the error is printed instead.")
 
 ;;; For each character, the value of the corresponding element is the
 ;;; lowest base in which that character is a digit.
-(defconstant +digit-bases+
+(defconstant-eqx +digit-bases+
   #.(let ((a (sb-xc:make-array 128 ; FIXME
+                               :retain-specialization-for-after-xc-core t
                                :element-type '(unsigned-byte 8)
                                :initial-element 36)))
       (dotimes (i 36 a)
         (let ((char (digit-char i 36)))
-          (setf (aref a (sb-xc:char-code char)) i)))))
+          (setf (aref a (sb-xc:char-code char)) i))))
+  #'equalp)
 
-(defconstant +character-attributes+
+(defconstant-eqx +character-attributes+
   #.(let ((a (sb-xc:make-array 160 ; FIXME
+                               :retain-specialization-for-after-xc-core t
                                :element-type '(unsigned-byte 16)
                                :initial-element 0)))
       (flet ((set-bit (char bit)
@@ -525,7 +534,8 @@ variable: an unreadable object representing the error is printed instead.")
         (dotimes (i 160) ; FIXME
           (when (zerop (aref a i))
             (setf (aref a i) funny-attribute))))
-      a))
+      a)
+  #'equalp)
 
 ;;; A FSM-like thingie that determines whether a symbol is a potential
 ;;; number or has evil characters in it.
@@ -831,7 +841,8 @@ variable: an unreadable object representing the error is printed instead.")
                     (write-char #\" stream))
                    (t
                     (write-string vector stream))))
-            ((not (or *print-array* readably))
+            ((or (null (array-element-type vector))
+                 (not (or *print-array* readably)))
              (output-terse-array vector stream))
             ((bit-vector-p vector)
              (cond ((cut-length))
@@ -882,7 +893,7 @@ variable: an unreadable object representing the error is printed instead.")
 ;;; Output the printed representation of any array in either the #< or #A
 ;;; form.
 (defmethod print-object ((array array) stream)
-  (if (or *print-array* *print-readably*)
+  (if (and (or *print-array* *print-readably*) (array-element-type array))
       (output-array-guts array stream)
       (output-terse-array array stream)))
 
@@ -890,7 +901,10 @@ variable: an unreadable object representing the error is printed instead.")
 (defun output-terse-array (array stream)
   (let ((*print-level* nil)
         (*print-length* nil))
-    (print-unreadable-object (array stream :type t :identity t))))
+    (if (and (not (array-element-type array)) *print-readably* *read-eval*)
+        (format stream "#.(~S '~D :ELEMENT-TYPE ~S)"
+                'make-array (array-dimensions array) nil)
+        (print-unreadable-object (array stream :type t :identity t)))))
 
 ;;; Convert an array into a list that can be used with MAKE-ARRAY's
 ;;; :INITIAL-CONTENTS keyword argument.
@@ -972,23 +986,8 @@ variable: an unreadable object representing the error is printed instead.")
                 (2 #\b)
                 (8 #\o)
                 (16 #\x)
-                (t (%output-reasonable-integer-in-base base 10 stream)
-                   #\r))
+                (t (%output-integer-in-base base 10 stream) #\r))
               stream))
-
-(defun %output-reasonable-integer-in-base (n base stream)
-  (multiple-value-bind (q r)
-      (truncate n base)
-    ;; Recurse until you have all the digits pushed on
-    ;; the stack.
-    (unless (zerop q)
-      (%output-reasonable-integer-in-base q base stream))
-    ;; Then as each recursive call unwinds, turn the
-    ;; digit (in remainder) into a character and output
-    ;; the character.
-    (write-char
-     (schar "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ" r)
-     stream)))
 
 ;;; *POWER-CACHE* is an alist mapping bases to power-vectors. It is
 ;;; filled and probed by POWERS-FOR-BASE. SCRUB-POWER-CACHE is called
@@ -1071,17 +1070,111 @@ variable: an unreadable object representing the error is printed instead.")
                         (bisect r k (or exactp (plusp q))))))))
       (bisect n k-start nil))))
 
+;;; Not all architectures can stack-allocate lisp strings,
+;;; but we can fake it using aliens.
+;;; %output-integer-in-base always needs 8 lispwords:
+;;;  if n-word-bytes = 4 then 8 * 4 = 32 characters
+;;;  if n-word-bytes = 8 then 8 * 8 = 64 characters
+;;; This allows for output in base 2 worst case.
+;;; We don't need a trailing null.
+(defmacro with-lisp-string-on-alien-stack ((string size-in-chars) &body body)
+  (let ((size-in-lispwords ; +2 words for lisp string header
+          (+ 2 (align-up (ceiling (symbol-value size-in-chars) sb-vm:n-word-bytes)
+                         2)))
+        (alien '#:a)
+        (sap '#:sap))
+    ;; +1 is for alignment if needed
+    `(with-alien ((,alien (array unsigned ,(1+ size-in-lispwords))))
+       (let ((,sap (alien-sap ,alien)))
+         (when (logtest (sap-int ,sap) sb-vm:lowtag-mask)
+           (setq ,sap (sap+ ,sap sb-vm:n-word-bytes)))
+         (setf (sap-ref-word ,sap 0) sb-vm:simple-base-string-widetag
+               (sap-ref-word ,sap sb-vm:n-word-bytes) (ash sb-vm:n-word-bits
+                                                           sb-vm:n-fixnum-tag-bits))
+         (let ((,string
+                (truly-the simple-base-string
+                           (%make-lisp-obj (logior (sap-int ,sap)
+                                                   sb-vm:other-pointer-lowtag)))))
+           ,@body)))))
+
+;;; Using specialized routines for the various cases seems to work nicely.
+;;;
+;;; Testing with 100,000 random integers, output to a sink stream, x86-64:
+;;; word-sized integers, base >= 10
+;;;   old=.062 sec, 4MiB consed; new=.031 sec, 0 bytes consed
+;;; word-sized integers, base < 10
+;;;   old=.104 sec, 4MiB consed; new=.075 sec, 0 bytes consed
+;;; bignums in base 16:
+;;;   old=.125 sec, 20 MiB consed; new=.08 sec, 0 bytes consed
+;;;
+;;; Not sure why this didn't reduce consing on ppc64 when I tried it.
 (defun %output-integer-in-base (integer base stream)
+  (declare (type (integer 2 36) base))
   (when (minusp integer)
     (write-char #\- stream)
     (setf integer (- integer)))
-  ;; The ideal cutoff point between these two algorithms is almost
-  ;; certainly quite platform dependent: this gives 87 for 32 bit
-  ;; SBCL, which is about right at least for x86/Darwin.
-  (if (or (fixnump integer)
-          (< (integer-length integer) (* 3 sb-vm:n-positive-fixnum-bits)))
-      (%output-reasonable-integer-in-base integer base stream)
-      (%output-huge-integer-in-base integer base stream)))
+  ;; Grrr - a LET binding here causes a constant-folding problem
+  ;;   "The function SB-KERNEL:SIMPLE-CHARACTER-STRING-P is undefined."
+  ;; but a symbol-macrolet is ok. This is a FIXME except I don't care.
+  (symbol-macrolet ((chars "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
+    (declare (optimize (sb-c::insert-array-bounds-checks 0) speed))
+    (macrolet ((iterative-algorithm ()
+                 `(loop (multiple-value-bind (q r)
+                            (truncate (truly-the word integer) base)
+                          (decf ptr)
+                          (setf (aref buffer ptr) (schar chars r))
+                          (when (zerop (setq integer q)) (return)))))
+               (recursive-algorithm (dividend-type)
+                 `(named-let recurse ((n integer))
+                    (multiple-value-bind (q r) (truncate (truly-the ,dividend-type n) base)
+                      ;; Recurse until you have all the digits pushed on
+                      ;; the stack.
+                      (unless (zerop q) (recurse q))
+                      ;; Then as each recursive call unwinds, turn the
+                      ;; digit (in remainder) into a character and output
+                      ;; the character.
+                      (write-char (schar chars r) stream)))))
+      (cond ((typep integer 'word) ; Division vops can handle this all inline.
+             #+(and gencgc c-stack-is-control-stack) ; strings can be DX
+             ;; For bases exceeding 10 we know how many characters (at most)
+             ;; will be output. This allows for a single %WRITE-STRING call.
+             ;; There's diminishing payback for other bases because the fixed array
+             ;; size increases, and we don't have a way to elide initial 0-fill.
+             ;; Calling APPROX-CHARS-IN-REPL doesn't help much - we still 0-fill.
+             (if (< base 10)
+                 (recursive-algorithm word)
+                 (let* ((ptr #.(length (write-to-string sb-ext:most-positive-word
+                                                        :base 10)))
+                        (buffer (make-array ptr :element-type 'base-char)))
+                   (declare (truly-dynamic-extent buffer))
+                   (iterative-algorithm)
+                   (%write-string buffer stream ptr (length buffer))))
+             #-(and gencgc c-stack-is-control-stack) ; strings can not be DX
+             ;; Use the alien stack, which is not as fast as using the control stack
+             ;; (when we can). Even the absence of 0-fill doesn't make up for it.
+             ;; Since we've no choice in the matter, might as well allow
+             ;; any value of BASE - it's just a few more words of storage.
+             (let ((ptr sb-vm:n-word-bits))
+               (with-lisp-string-on-alien-stack (buffer sb-vm:n-word-bits)
+                 (iterative-algorithm)
+                 (%write-string buffer stream ptr sb-vm:n-word-bits))))
+            ((eql base 16)
+             ;; No division is involved at all.
+             ;; could also specialize for bases 32, 8, 4, and 2 if desired
+             (loop for pos from (* 4 (1- (ceiling (integer-length integer) 4)))
+                   downto 0 by 4
+                   do (write-char (schar chars (sb-bignum::ldb-bignum=>fixnum 4 pos
+                                                                              integer))
+                                  stream)))
+            ;; The ideal cutoff point between this and the "huge" algorithm
+            ;; might be platform-specific, and it also could depend on the output base.
+            ;; Nobody has cared to tweak it in so many years that I think we can
+            ;; arbitrarily say 3 bigdigits is fine.
+            ((<= (sb-bignum:%bignum-length (truly-the bignum integer)) 3)
+             (recursive-algorithm integer))
+            (t
+             (%output-huge-integer-in-base integer base stream)))))
+  nil)
 
 ;;; This gets both a method and a specifically named function
 ;;; since the latter is called from a few places.
@@ -1715,9 +1808,9 @@ variable: an unreadable object representing the error is printed instead.")
     ;; ":TYPE T" is no good, since CLOSURE doesn't have full-fledged status.
     (print-unreadable-object (object stream :identity (not proper-name-p))
       (format stream "~A~@[ ~S~]"
-              ;; TYPE-OF is so that GFs print as #<STANDARD-GENERIC-FUNCTION>
-              ;; and not #<FUNCTION> before SRC;PCL;PRINT-OBJECT is loaded.
-              (if (closurep object) 'closure (type-of object))
+              ;; CLOSURE and SIMPLE-FUN should print as #<FUNCTION>
+              ;; but anything else prints as its exact type.
+              (if (funcallable-instance-p object) (type-of object) 'function)
               name))))
 
 ;;;; catch-all for unknown things

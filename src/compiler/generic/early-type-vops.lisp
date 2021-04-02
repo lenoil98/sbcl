@@ -24,7 +24,7 @@
   (collect ((results))
     (let ((start nil)
           (prev nil)
-          (delta (- other-immediate-1-lowtag other-immediate-0-lowtag)))
+          (delta widetag-spacing))
       (flet ((emit-test ()
                (results (if (= start prev)
                             start
@@ -60,7 +60,7 @@
                (end-1 (end range-1))
                (begin-2 (begin range-2))
                (end-2 (end range-2))
-               (delta (- other-immediate-1-lowtag other-immediate-0-lowtag)))
+               (delta widetag-spacing))
           (when (and (= (+ end-1 (* 2 delta)) begin-2)
                      ;; Don't return {X} - {Y} if {X} spans only 3 widetags,
                      ;; because clearly we can just test the 2 members of X.
@@ -81,8 +81,14 @@
                                 (member lowtag type-codes))
                               '#.(mapcar #'symbol-value fixnum-lowtags))
                        t))
-         (lowtags (remove lowtag-limit type-codes :test #'<))
-         (extended (remove lowtag-limit type-codes :test #'>))
+         ;; On 64-bit, UNBOUND-MARKER-WIDETAG may be smaller than LOWTAG-LIMIT
+         ;; but it is not a lowtag.
+         (lowtags (remove unbound-marker-widetag
+                          (remove lowtag-limit type-codes :test #'<)))
+         (extended (remove-if (lambda (x)
+                                (and (< x lowtag-limit)
+                                     (/= x unbound-marker-widetag)))
+                              type-codes))
          (immediates (intersection extended +immediate-types+ :test #'eql))
          ;; To collapse the range of widetags comprising real numbers on 64-bit
          ;; machines, consider SHORT-FLOAT-WIDETAG both a header and immediate.

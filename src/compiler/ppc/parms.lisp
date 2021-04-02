@@ -126,12 +126,14 @@
 ;;; While on gencgc we don't.
 #+gencgc
 (!gencgc-space-setup #x04000000
+                     :read-only-space-size 0
                      :dynamic-space-start
                      #+linux   #x4f000000
                      #+netbsd  #x4f000000
                      #+openbsd #x4f000000
                      #+darwin  #x10000000)
 
+(defconstant linkage-table-growth-direction :up)
 (defconstant linkage-table-entry-size 16)
 
 #+linux

@@ -19,7 +19,7 @@
     #+(or x86 x86-64)
     `(progn ,@body)
     #-(or x86 x86-64)
-    `(with-pinned-objects ((without-gcing
+    `(with-pinned-objects ((with-code-pages-pinned (:dynamic)
                              (sb-di::code-object-from-context ,context)))
        ,@body))
 
@@ -130,3 +130,8 @@
                            (* kludge-big-endian-short-pointer-offset
                               n-word-bytes))
           new)))
+
+;;; Convert the descriptor into a SAP. The bits all stay the same, we just
+;;; change our notion of what we think they are.
+(declaim (inline descriptor-sap))
+(defun descriptor-sap (x) (int-sap (get-lisp-obj-address x)))

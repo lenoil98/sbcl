@@ -24,10 +24,6 @@
 #include "breakpoint.h"
 #include "monitor.h"
 
-#ifdef LISP_FEATURE_LINUX
-extern int linux_sparc_siginfo_bug;
-#endif
-
 os_vm_address_t arch_get_bad_addr(int sig, siginfo_t *code, os_context_t *context)
 {
 #if 1 /* New way. */
@@ -243,29 +239,28 @@ arch_handle_after_breakpoint(os_context_t *context)
 void
 arch_handle_single_step_trap(os_context_t *context, int trap)
 {
-    unsigned int code = *((u32 *)(*os_context_pc_addr(context)));
+    unsigned int code = *((uint32_t *)(*os_context_pc_addr(context)));
     int register_offset = code >> 8 & 0x1f;
     handle_single_step_trap(context, trap, register_offset);
     arch_skip_instruction(context);
 }
 
 #ifdef LISP_FEATURE_GENCGC
-void
-arch_handle_allocation_trap(os_context_t *context)
+static void handle_allocation_trap(os_context_t *context, unsigned int *pc)
 {
-    unsigned int* pc;
     unsigned int or_inst;
     int rs1;
     int size;
     int immed;
-    int context_index;
-    boolean were_in_lisp;
-    char* memory;
+    extern void boxed_region_rollback(sword_t);
 
     if (foreign_function_call_active)
       lose("Allocation trap inside foreign code.");
 
-    pc = (unsigned int*) *os_context_pc_addr(context);
+    struct thread* thread = get_sb_vm_thread();
+    if (gencgc_alloc_profiler && thread->state_word.sprof_enable)
+        record_backtrace_from_context(context, thread);
+
     or_inst = pc[-1];
 
     /*
@@ -273,36 +268,39 @@ arch_handle_allocation_trap(os_context_t *context)
      * instruction!
      */
     if (!(((or_inst >> 30) == 2) && (((or_inst >> 19) & 0x1f) == 2)))
-        lose("Allocation trap not preceded by an OR instruction: 0x%08x",
-             or_inst);
+        lose("Allocation trap @ %p not preceded by an OR instruction: 0x%08x",
+             pc, or_inst);
 
     /*
      * An OR instruction.  RS1 is the register we want to allocate to.
      * RS2 (or an immediate) is the size.
      */
+    int rd = (or_inst >> 25) & 0x1f; // just a 1 bit flag essentially
     rs1 = (or_inst >> 14) & 0x1f;
     immed = (or_inst >> 13) & 1;
 
     if (immed == 1)
         size = or_inst & 0x1fff;
-    else {
-        size = or_inst & 0x1f;
-        size = *os_context_register_addr(context, size);
-    }
+    else
+        size = *os_context_register_addr(context, or_inst & 0x1f);
+    boxed_region_rollback(size);
 
     fake_foreign_function_call(context);
 
     /*
      * Allocate some memory, store the memory address in rs1.
      */
+    lispobj* memory;
     {
-        struct interrupt_data *data =
-            arch_os_get_current_thread()->interrupt_data;
+        struct interrupt_data *data = &thread_interrupt_data(thread);
         data->allocation_trap_context = context;
-        memory = alloc(size);
+        extern lispobj *alloc(sword_t), *alloc_list(sword_t);
+        memory = (rd & 1) ? alloc_list(size) : alloc(size);
         data->allocation_trap_context = 0;
     }
-    *os_context_register_addr(context, rs1) = memory;
+
+    *os_context_register_addr(context, rs1) = (lispobj)memory;
+    arch_skip_instruction(context);
 
     undo_fake_foreign_function_call(context);
 }
@@ -311,24 +309,20 @@ arch_handle_allocation_trap(os_context_t *context)
 static void sigill_handler(int signal, siginfo_t *siginfo,
                            os_context_t *context)
 {
-    if ((siginfo->si_code) == ILL_ILLOPC
-#ifdef LISP_FEATURE_LINUX
-        || (linux_sparc_siginfo_bug && (siginfo->si_code == 2))
-#endif
-        ) {
+    if ((siginfo->si_code) == ILL_ILLOPC) {
         int trap;
         unsigned int inst;
         unsigned int* pc = (unsigned int*) siginfo->si_addr;
 
+        if (!gc_managed_heap_space_p((lispobj)pc))
+          lose("Illegal instruction not in lisp: %p [%x]\n", pc, *pc);
+
         inst = *pc;
         trap = inst & 0xff;
-        handle_trap(context,trap);
+        if (trap == trap_Allocation) handle_allocation_trap(context, pc);
+        else handle_trap(context,trap);
     }
-    else if ((siginfo->si_code) == ILL_ILLTRP
-#ifdef LISP_FEATURE_LINUX
-             || (linux_sparc_siginfo_bug && (siginfo->si_code) == 192)
-#endif
-             ) {
+    else if ((siginfo->si_code) == ILL_ILLTRP) {
         if (pseudo_atomic_trap_p(context)) {
             /* A trap instruction from a pseudo-atomic.  We just need
                to fixup up alloc-tn to remove the interrupted flag,
@@ -349,11 +343,10 @@ static void sigill_handler(int signal, siginfo_t *siginfo,
 
 void arch_install_interrupt_handlers()
 {
-    undoably_install_low_level_interrupt_handler(SIGILL, sigill_handler);
+    ll_install_handler(SIGILL, sigill_handler);
 }
 
 
-#ifdef LISP_FEATURE_LINKAGE_TABLE
 
 /* This a naive port from CMUCL/sparc, which was mostly stolen from the
  * CMUCL/x86 version, with adjustments for sparc
@@ -383,8 +376,9 @@ void arch_install_interrupt_handlers()
  * Insert the necessary jump instructions at the given address.
  */
 void
-arch_write_linkage_table_entry(char *reloc_addr, void *target_addr, int datap)
+arch_write_linkage_table_entry(int index, void *target_addr, int datap)
 {
+  char *reloc_addr = (char*)LINKAGE_TABLE_SPACE_START + index * LINKAGE_TABLE_ENTRY_SIZE;
   if (datap) {
     *(unsigned long *)reloc_addr = (unsigned long)target_addr;
     return;
@@ -439,4 +433,3 @@ arch_write_linkage_table_entry(char *reloc_addr, void *target_addr, int datap)
 
   os_flush_icache((os_vm_address_t) reloc_addr, (char*) inst_ptr - reloc_addr);
 }
-#endif

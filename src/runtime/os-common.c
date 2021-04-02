@@ -32,13 +32,21 @@
 # include <dlfcn.h>
 #endif
 
+/*
+ * historically, this used sysconf to select the runtime page size
+ * per recent changes on other arches and discussion on sbcl-devel,
+ * however, this is not necessary -- the VM page size need not match
+ * the OS page size (and the default backend page size has been
+ * ramped up accordingly for efficiency reasons).
+*/
+os_vm_size_t os_vm_page_size = BACKEND_PAGE_BYTES;
+
 /* Expose to Lisp the value of the preprocessor define. Don't touch! */
 int install_sig_memory_fault_handler = INSTALL_SIG_MEMORY_FAULT_HANDLER;
 
 /* Except for os_zero, these routines are only called by Lisp code.
  * These routines may also be replaced by os-dependent versions
- * instead. See hpux-os.c for some useful restrictions on actual
- * usage. */
+ * instead. */
 
 #ifdef LISP_FEATURE_CHENEYGC
 void
@@ -66,18 +74,57 @@ os_zero(os_vm_address_t addr, os_vm_size_t length)
          * zero-filled. */
 
         os_invalidate(block_start, block_size);
-        addr = os_validate(NOT_MOVABLE, block_start, block_size);
+        addr = os_validate(NOT_MOVABLE, block_start, block_size, 0, 0);
 
         if (addr == NULL || addr != block_start)
-            lose("os_zero: block moved! %p ==> %p\n", block_start, addr);
+            lose("os_zero: block moved! %p ==> %p", block_start, addr);
     }
 }
 #endif
 
+#ifdef LISP_FEATURE_USE_SYS_MMAP
+///
+///                **********************************
+///                *  GC MUST NOT ACQUIRE ANY LOCKS *
+///                **********************************
+///
+/// It's normally fine to use the mmap() system call to obtain memory for the
+/// hopscotch tables, unless your C runtime intercepts mmap() and causes it
+/// to sometimes (or always?) need a spinlock. That lock may be owned already,
+/// so GC will patiently wait forever; meanwhile the lock owner is also
+/// waiting forever on GC to finish.
+/// So bypass the C library routine and call the OS directly
+/// in case of a non-signal-safe interceptor such as
+///   https://chromium.googlesource.com/chromium/src/third_party/tcmalloc/chromium/+/refs/heads/master/src/malloc_hook_mmap_linux.h#146
+///
+static inline void* sys_mmap(void* addr, size_t length, int prot, int flags,
+                             int fd, off_t offset) {
+    // "linux-os.h" brings in <syscall.h>, others may need something different.
+    // mmap2 allows large file access with 32-bit off_t. We don't care about that,
+    // but _usually_ only one or the other of the syscalls exists depending on,
+    // various factors. Basing it on word size will pick the right one.
+#ifdef LISP_FEATURE_64_BIT
+    return (void*)syscall(SYS_mmap, addr, length, prot, flags, fd, offset);
+#else
+    return (void*)syscall(SYS_mmap2, addr, length, prot, flags, fd, offset);
+#endif
+}
+static inline int sys_munmap(void* addr, size_t length) {
+    return syscall(__NR_munmap, addr, length);
+}
+os_vm_address_t os_allocate(os_vm_size_t len) {
+    void* answer = sys_mmap(0, len, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, 0, 0);
+    if (answer == MAP_FAILED) return 0;
+    return answer;
+}
+void os_deallocate(os_vm_address_t addr, os_vm_size_t len) {
+    sys_munmap(addr, len);
+}
+#else
 os_vm_address_t
 os_allocate(os_vm_size_t len)
 {
-    return os_validate(MOVABLE, (os_vm_address_t)NULL, len);
+    return os_validate(MOVABLE, (os_vm_address_t)NULL, len, 0, 0);
 }
 
 void
@@ -85,6 +132,7 @@ os_deallocate(os_vm_address_t addr, os_vm_size_t len)
 {
     os_invalidate(addr,len);
 }
+#endif
 
 int
 os_get_errno(void)
@@ -92,9 +140,7 @@ os_get_errno(void)
     return errno;
 }
 
-
-#if defined(LISP_FEATURE_SB_THREAD) && (!defined(CANNOT_USE_POSIX_SEM_T) || defined(LISP_FEATURE_WIN32))
-
+#if defined LISP_FEATURE_SB_THREAD && defined LISP_FEATURE_UNIX && !defined USE_DARWIN_GCD_SEMAPHORES
 void
 os_sem_init(os_sem_t *sem, unsigned int value)
 {
@@ -130,10 +176,9 @@ os_sem_destroy(os_sem_t *sem)
 
 #endif
 
-/* When :SB-DYNAMIC-CORE is enabled, the special category of /static/ foreign
- * symbols disappears. Foreign fixups are resolved to linkage table locations
- * during genesis, and for each of them a record is added to
- * REQUIRED_FOREIGN_SYMBOLS vector, of the form "name" for a function reference,
+/* Genesis-time foreign fixups are resolved to linkage table locations
+ * and for each of them a record is added to the REQUIRED_FOREIGN_SYMBOLS
+ * vector, of the form "name" for a function reference,
  * or ("name") for a data reference. "name" is a base-string.
  *
  * Before any code in lisp image can be called, we have to resolve all
@@ -141,7 +186,7 @@ os_sem_destroy(os_sem_t *sem)
  * table entry for each element of REQUIRED_FOREIGN_SYMBOLS.
  */
 
-#if defined(LISP_FEATURE_SB_DYNAMIC_CORE) && !defined(LISP_FEATURE_WIN32)
+#ifndef LISP_FEATURE_WIN32
 void *
 os_dlsym_default(char *name)
 {
@@ -153,9 +198,7 @@ os_dlsym_default(char *name)
 int lisp_linkage_table_n_prelinked;
 void os_link_runtime()
 {
-#ifdef LISP_FEATURE_SB_DYNAMIC_CORE
-    char *link_target = (char*)(intptr_t)LINKAGE_TABLE_SPACE_START;
-    void *validated_end = link_target;
+    int entry_index = 0;
     lispobj symbol_name;
     char *namechars;
     boolean datap;
@@ -175,21 +218,18 @@ void os_link_runtime()
         namechars = (void*)(intptr_t)(VECTOR(symbol_name)->data);
         result = os_dlsym_default(namechars);
 
-        if (link_target == validated_end) {
-            validated_end = (char*)validated_end + os_vm_page_size;
-#ifdef LISP_FEATURE_WIN32
-            os_validate_recommit(link_target,os_vm_page_size);
-#endif
-        }
         if (result) {
-            arch_write_linkage_table_entry(link_target, result, datap);
+            arch_write_linkage_table_entry(entry_index, result, datap);
         } else { // startup might or might not work. ymmv
-            printf("Missing required foreign symbol '%s'\n", namechars);
+            fprintf(stderr, "Missing required foreign symbol '%s'\n", namechars);
         }
 
-        link_target += LINKAGE_TABLE_ENTRY_SIZE;
+        ++entry_index;
     }
-#endif /* LISP_FEATURE_SB_DYNAMIC_CORE */
+}
+
+void os_unlink_runtime()
+{
 }
 
 boolean
@@ -207,6 +247,9 @@ gc_managed_heap_space_p(lispobj addr)
         || (DYNAMIC_1_SPACE_START <= addr &&
             addr < DYNAMIC_1_SPACE_START + dynamic_space_size)
 #endif
+#ifdef LISP_FEATURE_DARWIN_JIT
+        || (STATIC_CODE_SPACE_START <= addr && addr < STATIC_CODE_SPACE_END)
+#endif
         )
         return 1;
     return 0;
@@ -214,19 +257,64 @@ gc_managed_heap_space_p(lispobj addr)
 
 #ifndef LISP_FEATURE_WIN32
 
-/* Remap a part of an already existing mapping to a file */
-void os_map(int fd, int offset, os_vm_address_t addr, os_vm_size_t len)
+/* Remap a part of an already existing memory mapping from a file,
+ * and/or create a new mapping as need be */
+void* load_core_bytes(int fd, os_vm_offset_t offset, os_vm_address_t addr, os_vm_size_t len,
+                      int __attribute__((unused)) execute)
 {
+    int fail = 0;
     os_vm_address_t actual;
-
-    actual = mmap(addr, len, OS_VM_PROT_ALL, MAP_PRIVATE | MAP_FIXED,
+    actual = mmap(addr, len,
+                  // If mapping to a random address, then the assumption is
+                  // that we're not going to execute the core; nor should we write to it.
+                  // However, the addr=0 case is for 'editcore' which unfortunately _does_
+                  // write the memory. I'd prefer that it not,
+                  // but that's not the concern here.
+#ifdef LISP_FEATURE_DARWIN_JIT
+                  OS_VM_PROT_READ | (execute ?  OS_VM_PROT_EXECUTE : OS_VM_PROT_WRITE),
+#else
+                  addr ? OS_VM_PROT_ALL : OS_VM_PROT_READ | OS_VM_PROT_WRITE,
+#endif
+                  // Do not pass MAP_FIXED with addr of 0, because most OSes disallow that.
+                  MAP_PRIVATE | (addr ? MAP_FIXED : 0),
                   fd, (off_t) offset);
-    if (actual == MAP_FAILED || (addr && (addr != actual))) {
+    if (actual == MAP_FAILED) {
         perror("mmap");
-        lose("unexpected mmap(%"OBJ_FMTX", %"OBJ_FMTX") failure\n",
-             (lispobj)addr, (lispobj)len);
+        fail = 1;
+    } else if (addr && (addr != actual)) {
+        fail = 1;
     }
+    if (fail)
+        lose("load_core_bytes(%d,%zx,%p,%zx) failed", fd, offset, addr, len);
+    return (void*)actual;
 }
+
+#ifdef LISP_FEATURE_DARWIN_JIT
+void* load_core_bytes_jit(int fd, os_vm_offset_t offset, os_vm_address_t addr, os_vm_size_t len)
+{
+    ssize_t count;
+
+    lseek(fd, offset, SEEK_SET);
+
+    char* buf = malloc(65536);
+
+    while (len) {
+        count = read(fd, buf, len);
+
+        if (count <= -1) {
+            perror("read");
+        }
+
+        memcpy(addr, buf, count);
+        addr += count;
+        len -= count;
+    }
+    free(buf);
+    return (void*)0;
+}
+#endif
+
+#endif
 
 boolean
 gc_managed_addr_p(lispobj addr)
@@ -245,5 +333,3 @@ gc_managed_addr_p(lispobj addr)
     }
     return 0;
 }
-
-#endif

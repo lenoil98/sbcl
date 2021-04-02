@@ -26,8 +26,6 @@
 #include "interrupt.h"
 #include "interr.h"
 #include "lispregs.h"
-#include <sys/socket.h>
-#include <sys/utsname.h>
 
 #include <sys/types.h>
 #include <signal.h>
@@ -39,13 +37,7 @@
 #include "validate.h"
 #include "ppc-linux-mcontext.h"
 
-size_t os_vm_page_size;
-
 int arch_os_thread_init(struct thread *thread) {
-#if defined(LISP_FEATURE_SB_THREAD)
-    pthread_setspecific(specials,thread);
-#endif
-
     /* For some reason, PPC Linux appears to default to not generating
      * floating point exceptions.  PR_SET_FPEXC is a PPC-specific
      * option new in kernel 2.4.21 and 2.5.32 that allows us to
@@ -178,3 +170,12 @@ os_flush_icache(os_vm_address_t address, os_vm_size_t length)
     ppc_flush_icache(address,length);
 }
 
+// "cc -S" on this file shows that the C compiler is responsible for making
+// a substitution for these functions with an additional argument in front.
+// I don't want to know how to do that from Lisp.
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <unistd.h>
+int _stat(const char *pathname, struct stat *sb) {return stat(pathname, sb); }
+int _lstat(const char *pathname, struct stat *sb) { return lstat(pathname, sb); }
+int _fstat(int fd, struct stat *sb) { return fstat(fd, sb); }

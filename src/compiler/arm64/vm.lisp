@@ -11,6 +11,9 @@
 
 (in-package "SB-VM")
 
+(defconstant-eqx +fixup-kinds+ #(:absolute :cond-branch :uncond-branch :layout-id)
+  #'equalp)
+
 
 ;;;; register specs
 
@@ -48,6 +51,7 @@
   (defreg r5 15)
   (defreg r6 16)
   (defreg r7 17)
+  ;; Can't use it on Darwin
   (defreg r8 18)
   (defreg r9 19)
 
@@ -74,15 +78,14 @@
       null cfp nsp lr code)
 
   (defregset descriptor-regs
-      r0 r1 r2 r3 r4 r5 r6 r7 r8 r9 #-sb-thread r10 lexenv)
+      r0 r1 r2 r3 r4 r5 r6 r7 #-darwin r8 r9 #-sb-thread r10 lexenv)
 
   (defregset non-descriptor-regs
       nl0 nl1 nl2 nl3 nl4 nl5 nl6 nl7 nl8 nl9 nargs nfp ocfp)
 
-  ;; OAOOM: Same as runtime/arm64-lispregs.h
   (defregset boxed-regs
       r0 r1 r2 r3 r4 r5 r6
-      r7 r8 r9 #-sb-thread r10 #+sb-thread thread lexenv code)
+      r7 #-darwin r8 r9 #-sb-thread r10 #+sb-thread thread lexenv code)
 
   ;; registers used to pass arguments
   ;;
@@ -249,7 +252,7 @@
   (typecase value
     (null
      (values descriptor-reg-sc-number null-offset))
-    ((or (integer #.sb-xc:most-negative-fixnum #.sb-xc:most-positive-fixnum)
+    ((or (integer #.most-negative-fixnum #.most-positive-fixnum)
          character)
      immediate-sc-number)
     (symbol
@@ -373,3 +376,15 @@
 #+sb-thread
 (defconstant pseudo-atomic-interrupted-flag
     (ash list-pointer-lowtag #+little-endian 32 #+big-endian 0))
+
+#+sb-xc-host
+(setq *backend-cross-foldable-predicates*
+      '(char-immediate-p
+        abs-add-sub-immediate-p
+        fixnum-abs-add-sub-immediate-p
+        sb-arm64-asm::add-sub-immediate-p
+        sb-arm64-asm::fixnum-add-sub-immediate-p
+        sb-arm64-asm::encode-logical-immediate
+        sb-arm64-asm::fixnum-encode-logical-immediate
+        bic-encode-immediate
+        bic-fixnum-encode-immediate))

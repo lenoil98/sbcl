@@ -66,16 +66,25 @@
 
 ;;; This variable is accessed by C code when saving. Export it to survive tree-shaker.
 ;;; The symbols in this set are clobbered just in time to avoid saving them to the core
-;;; but not so early that we kill the running image. (Though in fact if SAVE-ERROR
-;;; and hence REINIT is reached, we reassign them all anyway)
+;;; but not so early that we kill the running image.
 (export 'sb-kernel::*save-lisp-clobbered-globals* 'sb-kernel)
 (define-load-time-global sb-kernel::*save-lisp-clobbered-globals*
     '#(sb-impl::*exit-lock*
        sb-thread::*make-thread-lock*
        sb-thread::*initial-thread*
+       ;; Saving *JOINABLE-THREADS* could cause catastophic failure on restart.
+       ;; SAVE-LISP-AND-DIE should have cleaned up, but there's a timing problem
+       ;; with the finalizer thread, and I'm loathe to put in a SLEEP delay.
+       sb-thread::*joinable-threads*
        sb-thread::*all-threads*
        sb-thread::*session*
        sb-kernel::*gc-epoch*))
+
+(defun start-lisp (toplevel)
+  (named-lambda start-lisp ()
+    (handling-end-of-the-world
+     (reinit t)
+     (funcall toplevel))))
 
 (defun save-lisp-and-die (core-file-name &key
                                          (toplevel #'toplevel-init)
@@ -187,7 +196,8 @@ sufficiently motivated to do lengthy fixes."
   (declare (ignore purify) (ignorable root-structures))
   ;; If the toplevel function is not defined, this will signal an
   ;; error before saving, not at startup time.
-  (let ((toplevel (%coerce-callable-to-fun toplevel)))
+  (let ((toplevel (%coerce-callable-to-fun toplevel))
+        *streams-closed-by-slad*)
     #+sb-core-compression
     (check-type compression (or boolean (integer -1 9)))
     #-sb-core-compression
@@ -203,20 +213,11 @@ sufficiently motivated to do lengthy fixes."
           (return-from save-lisp-and-die))))
     (when (eql t compression)
       (setf compression -1))
-    (labels ((restart-lisp ()
-               (handling-end-of-the-world
-                 (reinit)
-                 ;; REINIT can not discern between a restarted image and a
-                 ;; failure to save. It doesn't make a lot of sense to start
-                 ;; a finalizer thread in the failed case, so we set the flag
-                 ;; here, not in REINIT which would do it for both cases.
-                 #+sb-thread (setq *finalizer-thread* t)
-                 #+hpux (%primitive sb-vm::setup-return-from-lisp-stub)
-                 (funcall toplevel)))
-             (foreign-bool (value)
-               (if value 1 0)))
+    (flet ((foreign-bool (value)
+             (if value 1 0)))
       (let ((name (native-namestring (physicalize-pathname core-file-name)
-                                     :as-file t)))
+                                     :as-file t))
+            (startfun (start-lisp toplevel)))
         (deinit)
         ;; FIXME: Would it be possible to unmix the PURIFY logic from this
         ;; function, and just do a GC :FULL T here? (Then if the user wanted
@@ -228,10 +229,16 @@ sufficiently motivated to do lengthy fixes."
           ;; prior causes compilation to occur into immobile space.
           ;; Failing to see all immobile code would miss some relocs.
           #+immobile-code (sb-vm::choose-code-component-order root-structures)
+          ;; Must clear this cache if asm routines are movable.
+          (setq sb-disassem::*assembler-routines-by-addr* nil
+                ;; and save some space by deleting the instruction decoding table
+                ;; which can be rebuilt on demand. Must be done after DEINIT
+                ;; and CHOOSE-CODE-COMPONENT-ORDER both of which disassemble.
+                sb-disassem::*disassem-inst-space* nil)
           ;; Save the restart function. Logically a passed argument, but can't be,
           ;; as it would require pinning around the whole save operation.
-          (with-pinned-objects (#'restart-lisp)
-            (setf lisp-init-function (get-lisp-obj-address #'restart-lisp)))
+          (with-pinned-objects (startfun)
+            (setf lisp-init-function (get-lisp-obj-address startfun)))
           ;; Do a destructive non-conservative GC, and then save a core.
           ;; A normal GC will leave huge amounts of storage unreclaimed
           ;; (over 50% on x86). This needs to be done by a single function
@@ -253,7 +260,7 @@ sufficiently motivated to do lengthy fixes."
           (if purify (purify :root-structures root-structures) (gc))
           (without-gcing
             (save name
-                  (get-lisp-obj-address #'restart-lisp)
+                  (get-lisp-obj-address startfun)
                   (foreign-bool executable)
                   (foreign-bool save-runtime-options)
                   (foreign-bool compression)
@@ -263,7 +270,8 @@ sufficiently motivated to do lengthy fixes."
 
     ;; Something went very wrong -- reinitialize to have a prayer
     ;; of being able to report the error.
-    (reinit)
+    (restore-fd-streams)
+    (reinit nil)
     (error 'save-error)))
 
 (defun tune-image-for-dump ()
@@ -280,31 +288,44 @@ sufficiently motivated to do lengthy fixes."
          (if shared-info
              (setf (info :function :info name) shared-info)
              (setf (gethash info ht) info))))))
-  (sb-c::coalesce-debug-info) ; Share even more things
+
+  ;; Don't try to assign header slots of code objects. Any of them could be in
+  ;; readonly space. It's not worth the trouble to try to figure out which aren't.
+  #-cheneygc (sb-c::coalesce-debug-info) ; Share even more things
+
   #+sb-fasteval (sb-interpreter::flush-everything)
   (tune-hashtable-sizes-of-all-packages))
 
 (defun deinit ()
   (call-hooks "save" *save-hooks*)
-  #+sb-wtimer
-  (itimer-emulation-deinit)
-  ;; Terminate finalizer thread now, especially given that the thread runs
-  ;; user-supplied code that might not even work in later steps of deinit.
-  ;; See also the comment at definition of THREAD-EPHEMERAL-P.
-  #+sb-thread (finalizer-thread-stop)
-  (let ((threads (sb-thread:list-all-threads)))
-    (unless (= 1 (length threads))
-      (let* ((interactive (sb-thread::interactive-threads))
-             (other (set-difference threads interactive)))
-        (error 'save-with-multiple-threads-error
-               :interactive-threads interactive
-               :other-threads other))))
+  #+win32 (itimer-emulation-deinit)
+  #+sb-thread
+  (let (err)
+    (with-system-mutex (sb-thread::*make-thread-lock*)
+      (finalizer-thread-stop)
+      #+pauseless-threadstart (sb-thread::join-pthread-joinables #'identity)
+      (let ((threads (sb-thread:list-all-threads))
+            (starting
+             (setq sb-thread::*starting-threads* ; ordinarily pruned in MAKE-THREAD
+                   (delete 0 sb-thread::*starting-threads*)))
+            (joinable sb-thread::*joinable-threads*))
+        (when (or (cdr threads) starting joinable)
+          (let* ((interactive (sb-thread::interactive-threads))
+                 (other (union (set-difference threads interactive)
+                               (union starting joinable))))
+            (make-condition 'save-with-multiple-threads-error
+                            :interactive-threads interactive
+                            :other-threads other)))))
+    (when err (error err))
+    (setq sb-thread::*sprof-data* nil))
   (tune-image-for-dump)
   (float-deinit)
   (profile-deinit)
   (foreign-deinit)
-  (finalizers-deinit)
-  (fill *pathnames* nil)
+  ;; To have any hope of making pathname interning actually work,
+  ;; this CLRHASH would need to be removed. But removing it causes excess
+  ;; garbage retention because weakness doesn't work. It's a catch-22.
+  (clrhash *pathnames*)
   ;; Clean up the simulated weak list of covered code components.
   (rplacd sb-c:*code-coverage-info*
           (delete-if-not #'weak-pointer-value (cdr sb-c:*code-coverage-info*)))
@@ -312,12 +333,12 @@ sufficiently motivated to do lengthy fixes."
   ;; because coalescing compares by TYPE= which creates more cache entries.
   (coalesce-ctypes)
   (drop-all-hash-caches)
-  ;; Must clear this cache if asm routines are movable.
-  (setq sb-disassem::*assembler-routines-by-addr* nil)
   (os-deinit)
   ;; Perform static linkage. Functions become un-statically-linked
   ;; on demand, for TRACE, redefinition, etc.
   #+immobile-code (sb-vm::statically-link-core)
+  (invalidate-fd-streams)
+  (finalizers-deinit)
   ;; Do this last, to have some hope of printing if we need to.
   (stream-deinit)
   (setf * nil ** nil *** nil
@@ -359,8 +380,9 @@ sufficiently motivated to do lengthy fixes."
                     ;; ctype, because that's already a canonical object.
                     (not (minusp (type-hash-value part)))))
              (coalesce (type &aux
-                             ;; Deal with ctypes instances whose unparser fails.
-                             (spec (ignore-errors (type-specifier type))))
+                               ;; Deal with ctypes instances whose unparser fails.
+                               (spec (and (not (contains-unknown-type-p type))
+                                          (ignore-errors (type-specifier type)))))
                ;; There are ctypes that unparse to the same s-expression
                ;; but are *NOT* TYPE=. Some examples:
                ;;   classoid LIST  vs UNION-TYPE LIST  = (OR CONS NULL)
@@ -435,16 +457,16 @@ sufficiently motivated to do lengthy fixes."
             (sb-vm:do-referenced-object (obj examine)
               (simple-vector
                :extend
-               (when (and written (logtest sb-vm:vector-addr-hashing-subtype
+               (when (and written (logtest sb-vm:vector-addr-hashing-flag
                                            (get-header-data obj)))
                  (setf (svref obj 1) 1)))))))))) ; set need-to-rehash
 
 sb-c::
 (defun coalesce-debug-info ()
+  #+cheneygc (clrhash sb-di::*compiled-debug-funs*)
   (flet ((debug-source= (a b)
            (and (equal (debug-source-plist a) (debug-source-plist b))
-                (eql (debug-source-created a) (debug-source-created b))
-                (eql (debug-source-compiled a) (debug-source-compiled b)))))
+                (eql (debug-source-created a) (debug-source-created b)))))
     ;; Coalesce the following:
     ;;  DEBUG-INFO-SOURCE, DEBUG-FUN-NAME
     ;;  SIMPLE-FUN-ARGLIST, SIMPLE-FUN-TYPE
@@ -459,6 +481,12 @@ sb-c::
          (declare (ignore size))
          (case widetag
           (#.sb-vm:code-header-widetag
+           (let ((di (sb-vm::%%code-debug-info obj)))
+             ;; Discard memoized debugger's debug info
+             (when (typep di 'sb-c::compiled-debug-info)
+               (let ((thing (sb-c::compiled-debug-info-tlf-num+offset di)))
+                 (when (consp thing)
+                   (setf (sb-c::compiled-debug-info-tlf-num+offset di) (car thing))))))
            (dotimes (i (sb-kernel:code-n-entries obj))
              (let* ((fun (sb-kernel:%code-entry-point obj i))
                     (arglist (%simple-fun-arglist fun))
@@ -477,7 +505,7 @@ sb-c::
             (compiled-debug-info
              (let ((source (compiled-debug-info-source obj)))
                (typecase source
-                 (core-debug-source)    ; skip
+                 (core-debug-source)    ; skip - uh, why?
                  (debug-source
                   (let* ((namestring (debug-source-namestring source))
                          (canonical-repr

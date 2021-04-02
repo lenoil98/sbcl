@@ -1083,12 +1083,16 @@
 (defmacro class-test (arg class)
   (cond
     ((eq class *the-class-t*) t)
-    ((eq class *the-class-slot-object*)
-     `(not (typep (classoid-of ,arg) 'system-classoid)))
     ((eq class *the-class-standard-object*)
      `(or (std-instance-p ,arg) (fsc-instance-p ,arg)))
     ((eq class *the-class-funcallable-standard-object*)
      `(fsc-instance-p ,arg))
+    ;; This is going to be cached (in *fgens*),
+    ;; and structure type tests do not check for invalid layout.
+    ;; Cache the wrapper itself, which is going to be different after
+    ;; redifinition.
+    ((structure-class-p class)
+     `(sb-c::%instance-typep ,arg ,(class-wrapper class)))
     (t
      `(typep ,arg ',(class-name class)))))
 
@@ -1267,8 +1271,8 @@
 
 (defun compute-secondary-dispatch-function (generic-function net &optional
                                             method-alist wrappers)
-  (function-funcall (compute-secondary-dispatch-function1 generic-function net)
-                    method-alist wrappers))
+  (funcall (the function (compute-secondary-dispatch-function1 generic-function net))
+           method-alist wrappers))
 
 (defvar *eq-case-table-limit* 15)
 (defvar *case-table-limit* 10)
@@ -1418,17 +1422,17 @@
       (multiple-value-bind (cfunction constants)
           ;; We don't want NAMED-LAMBDA for any expressions handed to FNGEN,
           ;; because name mismatches will render the hashing ineffective.
-          (get-fun1 `(lambda ,arglist
+          (get-fun `(lambda ,arglist
                       (declare (optimize (sb-c::store-closure-debug-pointer 3)))
                       ,@(unless function-p
                           `((declare (ignore .pv. .next-method-call.))))
                       (locally (declare #.*optimize-speed*)
-                               (let ((emf ,net))
-                                 ,(make-emf-call nargs applyp 'emf))))
-                    #'net-test-converter
-                    #'net-code-converter
-                    (lambda (form)
-                      (net-constant-converter form generic-function)))
+                        (let ((emf ,net))
+                          ,(make-emf-call nargs applyp 'emf))))
+                   #'net-test-converter
+                   #'net-code-converter
+                   (lambda (form)
+                     (net-constant-converter form generic-function)))
         (lambda (method-alist wrappers)
           (let* ((alist (list nil))
                  (alist-tail alist))
