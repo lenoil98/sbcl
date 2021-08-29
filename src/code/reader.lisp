@@ -25,23 +25,21 @@
            (ignore key self))
   default)
 (defun !readtable-cold-init ()
-  (macrolet ((nwords ()
-               (dd-length (find-defstruct-description 'hash-table)))
-             (initforms ()
-               `(setf,@(mapcan (lambda (dsd)
-                                 (list `(%instance-ref table ,(dsd-index dsd))
-                                       (case (dsd-name dsd)
-                                         (gethash-impl '#'gethash-return-default)
-                                         (pairs (make-array kv-pairs-overhead-slots
-                                                            :initial-element 0))
-                                         (lock nil)
-                                         (t (dsd-default dsd)))))
-                               (dd-slots
-                                (find-defstruct-description 'hash-table))))))
-    (let ((table (%make-instance (nwords))))
-      (setf (%instance-layout table) #.(find-layout 'hash-table))
-      (initforms)
-      (setq *empty-extended-char-table* table))))
+  (macrolet ((alloc-fake-hash-table ()
+               (let ((dd (find-defstruct-description 'hash-table)))
+                 (sb-kernel::instance-constructor-form
+                  dd
+                  (mapcar (lambda (dsd)
+                            (case (dsd-name dsd)
+                              (gethash-impl '#'gethash-return-default)
+                              (pairs (make-array (+ kv-pairs-overhead-slots 2)
+                                                 :initial-element 0))
+                              (rehash-size 1)
+                              (rehash-threshold $1.0)
+                              (t (dsd-default dsd))))
+                          (dd-slots dd))))))
+    (setq *empty-extended-char-table* (alloc-fake-hash-table)
+          *readtable* (make-readtable))))
 
 (setf (documentation '*readtable* 'variable)
       "Variable bound to current readtable.")
@@ -60,15 +58,15 @@
 ;;;; reader errors
 
 (defun reader-eof-error (stream context)
-  (declare (optimize allow-non-returning-tail-call))
+  ;; Don't worry if STREAM isn't a valid stream; it's not a reason to fail now.
+  (declare (explicit-check) (optimize allow-non-returning-tail-call))
   (error 'reader-eof-error
          :stream stream
          :context context))
 
-;;; If The Gods didn't intend for us to use multiple namespaces, why
-;;; did They specify them?
 (defun simple-reader-error (stream control &rest args)
-  (declare (optimize allow-non-returning-tail-call))
+  ;; Don't worry if STREAM isn't a valid stream; it's not a reason to fail now.
+  (declare (explicit-check) (optimize allow-non-returning-tail-call))
   (error 'simple-reader-error
          :stream stream
          :format-control control
@@ -210,16 +208,15 @@
 
 ;;; There are a number of "secondary" attributes which are constant
 ;;; properties of characters (as long as they are constituents).
-;;; FIXME: this initform is considered too hairy to assign (a constant array, really?)
-;;; if changed to DEFCONSTANT-EQX, which makes this file unslammable as-is. Oh well.
 (defconstant-eqx +constituent-trait-table+
   #.(let ((a (sb-xc:make-array base-char-code-limit
                                :retain-specialization-for-after-xc-core t
                                :element-type '(unsigned-byte 8))))
       (fill a +char-attr-constituent+)
-      (flet ((!set-constituent-trait (char trait)
-               (aver (typep char 'base-char))
-               (setf (elt a (char-code char)) trait)))
+      (labels ((!set-code-constituent-trait (code trait)
+                 (setf (elt a code) trait))
+               (!set-constituent-trait (char trait)
+                 (!set-code-constituent-trait (char-code char) trait)))
         (!set-constituent-trait #\: +char-attr-package-delimiter+)
         (!set-constituent-trait #\. +char-attr-constituent-dot+)
         (!set-constituent-trait #\+ +char-attr-constituent-sign+)
@@ -227,7 +224,7 @@
         (!set-constituent-trait #\/ +char-attr-constituent-slash+)
         (do ((i (char-code #\0) (1+ i)))
             ((> i (char-code #\9)))
-          (!set-constituent-trait (code-char i) +char-attr-constituent-digit+))
+          (!set-code-constituent-trait i +char-attr-constituent-digit+))
         (!set-constituent-trait #\E +char-attr-constituent-expt+)
         (!set-constituent-trait #\F +char-attr-constituent-expt+)
         (!set-constituent-trait #\D +char-attr-constituent-expt+)
@@ -244,7 +241,7 @@
         (!set-constituent-trait #\Newline +char-attr-invalid+)
         (dolist (c (list backspace-char-code tab-char-code form-feed-char-code
                          return-char-code rubout-char-code))
-          (!set-constituent-trait (code-char c) +char-attr-invalid+)))
+          (!set-code-constituent-trait c +char-attr-invalid+)))
       a)
   #'equalp)
 
@@ -515,8 +512,7 @@ standard Lisp readtable when NIL."
 ;;;; temporary initialization hack
 
 ;; Install the (easy) standard macro-chars into *READTABLE*.
-(defun !cold-init-standard-readtable ()
-  (/show0 "entering !cold-init-standard-readtable")
+(defun !reader-cold-init ()
   ;; All characters get boring defaults in MAKE-READTABLE. Now we
   ;; override the boring defaults on characters which need more
   ;; interesting behavior.
@@ -542,7 +538,7 @@ standard Lisp readtable when NIL."
   (set-macro-character #\; #'read-comment)
   ;; (The hairier macro-character definitions, for #\# and #\`, are
   ;; defined elsewhere, in their own source files.)
-  (/show0 "leaving !cold-init-standard-readtable"))
+  )
 
 ;;;; implementation of the read buffer
 
@@ -1955,9 +1951,6 @@ extended <package-name>::<form-in-package> syntax."
 
 ;;;; reader initialization code
 
-(defun !reader-cold-init ()
-  (!cold-init-standard-readtable))
-
 (defmethod print-object ((readtable readtable) stream)
   (print-unreadable-object (readtable stream :identity t :type t)))
 

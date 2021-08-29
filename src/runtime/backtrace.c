@@ -99,7 +99,7 @@ print_string (struct vector *vector, FILE *f)
         return;
     }
     int i;
-    int n = fixnum_value(vector->length);
+    int n = vector_len(vector);
     for (i = 0; i < n; i++) {
         unsigned int c = schar(vector, i);
         if (c > 0xFFFF) fprintf(f,"\\U%08x", c);
@@ -217,7 +217,9 @@ code_pointer(lispobj object)
     switch (widetag_of(headerp)) {
         case CODE_HEADER_WIDETAG:
             break;
+#ifdef RETURN_PC_WIDETAG
         case RETURN_PC_WIDETAG:
+#endif
         case SIMPLE_FUN_WIDETAG:
             len = (HeaderValue(*headerp) & FUN_HEADER_NWORDS_MASK);
             if (len == 0)
@@ -258,14 +260,20 @@ call_info_from_context(struct call_info *info, os_context_t *context)
     } else
 #endif
     {
+        pc = *os_context_pc_addr(context);
         info->frame =
             (struct call_frame *)(uword_t)
                 (*os_context_register_addr(context, reg_CFP));
         info->code =
+#ifdef reg_CODE
             code_pointer(*os_context_register_addr(context, reg_CODE));
+#else
+        (struct code *)dynamic_space_code_from_pc((char *)pc);
+#endif
         info->lra = NIL;
-        pc = *os_context_pc_addr(context);
+
     }
+
     if (info->code != NULL)
         info->pc = (char*)pc - (char*)info->code;
     else
@@ -302,8 +310,15 @@ int lisp_frame_previous(struct thread *thread, struct call_info *info)
             }
         }
     } else if (fixnump(lra)) {
-        info->code = (struct code*)native_pointer(this_frame->code);
+        info->code =
+#ifdef reg_CODE
+        (struct code*)native_pointer(this_frame->code);
         info->pc = lra;
+#else
+        (struct code *)dynamic_space_code_from_pc((char *)lra);
+        info->pc = (char*)native_pointer(lra) - (char*)info->code;
+#endif
+
         info->lra = NIL;
     } else {
         info->code = code_pointer(lra);
@@ -339,10 +354,16 @@ lisp_backtrace(int nframes)
         }
         printf("%4d: ", i);
         // Print spaces to keep the alignment nice
-        if (info.lra == NIL || info.interrupted) {
+        if (info.interrupted
+#ifdef reg_CODE
+            || info.lra == NIL
+#endif
+            ) {
             putchar('[');
             if (info.interrupted) { footnotes |= 1; putchar('I'); }
+#ifdef reg_CODE
             if (info.lra == NIL) { footnotes |= 2; putchar('*'); }
+#endif
             putchar(']');
             if (!(info.lra == NIL && info.interrupted)) putchar(' ');
         } else {
@@ -378,7 +399,11 @@ lisp_backtrace(int nframes)
         putchar('\n');
 
     } while (++i <= nframes);
-    if (footnotes) printf("Note: [I] = interrupted, [*] = no LRA\n");
+    if (footnotes) printf("Note: [I] = interrupted"
+#ifdef reg_CODE
+                          ", [*] = no LRA"
+#endif
+                          "\n");
 }
 
 #else
@@ -581,7 +606,7 @@ int simple_fun_index_from_pc(struct code* code, char *pc)
 static boolean __attribute__((unused)) print_lisp_fun_name(char* pc)
 {
   struct code* code;
-  if (gc_managed_addr_p((uword_t)pc) &&
+  if (gc_managed_heap_space_p((uword_t)pc) &&
       (code = (void*)component_ptr_from_pc(pc)) != 0) {
       struct compiled_debug_fun* df = debug_function_from_pc(code, pc);
       if (df) {

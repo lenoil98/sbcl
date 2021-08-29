@@ -823,11 +823,10 @@ build_fake_control_stack_frames(struct thread __attribute__((unused)) *th,
         }
     } else
 #elif defined (LISP_FEATURE_ARM)
-        access_control_frame_pointer(th) = (lispobj*)
-            SymbolValue(CONTROL_STACK_POINTER, th);
+        access_control_frame_pointer(th) = (lispobj*) SymbolValue(CONTROL_STACK_POINTER, th);
 #elif defined (LISP_FEATURE_ARM64)
     access_control_frame_pointer(th) =
-        (lispobj *)(uword_t) (*os_context_register_addr(context, reg_CSP));
+        (lispobj *)(uword_t) (*os_context_register_addr(context, reg_CSP)) + 2;
 #endif
     /* We can't tell whether we are still in the caller if it had to
      * allocate a stack frame due to stack arguments. */
@@ -841,9 +840,13 @@ build_fake_control_stack_frames(struct thread __attribute__((unused)) *th,
     access_control_stack_pointer(th) = access_control_frame_pointer(th) + 3;
 
     access_control_frame_pointer(th)[0] = oldcont;
+#ifdef reg_CODE
     access_control_frame_pointer(th)[1] = NIL;
     access_control_frame_pointer(th)[2] =
         (lispobj)(*os_context_register_addr(context, reg_CODE));
+#else
+    access_control_frame_pointer(th)[1] = *os_context_pc_addr(context);
+#endif
 #endif
 }
 
@@ -1362,6 +1365,11 @@ maybe_now_maybe_later(int signal, siginfo_t *info, void *void_context)
 }
 #endif
 
+#ifdef LISP_FEATURE_GC_METRICS
+pthread_cond_t gcmetrics_condvar = PTHREAD_COND_INITIALIZER;
+pthread_mutex_t gcmetrics_mutex = PTHREAD_MUTEX_INITIALIZER;
+#endif
+
 #ifdef THREADS_USING_GCSIGNAL
 
 /* This function must not cons, because that may trigger a GC. */
@@ -1443,7 +1451,29 @@ sig_stop_for_gc_handler(int __attribute__((unused)) signal,
      * Normally the way to implement a "suspend" operation is to issue any blocking
      * syscall such as sigsuspend() or select(). Apparently every OS + C runtime that
      * we wish to support has no problem with sem_wait() here in the signal handler. */
+
+#ifdef LISP_FEATURE_GC_METRICS
+    int my_state;
+    {
+    struct timespec t_beginwait, t_endwait, t_runtime;
+    clock_gettime(CLOCK_MONOTONIC, &t_beginwait);
+    my_state = thread_wait_until_not(STATE_STOPPED, thread);
+    clock_gettime(CLOCK_MONOTONIC, &t_endwait);
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t_runtime);
+    // calculate CPU time in microseconds
+    long elapsed = ((t_endwait.tv_sec - t_beginwait.tv_sec)*1000000000L
+                    + (t_endwait.tv_nsec - t_beginwait.tv_nsec)) / 1000;
+    struct extra_thread_data *data = thread_extra_data(thread);
+    if (elapsed > data->worst_gc_wait) data->worst_gc_wait = elapsed;
+    data->sum_gc_wait += elapsed;
+    data->avg_gc_wait = data->sum_gc_wait / ++data->n_gc_wait;
+    data->on_cpu_time = t_runtime.tv_sec * 1000000 + t_runtime.tv_nsec / 1000;
+    pthread_cond_broadcast(&gcmetrics_condvar);
+    }
+#else
     int my_state = thread_wait_until_not(STATE_STOPPED, thread);
+#endif
+
     FSHOW_SIGNAL((stderr,"resumed\n"));
 
     /* The state can't go from STOPPED to DEAD because it's this thread is reading
@@ -1672,7 +1702,7 @@ arrange_return_to_c_function(os_context_t *context,
     *os_context_npc_addr(context) =
         4 + *os_context_pc_addr(context);
 #endif
-#if defined(LISP_FEATURE_SPARC) || defined(LISP_FEATURE_ARM) || defined(LISP_FEATURE_ARM64) || defined(LISP_FEATURE_RISCV)
+#if defined(LISP_FEATURE_SPARC) || defined(LISP_FEATURE_ARM) || defined(LISP_FEATURE_RISCV)
     *os_context_register_addr(context,reg_CODE) =
         (os_context_register_t)((char*)fun + FUN_POINTER_LOWTAG);
 #endif

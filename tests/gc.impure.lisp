@@ -268,8 +268,8 @@
 #+gencgc
 (defun ensure-code/data-separation ()
   (let* ((n-bits (+ sb-vm:next-free-page 10))
-         (code-bits (make-array n-bits :element-type 'bit))
-         (data-bits (make-array n-bits :element-type 'bit))
+         (code-bits (make-array n-bits :element-type 'bit :initial-element 0))
+         (data-bits (make-array n-bits :element-type 'bit :initial-element 0))
          (total-code-size 0))
     (sb-vm:map-allocated-objects
      (lambda (obj type size)
@@ -389,14 +389,13 @@
     (sb-thread:join-thread gc-thread)))
 
 (defun parse-address-range (line)
-  ;; I hope nothing preceding the match of "00-" could be a false positive.
+  ;; I hope nothing preceding the match of "-" could be a false positive.
   ;; If there is, I suspect we should parse the legend that contains
   ;;  "REGION TYPE                      START - END" to determine the column
   ;; with a #\- which appears consistently in the same place on each following line.
-  (let ((pos (search "00-" line)))
-    (assert pos)
-    (let* ((separator (+ pos 2)) ; position of the #\-
-           (start separator))
+  (let ((separator (position #\- line)))
+    (assert separator)
+    (let* ((start separator))
       (loop (if (digit-char-p (char line (1- start)) 16) (decf start) (return)))
       (values (parse-integer line :start start :end separator :radix 16)
               (multiple-value-bind (value end)

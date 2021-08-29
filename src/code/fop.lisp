@@ -2,82 +2,6 @@
 
 (in-package "SB-FASL")
 
-;;; Bind STACK-VAR and PTR-VAR to the start of a subsequence of
-;;; the fop stack of length COUNT, then execute BODY.
-;;; Within the body, FOP-STACK-REF is used in lieu of SVREF
-;;; to elide bounds checking.
-(defmacro with-fop-stack (((stack-var &optional stack-expr) ptr-var count)
-                          &body body)
-  `(macrolet ((fop-stack-ref (i)
-                `(locally
-                     #-sb-xc-host
-                     (declare (optimize (sb-c::insert-array-bounds-checks 0)))
-                   (svref ,',stack-var (truly-the index ,i)))))
-     (let* (,@(when stack-expr
-                (list `(,stack-var (the simple-vector ,stack-expr))))
-            (,ptr-var (truly-the index (fop-stack-pop-n ,stack-var ,count))))
-       ,@body)))
-
-;;; Define NAME as a fasl operation, with op-code FOP-CODE.
-;;; PUSHP describes what the body does to the fop stack:
-;;;   T   - The result of the body is pushed on the fop stack.
-;;;   NIL - The result of the body is discarded.
-;;; In either case, the body is permitted to pop the stack.
-;;;
-(defmacro define-fop (fop-code &rest stuff)
-  (multiple-value-bind (name allowp operands stack-args pushp forms)
-      (let ((allowp (if (eq (car stuff) :not-host)
-                        (progn (pop stuff) (or #-sb-xc-host t))
-                        t)))
-        (destructuring-bind ((name &optional arglist (pushp t)) . forms) stuff
-          (aver (member pushp '(nil t)))
-          (multiple-value-bind (operands stack-args)
-              (if (atom (car arglist))
-                  (values nil arglist)
-                  (ecase (caar arglist)
-                    (:operands (values (cdar arglist) (cdr arglist)))))
-            (assert (<= (length operands) 3))
-            (values name allowp operands stack-args pushp forms))))
-    `(progn
-       (defun ,name (.fasl-input. ,@operands)
-         (declare (ignorable .fasl-input.))
-         ,@(if allowp
-               `((macrolet
-                   ((fasl-input () '(truly-the fasl-input .fasl-input.))
-                    (fasl-input-stream () '(%fasl-input-stream (fasl-input)))
-                    (operand-stack () '(%fasl-input-stack (fasl-input)))
-                    (skip-until () '(%fasl-input-skip-until (fasl-input))))
-                  ,@(if (null stack-args)
-                        forms
-                        (with-unique-names (stack ptr)
-                         `((with-fop-stack ((,stack (operand-stack))
-                                            ,ptr ,(length stack-args))
-                             (multiple-value-bind ,stack-args
-                                 (values ,@(loop for i below (length stack-args)
-                                                 collect `(fop-stack-ref (+ ,ptr ,i))))
-                               ,@forms)))))))
-               `((declare (ignore ,@operands))
-                 (error ,(format nil "Not-host fop invoked: ~A" name)))))
-       (!%define-fop ',name ,fop-code ,(length operands) ,(if pushp 1 0)))))
-
-(defun !%define-fop (name opcode n-operands pushp)
-  (declare (type (mod 4) n-operands))
-  (let ((function (svref **fop-funs** opcode)))
-    (when (functionp function)
-      (let ((oname (nth-value 2 (function-lambda-expression function))))
-        (when (and oname (not (eq oname name)))
-          (error "fop ~S with opcode ~D conflicts with fop ~S."
-                 name opcode oname))))
-    (let ((existing-opcode (get name 'opcode)))
-      (when (and existing-opcode (/= existing-opcode opcode))
-        (error "multiple codes for fop name ~S: ~D and ~D"
-               name opcode existing-opcode)))
-    (setf (get name 'opcode) opcode
-          (svref **fop-funs** opcode) (symbol-function name)
-          (aref (car **fop-signatures**) opcode) n-operands
-          (sbit (cdr **fop-signatures**) opcode) pushp))
-  name)
-
 ;;; Compatibity macros that allow some fops to share the identical
 ;;; body between genesis and the target code.
 #-sb-xc-host
@@ -100,7 +24,7 @@
   (with-fast-read-byte ((unsigned-byte 8) stream)
     (dotimes (i length)
       (setf (aref string i)
-            (sb-xc:code-char (fast-read-byte)))))
+            (code-char (fast-read-byte)))))
   string)
 ;;; Variation 2: base-string, transfer elements of type (unsigned-byte 8)
 (defun read-base-string-as-bytes (stream string &optional (length (length string)))
@@ -110,7 +34,7 @@
   (with-fast-read-byte ((unsigned-byte 8) stream)
     (dotimes (i length)
       (setf (aref string i)
-            (sb-xc:code-char (fast-read-byte)))))
+            (code-char (fast-read-byte)))))
   string)
 ;;; Variation 3: character-string, transfer elements of type varint
 (defun read-char-string-as-varints
@@ -133,7 +57,7 @@
                    unless (logbitp 7 octet) return accum)))
       (dotimes (i length)
         (setf (aref string i)
-              (sb-xc:code-char (read-varint))))))
+              (code-char (read-varint))))))
   string)
 
 ;;;; miscellaneous fops
@@ -159,18 +83,18 @@
   (let ((res (%make-instance size)) ; number of words excluding header
         ;; Discount the layout from number of user-visible words.
         (n-data-words (- size sb-vm:instance-data-start)))
-    (setf (%instance-layout res) layout)
+    (setf (%instance-wrapper res) layout)
     (with-fop-stack ((stack (operand-stack)) ptr n-data-words)
       (declare (type index ptr))
-      (let ((bitmap (layout-bitmap layout)))
+      (let ((bitmap (wrapper-bitmap layout)))
         ;; Values on the stack are in the same order as in the structure itself.
         (do ((i sb-vm:instance-data-start (1+ i)))
             ((>= i size))
           (declare (type index i))
           (let ((val (fop-stack-ref ptr)))
             (if (logbitp i bitmap)
-                (setf (%instance-ref res i) val)
-                (setf (%raw-instance-ref/word res i) val))
+                (%instance-set res i val)
+                (%raw-instance-set/word res i val))
             (incf ptr)))))
     res))
 
@@ -436,44 +360,18 @@
     (set-array-header res vec length nil 0 (fop-list (fasl-input) rank) nil t)
     res))
 
-(defglobal **saetp-bits-per-length**
-    (let ((array (make-array (1+ sb-vm:widetag-mask)
-                             :element-type '(unsigned-byte 8)
-                             :initial-element 255)))
-      (loop for saetp across sb-vm:*specialized-array-element-type-properties*
-            do
-            (setf (aref array (sb-vm:saetp-typecode saetp))
-                  (sb-vm:saetp-n-bits saetp)))
-      array)
-    "255 means bad entry.")
-(declaim (type (simple-array (unsigned-byte 8) (#.(1+ sb-vm:widetag-mask)))
-               **saetp-bits-per-length**))
-
 (define-fop 43 (fop-spec-vector  ((:operands length)))
   (let* ((widetag (read-byte-arg (fasl-input-stream)))
-         (bits-per-length (aref **saetp-bits-per-length** widetag))
-         (bits (progn (aver (< bits-per-length 255))
-                      (* length bits-per-length)))
+         (bits (* length (sb-vm::simple-array-widetag->bits-per-elt widetag)))
          (bytes (ceiling bits sb-vm:n-byte-bits))
          (words (ceiling bytes sb-vm:n-word-bytes))
-         (vector
-          (progn (aver (/= widetag sb-vm:simple-vector-widetag))
-                 (logically-readonlyize
-                  (allocate-vector widetag length words)))))
+         (vector (logically-readonlyize
+                  (allocate-vector #+(and (not sb-xc-host) ubsan) nil
+                                   widetag length words))))
     (declare (type index length bytes words)
              (type word bits))
     (read-n-bytes (fasl-input-stream) vector 0 bytes)
     vector))
-
-(define-fop 53 (fop-eval (expr)) ; This seems to be unused
-  (if (skip-until)
-      expr
-      (eval expr)))
-
-(define-fop 54 (fop-eval-for-effect (expr) nil) ; This seems to be unused
-  (unless (skip-until)
-    (eval expr))
-  nil)
 
 (defun fop-funcall* (argc stack skipping)
   (with-fop-stack ((stack) ptr (1+ argc))
@@ -508,7 +406,8 @@
   (setf (svref (ref-fop-table (fasl-input) tbl-slot) idx) val))
 
 (define-fop 14 :not-host (fop-structset ((:operands tbl-slot idx) val) nil)
-  (setf (%instance-ref (ref-fop-table (fasl-input) tbl-slot) idx) val))
+  (%instance-set (ref-fop-table (fasl-input) tbl-slot) idx val)
+  val) ; I can't remmeber whether this fop needs to return VAL. maybe?
 
 (define-fop 15 (fop-nthcdr ((:operands n) obj))
   (nthcdr n obj))
@@ -522,14 +421,14 @@
 ;;; putting the implementation and version in required fields in the
 ;;; fasl file header.)
 
+(define-load-time-global *show-new-code* nil)
 (define-fop 16 :not-host (fop-load-code ((:operands header n-code-bytes n-fixups)))
   (let* ((n-named-calls (read-unsigned-byte-32-arg (fasl-input-stream)))
          (n-boxed-words (ash header -1))
          (n-constants (- n-boxed-words sb-vm:code-constants-offset)))
     ;; stack has (at least) N-CONSTANTS words plus debug-info
     (with-fop-stack ((stack (operand-stack)) ptr (1+ n-constants))
-      (let* ((debug-info-index (+ ptr n-constants))
-             (n-boxed-words (+ sb-vm:code-constants-offset n-constants))
+      (let* ((n-boxed-words (+ sb-vm:code-constants-offset n-constants))
              (code (sb-c:allocate-code-object
                     (if (oddp header) :immobile :dynamic)
                     n-named-calls
@@ -552,20 +451,31 @@
           (sb-thread:barrier (:write))
           ;; Assign debug-info last. A code object that has no debug-info will never
           ;; have its fun table accessed in conservative_root_p() or pin_object().
-          (setf (%code-debug-info code) (svref stack debug-info-index))
+          (setf (%code-debug-info code) (svref stack (+ ptr n-constants)))
           ;; Boxed constants can be assigned only after figuring out where the range
           ;; of implicitly tagged words is, which requires knowing how many functions
           ;; are in the code component, which requires reading the code trailer.
-          (let* ((fdefns-start (sb-impl::code-fdefns-start-index code))
-                 (fdefns-end (1- (+ fdefns-start n-named-calls)))) ; inclusive bound
-            (loop for i of-type index from sb-vm:code-constants-offset
-                  for j of-type index from ptr below debug-info-index
-                  do (let ((constant (svref stack j)))
-                       (if (<= fdefns-start i fdefns-end)
-                           (sb-c::set-code-fdefn code i constant)
-                           (setf (code-header-ref code i) constant)))))
+          (let* ((header-index sb-vm:code-constants-offset)
+                 (stack-index ptr))
+            (declare (type index header-index stack-index))
+            (dotimes (n (code-n-entries code))
+              (dotimes (i sb-vm:code-slots-per-simple-fun)
+                (setf (code-header-ref code header-index) (svref stack stack-index))
+                (incf header-index)
+                (incf stack-index)))
+            (dotimes (i n-named-calls)
+              (sb-c::set-code-fdefn code header-index (svref stack stack-index))
+              (incf header-index)
+              (incf stack-index))
+            (do () ((>= header-index n-boxed-words))
+              (setf (code-header-ref code header-index) (svref stack stack-index))
+              (incf header-index)
+              (incf stack-index)))
           ;; Now apply fixups. The fixups to perform are popped from the fasl stack.
           (sb-c::apply-fasl-fixups stack code n-fixups))
+        (when *show-new-code*
+          (let ((*print-pretty* nil))
+            (format t "~&~X New code(load): ~A~%" (get-lisp-obj-address code) code)))
         #-sb-xc-host
         (when (typep (code-header-ref code (1- n-boxed-words))
                      '(cons (eql sb-c::coverage-map)))
@@ -612,7 +522,7 @@ report it as a ~ bug.~:@>")
     (setf (code-header-ref code index) value)
     (values)))
 
-(define-fop 20 :not-host (fop-fun-entry ((:operands fun-index) code-object))
+(define-fop 20 (fop-fun-entry ((:operands fun-index) code-object))
   (%code-entry-point code-object fun-index))
 
 ;;;; assemblerish fops

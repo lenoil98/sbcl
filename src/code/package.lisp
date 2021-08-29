@@ -93,12 +93,7 @@
   (%local-nicknames nil :type (or null (cons simple-vector simple-vector)))
   ;; Definition source location
   (source-location nil :type (or null sb-c:definition-source-location)))
-(sb-xc:proclaim '(freeze-type package-hashtable package))
-(!set-load-form-method package (:xc)
-  (lambda (obj env)
-    (declare (ignore env))
-    ;; the target code will use FIND-UNDELETED-PACKAGE-OR-LOSE
-    `(find-package ,(package-name obj))))
+(proclaim '(freeze-type package-hashtable package))
 
 (defconstant +initial-package-bits+ 2) ; for genesis
 
@@ -109,7 +104,7 @@
 (defmacro package-lock (package) `(logbitp 0 (package-%bits ,package)))
 
 ;;;; IN-PACKAGE
-(sb-xc:proclaim '(special *package*))
+(proclaim '(special *package*))
 (sb-xc:defmacro in-package (string-designator)
   (let ((string (string string-designator)))
     `(eval-when (:compile-toplevel :load-toplevel :execute)

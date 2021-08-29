@@ -444,13 +444,13 @@
                    (:copier nil)
                    (:conc-name block-)
                    (:predicate block-p))
-    ;; a list of all the blocks that are predecessors/successors of this
-    ;; block. In well-formed IR1, most blocks will have one successor.
-    ;; The only exceptions are:
-    ;;  1. component head blocks (any number)
-    ;;  2. blocks ending in an IF (1 or 2)
-    ;;  3. blocks with DELETE-P set (zero)
-    (pred nil :type list)
+  ;; a list of all the blocks that are predecessors/successors of this
+  ;; block. In well-formed IR1, most blocks will have one successor.
+  ;; The only exceptions are:
+  ;;  1. component head blocks (any number)
+  ;;  2. blocks ending in an IF (1 or 2)
+  ;;  3. blocks with DELETE-P set (zero)
+  (pred nil :type list)
   (succ nil :type list)
   ;; the ctran which heads this block (a :BLOCK-START), or NIL when we
   ;; haven't made the start ctran yet (and in the dummy component head
@@ -691,10 +691,7 @@
   ;; analysis. (For closures this is a list of the enclose node during
   ;; IR1, and a list of the LVAR of the enclose after physical
   ;; environment analysis.)
-  (info nil :type list)
-  ;; Used by propagate-ref-dx to check that the new ref is inside the
-  ;; original let
-  (lexenv nil :type (or null lexenv)))
+  (info nil :type list))
 (defprinter (cleanup :identity t)
   kind
   mess-up
@@ -1445,9 +1442,6 @@
   (private-constraints     nil :type (or null (array t 1)))
   (equality-constraints    nil :type (or null (array t 1)))
 
-  ;; The FOP handle of the lexical variable represented by LAMBDA-VAR
-  ;; in the fopcompiler.
-  (fop-value nil)
   source-form)
 (defprinter (lambda-var :identity t)
   %source-name
@@ -1546,8 +1540,8 @@
 (defstruct (basic-combination (:include valued-node)
                               (:constructor nil)
                               (:copier nil))
-    ;; LVAR for the function
-    (fun (missing-arg) :type lvar)
+  ;; LVAR for the function
+  (fun (missing-arg) :type lvar)
   ;; list of LVARs for the args. In a local call, an argument lvar may
   ;; be replaced with NIL to indicate that the corresponding variable
   ;; is unreferenced, and thus no argument value need be passed.
@@ -1736,6 +1730,28 @@
                     (:copier nil))
   ;; the list of functionals that this ENCLOSE node allocates.
   (funs nil :type list))
+(defprinter (enclose :identity t)
+  funs)
+
+
+;;;; miscellaneous IR1 structures
+
+(defstruct (undefined-warning
+            (:print-object (lambda (x s)
+                             (print-unreadable-object (x s :type t)
+                               (prin1 (undefined-warning-name x) s))))
+            (:copier nil))
+  ;; the name of the unknown thing
+  (name nil :type (or symbol list))
+  ;; the kind of reference to NAME
+  (kind (missing-arg) :type (member :function :type :variable))
+  ;; the number of times this thing was used
+  (count 0 :type unsigned-byte)
+  ;; a list of COMPILER-ERROR-CONTEXT structures describing places
+  ;; where this thing was used. Note that we only record the first
+  ;; *UNDEFINED-WARNING-LIMIT* calls.
+  (warnings () :type list))
+(declaim (freeze-type undefined-warning))
 
 
 ;;; a helper for the POLICY macro, defined late here so that the

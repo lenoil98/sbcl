@@ -134,6 +134,14 @@
                     (tokenize-control-string string))))
           (interpret-directive-list stream tokens orig-args args)))))
 
+
+(!begin-collecting-cold-init-forms)
+(define-load-time-global *format-directive-interpreters* nil)
+(!cold-init-forms
+ (setq *format-directive-interpreters* (make-array 128 :initial-element nil)))
+(declaim (type (simple-vector 128)
+               *format-directive-interpreters*))
+
 (defun interpret-directive-list (stream directives orig-args args)
   (loop
    (unless directives
@@ -178,11 +186,9 @@
                             char)))
         (directive '.directive) ; expose this var to the lambda. it's easiest
         (directives (if lambda-list (car (last lambda-list)) (sb-xc:gensym "DIRECTIVES"))))
-    `(%svset ;; a cold-loadable form
-       *format-directive-interpreters*
-       ;; Using the host's char-upcase should be fine here.
-       ;; (Do we even need to use it? Why not just spell the source code as desired?)
-       ,(sb-xc:char-code (char-upcase char))
+    `(!cold-init-forms
+      (setf
+       (aref *format-directive-interpreters* ,(char-code (char-upcase char)))
        (named-lambda ,defun-name (stream ,directive ,directives orig-args args)
          (declare (ignorable stream orig-args args))
          ,@(if lambda-list
@@ -192,7 +198,7 @@
                                (butlast lambda-list))
                    (values (progn ,@body) args)))
                `((declare (ignore ,directive ,directives))
-                 ,@body))))))
+                 ,@body)))))))
 
 (defmacro def-format-interpreter (char lambda-list &body body)
   (let ((directives (sb-xc:gensym "DIRECTIVES")))
@@ -688,15 +694,17 @@
                      (fmin (if (minusp k) 1 fdig)))
                 (multiple-value-bind (fstr flen lpoint tpoint)
                     (sb-impl::flonum-to-string num spaceleft fdig k fmin)
-                  (when (and d (zerop d)) (setq tpoint nil))
+                  (when (eql fdig 0) (setq tpoint nil))
                   (when w
                     (decf spaceleft flen)
                     (when lpoint
                       (if (or (> spaceleft 0) tpoint)
                           (decf spaceleft)
                           (setq lpoint nil)))
-                    (when (and tpoint (<= spaceleft 0))
-                      (setq tpoint nil)))
+                    (when tpoint
+                      (if (<= spaceleft 0)
+                          (setq tpoint nil)
+                          (decf spaceleft))))
                   (cond ((and w (< spaceleft 0) ovf)
                          ;;significand overflow
                          (dotimes (i w) (write-char ovf stream)))
@@ -707,6 +715,7 @@
                                (if atsign (write-char #\+ stream)))
                            (when lpoint (write-char #\0 stream))
                            (write-string fstr stream)
+                           (when tpoint (write-char #\0 stream))
                            (write-char (if marker
                                            marker
                                            (format-exponent-marker number))
@@ -1231,6 +1240,8 @@
             (:remaining (args (length args)))
             (t (args param)))))
       (apply symbol stream (next-arg) colonp atsignp (args)))))
+
+(!defun-from-collected-cold-init-forms !format-directives-init)
 
 (push '("SB-FORMAT"
         def-format-directive def-complex-format-directive

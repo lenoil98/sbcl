@@ -14,7 +14,6 @@
 #include <stdio.h>
 #include <sys/types.h>
 #include <stdlib.h>
-#include <setjmp.h>
 #include <sys/time.h>
 #ifndef LISP_FEATURE_WIN32
 #include <sys/resource.h>
@@ -93,8 +92,6 @@ static struct cmd {
     {NULL, NULL, NULL}
 };
 
-static jmp_buf curbuf;
-
 static int
 visible(unsigned char c)
 {
@@ -104,6 +101,11 @@ visible(unsigned char c)
         return c;
 }
 
+static boolean valid_widetag_p(unsigned char widetag) {
+    // TODO: ensure that widetag is defined (not "unused") and is for a headered object
+    // (i.e. is not CHARACTER_WIDETAG and not some other things)
+    return other_immediate_lowtag_p(widetag);
+}
 static int NO_SANITIZE_MEMORY
 dump_cmd(char **ptr)
 {
@@ -489,7 +491,7 @@ catchers_cmd(char __attribute__((unused)) **ptr)
                    catch,
                    catch->uwp,
                    catch->cfp,
-#if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)
+#if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64) || defined(LISP_FEATURE_ARM64)
                    component_ptr_from_pc((void*)catch->entry_pc),
 #else
                    catch->code,
@@ -530,14 +532,15 @@ grab_sigs_cmd(char __attribute__((unused)) **ptr)
     return 0;
 }
 
-static void
-sub_monitor(void)
+void
+ldb_monitor(void)
 {
     struct cmd *cmd, *found;
     char buf[256];
     char *line, *ptr, *token;
     int ambig;
 
+    printf("Welcome to LDB, a low-level debugger for the Lisp runtime environment.\n");
     if (!ldb_in) {
 #ifndef LISP_FEATURE_WIN32
         ldb_in = fopen("/dev/tty","r+");
@@ -586,28 +589,6 @@ sub_monitor(void)
             if (done) return;
         }
     }
-}
-
-void
-ldb_monitor()
-{
-    jmp_buf oldbuf;
-
-    memcpy(oldbuf, curbuf, sizeof(oldbuf));
-
-    printf("Welcome to LDB, a low-level debugger for the Lisp runtime environment.\n");
-
-    setjmp(curbuf);
-
-    sub_monitor();
-
-    memcpy(curbuf, oldbuf, sizeof(curbuf));
-}
-
-void
-throw_to_monitor()
-{
-    longjmp(curbuf, 1);
 }
 
 /* what we do when things go badly wrong at a low level */

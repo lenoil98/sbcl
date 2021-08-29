@@ -75,20 +75,20 @@
          #+(and sb-thread win32) (scratch-tn (pop scratch-tns))
          #+(and sb-thread win32) (swap-tn (pop scratch-tns))
          (free-pointer
-           ;; thread->alloc_region.free_pointer
+           ;; thread->boxed_tlab.free_pointer
            (make-ea :dword
                     :base (or #+(and sb-thread win32)
                               scratch-tn)
                     :disp
-                    #+sb-thread (* n-word-bytes thread-alloc-region-slot)
+                    #+sb-thread (* n-word-bytes thread-boxed-tlab-slot)
                     #-sb-thread boxed-region))
          (end-addr
-            ;; thread->alloc_region.end_addr
+            ;; thread->boxed_tlab.end_addr
            (make-ea :dword
                     :base (or #+(and sb-thread win32)
                               scratch-tn)
                     :disp
-                    #+sb-thread (* n-word-bytes (1+ thread-alloc-region-slot))
+                    #+sb-thread (* n-word-bytes (1+ thread-boxed-tlab-slot))
                     #-sb-thread (+ boxed-region n-word-bytes))))
     (unless (and (tn-p size) (location= alloc-tn size))
       (inst mov alloc-tn size))
@@ -180,7 +180,9 @@
 ;;; RESULT-TN.
 (defun alloc-other (result-tn widetag size node &optional stack-allocate-p)
   (pseudo-atomic (:elide-if stack-allocate-p)
-      (allocation nil (pad-data-block size) other-pointer-lowtag
+      (allocation nil (* (pad-data-block size)
+                         #+bignum-assertions (if (eql widetag bignum-widetag) 2 1))
+                  other-pointer-lowtag
                   node stack-allocate-p result-tn)
       (storew (compute-object-header size widetag)
               result-tn 0 other-pointer-lowtag)))
@@ -247,9 +249,7 @@
          (length :scs (any-reg immediate))
          (words :scs (any-reg immediate)))
   (:results (result :scs (descriptor-reg) :from :load))
-  (:arg-types positive-fixnum
-              positive-fixnum
-              positive-fixnum)
+  (:arg-types positive-fixnum positive-fixnum positive-fixnum)
   (:policy :fast-safe)
   (:node-var node)
   (:generator 100
@@ -303,7 +303,6 @@
   (:arg-types positive-fixnum
               positive-fixnum
               positive-fixnum)
-  (:translate allocate-vector)
   (:policy :fast-safe)
   (:generator 100
     (inst lea result (make-ea :byte :base words :disp
@@ -414,7 +413,9 @@
           (aver (null type))
           (inst call (make-fixup dst :assembly-routine)))
         (pseudo-atomic (:elide-if stack-allocate-p)
-         (allocation nil (pad-data-block words) lowtag node stack-allocate-p result)
+         (let ((nbytes (* (pad-data-block words)
+                          #+bignum-assertions (if (eql type bignum-widetag) 2 1))))
+           (allocation nil nbytes lowtag node stack-allocate-p result))
          (when type
            (storew (compute-object-header words type)
                    result
@@ -439,6 +440,7 @@
           (make-ea :dword :base header
                           :disp (+ (ash -2 (length-field-shift type)) type)))
     (inst and bytes (lognot lowtag-mask))
+    #+bignum-assertions (when (eql type bignum-widetag) (inst shl bytes 1)) ; use 2x space
     (pseudo-atomic (:elide-if stack-allocate-p)
      (allocation nil bytes lowtag node stack-allocate-p result)
      (storew header result 0 lowtag))))

@@ -57,7 +57,7 @@
            ;; Features that are also in *FEATURES-POTENTIALLY-AFFECTING-FASL-FORMAT*
            ;; and would probably mess up something if made non-public,
            ;; though I don't think they should all be public.
-           :MSAN
+           :MSAN :UBSAN
            :SB-SAFEPOINT
            :SB-THREAD :SB-UNICODE
            ;; Things which (I think) at least one person has requested be kept around
@@ -176,7 +176,7 @@
   result)
 
 ;;; Check for potentially bad format-control strings
-(defun !scan-format-control-strings ()
+(defun scan-format-control-strings ()
   (labels ((possibly-ungood-package-reference (string)
              ;; We want to see nothing SB-package-like at all
              (or (search "sb-" string :test #'char-equal)
@@ -210,12 +210,6 @@
 Please check that all strings which were not recognizable to the compiler
 (as the first argument to WARN, etc.) are wrapped in SB-FORMAT:TOKENS"))
       wps)))
-
-(progn
-  ;; See the giant comment at the bottom of this file
-  ;; concerning the need for this GC.
-  (gc :full t)
-  (!scan-format-control-strings))
 
 ;;; Either set some more package docstrings, or remove any and all docstrings
 ;;; that snuck in (as can happen with any file compiled in warm load)
@@ -326,9 +320,8 @@ Please check that all strings which were not recognizable to the compiler
   ;; Except that symbols which existed at SBCL build time must be.
   (do-all-symbols (symbol)
     (when (sb-kernel:immobile-space-obj-p symbol)
-      (sb-kernel:set-header-data
-           symbol (logior (sb-kernel:get-header-data symbol)
-                          (ash 1 sb-vm::+initial-core-symbol-bit+)))))
+      (sb-kernel:logior-header-bits
+       symbol (ash 1 sb-vm::+initial-core-symbol-bit+))))
 
   ;; A symbol whose INFO slot underwent any kind of manipulation
   ;; such that it now has neither properties nor globaldb info,
@@ -476,9 +469,7 @@ Please check that all strings which were not recognizable to the compiler
             sum-delta-ext sum-delta-int
             (+ sum-delta-ext sum-delta-int))))
 
-;;; Use historical (stupid) behavior for storing pathname namestrings
-;;; in fasls.
-(setq sb-c::*name-context-file-path-selector* 'truename)
+(scan-format-control-strings)
 
 ;;; Lock internal packages
 #-(and sb-devel

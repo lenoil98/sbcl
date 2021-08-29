@@ -195,7 +195,12 @@ output_space(FILE *file, int id, lispobj *addr, lispobj *end,
     words = end - addr;
     write_lispobj(words, file);
 
-    bytes = words * sizeof(lispobj);
+#ifdef LISP_FEATURE_METASPACE
+    if (id == READ_ONLY_CORE_SPACE_ID)
+        bytes = (READ_ONLY_SPACE_END - READ_ONLY_SPACE_START);
+    else
+#endif
+        bytes = words * sizeof(lispobj);
 
 #ifdef LISP_FEATURE_CHENEYGC
     /* KLUDGE: cheneygc can not restart a saved core if the dynamic space is empty,
@@ -254,7 +259,7 @@ void unwind_binding_stack()
     int i;
     if (!sym || !simple_vector_p(value = ((struct symbol*)sym)->value))
         fprintf(stderr, "warning: bad value in %s\n", symbol_name);
-    else for(i=fixnum_value(VECTOR(value)->length)-1; i>=0; --i)
+    else for(i=vector_len(VECTOR(value))-1; i>=0; --i)
         SYMBOL(VECTOR(value)->data[i])->value = UNBOUND_MARKER_WIDETAG;
     if (verbose) printf("done]\n");
 }

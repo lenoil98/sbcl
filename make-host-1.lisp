@@ -3,7 +3,7 @@
   (let ((*print-pretty* nil)
         (*print-length* nil))
     (dolist (thing '(("SB-XC" "*FEATURES*")
-                     ("SB-COLD" "*SHEBANG-BACKEND-SUBFEATURES*")))
+                     ("SB-COLD" "BACKEND-SUBFEATURES")))
       (let* ((sym (intern (cadr thing) (car thing)))
              (val (symbol-value sym)))
         (when val
@@ -121,7 +121,16 @@
         (setf (gethash input *ucd-inputs*) 'unused))
       (dolist (output outputs)
         (setf (gethash output *ucd-outputs*) 'unmade))
-      (let ((object (compile-file "tools-for-build/ucd.lisp")))
+      (let ((object (apply #'compile-file "tools-for-build/ucd.lisp"
+                           ;; ECL creates its compiled files beside
+                           ;; the truename of a source; that's bad
+                           ;; when we're in a build tree of symlinks.
+                           #+ecl
+                           (list
+                            :output-file
+                            (compile-file-pathname "tools-for-build/ucd.lisp"))
+                           #-ecl
+                           ())))
         (setf (gethash "tools-for-build/ucd.lisp" *ucd-inputs*) 'used)
         (load object :verbose t)
         (delete-file object))

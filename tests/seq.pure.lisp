@@ -546,8 +546,8 @@
 
 (with-test (:name :array-equalp-non-consing
                   :skipped-on :interpreter)
-  (let ((a (make-array 1000 :element-type 'double-float))
-        (b (make-array 1000 :element-type 'double-float)))
+  (let ((a (make-array 1000 :element-type 'double-float :initial-element 0d0))
+        (b (make-array 1000 :element-type 'double-float :initial-element 0d0)))
     (ctu:assert-no-consing (equalp a b))))
 
 (with-test (:name (search :array-equalp-numerics))
@@ -584,3 +584,23 @@
         ;; Try all other numeric array types
         (dolist (y arrays)
           (assert (equalp x y)))))))
+
+;; lp#1938598
+(with-test (:name :vector-replace-self)
+  ;; example 1
+  (let ((string (make-array 0 :adjustable t :fill-pointer 0 :element-type 'character)))
+    (declare (notinline replace))
+    (vector-push-extend #\_ string)
+    ;; also test it indirectly
+    (replace string string :start1 1 :start2 0))
+  ;; example 2
+  (let ((string (make-array 0 :adjustable t :fill-pointer 0 :element-type 'character)))
+    (declare (notinline replace))
+    (loop for char across "tset" do (vector-push-extend char string))
+    (replace string string :start2 1 :start1 2)
+    (assert (string= string "tsse"))))
+
+(with-test (:name :sort-vector-length-1
+                  :skipped-on :interpreter)
+  (let ((v (vector 5)))
+    (ctu:assert-no-consing (stable-sort v #'<))))

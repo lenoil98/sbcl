@@ -1732,8 +1732,27 @@
       (try-coalescing vop-info-temps)
       (try-coalescing vop-info-ref-ordering)
       (try-coalescing vop-info-targets)))
+  ;; vop rdefinition should be allowed, but a dup in the cross-compiler
+  ;; is probably a mistake. REGISTER-VOP-PARSE is the wrong place
+  ;; to check this, because parsing has both compile-time and load-time
+  ;; effects, since inheritance is computed at compile-time.
+  ;; And there are false positives with any DEFINE-VOP in an assembler file
+  ;; because those are processed twice. I don't know what to do.
+  #+nil (when (gethash (vop-info-name vop-info) *backend-template-names*)
+                 (warn "Duplicate vop name: ~s" vop-info))
   (setf (gethash (vop-info-name vop-info) *backend-template-names*)
         vop-info))
+
+(defun undefine-vop (name)
+  (let ((parse (gethash name *backend-parsed-vops*)))
+    (dolist (translate (vop-parse-translate parse))
+      (let ((info (info :function :info translate)))
+        (setf (fun-info-templates info)
+              (delete name (fun-info-templates info)
+                      :key #'vop-info-name))
+        (format t "~&~s has ~d templates~%" translate (length (fun-info-templates info)))))
+    (remhash name *backend-parsed-vops*)
+    (remhash name *backend-template-names*)))
 
 ;;;; emission macros
 

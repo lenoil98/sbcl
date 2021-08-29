@@ -60,8 +60,8 @@
 
 (compute-standard-slot-locations)
 (dolist (s '(condition function structure-object))
-  (dohash ((k wrapper) (classoid-subclasses (find-classoid s)))
-    (declare (ignore wrapper))
+  (sb-kernel::do-subclassoids ((k v) (find-classoid s))
+    (declare (ignore v))
     (find-class (classoid-name k))))
 (setq **boot-state** 'complete)
 
@@ -123,7 +123,7 @@
 
 (flet ((set-predicate (classoid-name pred)
          (let ((c (find-classoid classoid-name)))
-           (setf (%instance-ref c (get-dsd-index built-in-classoid predicate))
+           (%instance-set c (get-dsd-index built-in-classoid predicate)
                  pred))))
   (set-predicate 't #'constantly-t)
   (set-predicate 'random-class #'constantly-nil)

@@ -130,7 +130,7 @@
 
 (defglobal *editcore-ppd*
   ;; copy no entries for macros/special-operators (flet, etc)
-  (let ((ppd (sb-pretty::make-pprint-dispatch-table nil nil nil)))
+  (let ((ppd (sb-pretty::make-pprint-dispatch-table #() nil nil)))
     (set-pprint-dispatch 'string
                          ;; Write strings without string quotes
                          (lambda (stream string) (write-string string stream))
@@ -472,7 +472,8 @@
            :linkage-bounds linkage-bounds
            :linkage-entry-size linkage-entry-size
            :linkage-symbols linkage-symbols
-           :linkage-symbol-usedp (make-array (length linkage-symbols) :element-type 'bit)
+           :linkage-symbol-usedp (make-array (length linkage-symbols) :element-type 'bit
+                                             :initial-element 0)
            :enable-pie enable-pie)))
     (let ((package-table
            (symbol-global-value
@@ -1253,7 +1254,7 @@
     (addend (signed 64))))
 
 (defun make-elf64-sym (name info)
-  (let ((a (make-array 24 :element-type '(unsigned-byte 8))))
+  (let ((a (make-array 24 :element-type '(unsigned-byte 8) :initial-element 0)))
     (with-pinned-objects (a)
       (setf (sap-ref-32 (vector-sap a) 0) name
             (sap-ref-8 (vector-sap a) 4) info))
@@ -1527,8 +1528,8 @@
              (return-from scan-obj))
            (case widetag
              (#.instance-widetag
-              (let ((layout (truly-the layout (translate (%instance-layout obj) spaces))))
-                (do-instance-tagged-slot (i obj :layout layout)
+              (let ((type (translate (%instance-layout obj) spaces)))
+                (do-instance-tagged-slot (i obj t type)
                   (scanptr vaddr obj (1+ i))))
               (return-from scan-obj))
              (#.simple-vector-widetag
@@ -1562,10 +1563,10 @@
                              (+ core-offs n-word-bytes)
                              word)))
               (when (eq widetag funcallable-instance-widetag)
-                (let* ((layout (truly-the layout (translate (%fun-layout obj) spaces)))
+                (let* ((layout (truly-the sb-vm:layout (translate (%fun-layout obj) spaces)))
                        (bitmap (%raw-instance-ref/signed-word
-                                layout (sb-kernel::type-dd-length sb-kernel:layout))))
-                  (unless (= (sb-kernel:layout-bitmap-words layout) 1)
+                                layout (sb-kernel::type-dd-length sb-vm:layout))))
+                  (unless (= (sb-kernel:bitmap-nwords layout) 1)
                     (error "Strange funcallable-instance bitmap"))
                   (unless (eql bitmap sb-kernel:+layout-all-tagged+)
                       ;; tagged slots precede untagged slots,

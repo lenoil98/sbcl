@@ -69,10 +69,8 @@
   (:temporary (:sc unsigned-reg) this-id)
   (:generator 4
     (let ((test-id (layout-id test-layout))
-          (offset (+ (ash (+ (get-dsd-index layout sb-kernel::id-word0)
-                             instance-slots-offset)
-                          word-shift)
-                     (ash (- (layout-depthoid test-layout) 2) 2)
+          (offset (+ (id-bits-offset)
+                     (ash (- (wrapper-depthoid test-layout) 2) 2)
                      (- instance-pointer-lowtag))))
       (inst ldr this-id (@ x offset))
       ;; 8-bit IDs are permanently assigned, so no fixup ever needed for those.
@@ -94,8 +92,8 @@
   (:generator 6
     (load-type result object (- other-pointer-lowtag))))
 
-(define-vop (fun-subtype)
-  (:translate fun-subtype)
+(define-vop ()
+  (:translate %fun-pointer-widetag)
   (:policy :fast-safe)
   (:args (function :scs (descriptor-reg)))
   (:results (result :scs (unsigned-reg)))
@@ -116,10 +114,9 @@
 (define-vop (set-header-data)
   (:translate set-header-data)
   (:policy :fast-safe)
-  (:args (x :scs (descriptor-reg) :target res)
+  (:args (x :scs (descriptor-reg))
          (data :scs (any-reg immediate)))
   (:arg-types * positive-fixnum)
-  (:results (res :scs (descriptor-reg)))
   (:temporary (:scs (non-descriptor-reg)) t1)
   (:generator 6
     (load-type t1 x (- other-pointer-lowtag))
@@ -132,8 +129,7 @@
        ;; See SYS:SRC;COMPILER;ARM;MOVE.LISP for a partial fix...  And
        ;; maybe it should be promoted to an instruction-macro?
        (inst orr t1 t1 (ash (tn-value data) n-widetag-bits))))
-    (storew t1 x 0 other-pointer-lowtag)
-    (move res x)))
+    (storew t1 x 0 other-pointer-lowtag)))
 
 
 (define-vop (pointer-hash)

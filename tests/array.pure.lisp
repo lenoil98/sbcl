@@ -17,7 +17,8 @@
   (let ((testcases '(;; Bug 126, confusion between high-level default string
                      ;; initial element #\SPACE and low-level default array
                      ;; element #\NULL, is gone.
-                     (#\null (make-array 11 :element-type 'character) simple-string)
+                     (#\null (make-array 11 :element-type 'character :initial-element #\null)
+                             simple-string)
                      (#\space (make-string 11 :initial-element #\space) string)
                      (#\* (make-string 11 :initial-element #\*))
                      (#\null (make-string 11))
@@ -25,10 +26,11 @@
                      (#\x (make-string 11 :initial-element #\x))
                      ;; And the other tweaks made when fixing bug 126 didn't
                      ;; mess things up too badly either.
-                     (0 (make-array 11) simple-vector)
+                     (0 (make-array 11 :initial-element 0) simple-vector)
                      (nil (make-array 11 :initial-element nil))
                      (12 (make-array 11 :initial-element 12))
-                     (0 (make-array 11 :element-type '(unsigned-byte 4)) (simple-array (unsigned-byte 4) (*)))
+                     (0 (make-array 11 :element-type '(unsigned-byte 4) :initial-element 0)
+                        (simple-array (unsigned-byte 4) (*)))
                      (12 (make-array 11
                           :element-type '(unsigned-byte 4)
                           :initial-element 12)))))
@@ -231,9 +233,11 @@
     (() 4 :test (lambda (values expected)
                   (= (length (first values)) (first expected))))))
 
+;;; I have no idea how this is testing adjust-array with an initial-element !
 (with-test (:name (make-array adjust-array :initial-element))
   (let ((x (make-array nil :initial-element 'foo)))
-    (adjust-array x nil)
+    ;; make the result look used
+    (opaque-identity (adjust-array x nil))
     (assert (eql (aref x) 'foo))))
 
 ;;; BUG 315: "no bounds check for access to displaced array"
@@ -301,13 +305,14 @@
               (handler-case
                   (let ((array (make-array 12)))
                     (assert (not (array-has-fill-pointer-p array)))
-                    (adjust-array array 12 :fill-pointer t)
+                    ;; make the result look used
+                    (opaque-identity (adjust-array array 12 :fill-pointer t))
                     array)
                 (type-error ()
                   :good)))))
 
 (with-test (:name (adjust-array :multidimensional))
-  (let ((ary (make-array '(2 2))))
+  (let ((ary (make-array '(2 2) :initial-element 0)))
     ;; SBCL used to give multidimensional arrays a bogus fill-pointer
     (assert (not (array-has-fill-pointer-p (adjust-array ary '(2 2)))))))
 
@@ -411,7 +416,10 @@
     (test 'inline)
     (test 'notinline)))
 
-(with-test (:name (make-array :size-overflow))
+(with-test (:name (make-array :size-overflow)
+                  ;; size limit is small enough that this fails by not failing
+                  ;; in the expected way
+                  :skipped-on :ubsan)
   ;; 1-bit fixnum tags make array limits overflow the word length
   ;; when converted to bytes
   (when (= sb-vm:n-fixnum-tag-bits 1)
@@ -458,7 +466,7 @@
     (() #(4 5 6) :test #'equalp)))
 
 (with-test (:name (adjust-array :fill-pointer))
-  (let ((array (make-array 10 :fill-pointer t)))
+  (let ((array (make-array 10 :fill-pointer t :initial-element 0)))
     (assert (= (fill-pointer (adjust-array array 5 :fill-pointer 2))
                2))))
 
@@ -590,7 +598,7 @@
   (checked-compile-and-assert
       ()
       '(lambda (type)
-        (make-array 1 :element-type type))
+        (make-array 1 :element-type type :initial-element 0))
     (('(or (eql -16) unsigned-byte)) #(0) :test #'equalp)))
 
 (with-test (:name :check-bound-signed-bound-notes
@@ -651,3 +659,14 @@
         (declare (vector a))
         (map-into a #'identity a)))
    ((0) #() :test #'equalp)))
+
+(with-test (:name :displaced-index-offset-disallow-nil)
+  (assert-error (eval '(make-array 4 :displaced-index-offset nil))))
+
+(with-test (:name :adjust-array-copies-above-fill-pointer)
+  (let ((a (make-array 4 :fill-pointer 2 :initial-contents '(a b c d))))
+    (let ((b (adjust-array a 6 :initial-element 'e)))
+      (assert (eq (aref b 2) 'c))
+      (assert (eq (aref b 3) 'd))
+      (assert (eq (aref b 4) 'e))
+      (assert (eq (aref b 5) 'e)))))

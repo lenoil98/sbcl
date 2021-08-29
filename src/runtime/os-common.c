@@ -23,7 +23,6 @@
 #include "genesis/symbol.h"
 #include "genesis/static-symbols.h"
 #include "thread.h"
-#include "sbcl.h"
 #include "os.h"
 #include "arch.h"
 #include "interr.h"
@@ -82,43 +81,15 @@ os_zero(os_vm_address_t addr, os_vm_size_t length)
 }
 #endif
 
+#include "sys_mmap.inc"
 #ifdef LISP_FEATURE_USE_SYS_MMAP
-///
-///                **********************************
-///                *  GC MUST NOT ACQUIRE ANY LOCKS *
-///                **********************************
-///
-/// It's normally fine to use the mmap() system call to obtain memory for the
-/// hopscotch tables, unless your C runtime intercepts mmap() and causes it
-/// to sometimes (or always?) need a spinlock. That lock may be owned already,
-/// so GC will patiently wait forever; meanwhile the lock owner is also
-/// waiting forever on GC to finish.
-/// So bypass the C library routine and call the OS directly
-/// in case of a non-signal-safe interceptor such as
-///   https://chromium.googlesource.com/chromium/src/third_party/tcmalloc/chromium/+/refs/heads/master/src/malloc_hook_mmap_linux.h#146
-///
-static inline void* sys_mmap(void* addr, size_t length, int prot, int flags,
-                             int fd, off_t offset) {
-    // "linux-os.h" brings in <syscall.h>, others may need something different.
-    // mmap2 allows large file access with 32-bit off_t. We don't care about that,
-    // but _usually_ only one or the other of the syscalls exists depending on,
-    // various factors. Basing it on word size will pick the right one.
-#ifdef LISP_FEATURE_64_BIT
-    return (void*)syscall(SYS_mmap, addr, length, prot, flags, fd, offset);
-#else
-    return (void*)syscall(SYS_mmap2, addr, length, prot, flags, fd, offset);
-#endif
-}
-static inline int sys_munmap(void* addr, size_t length) {
-    return syscall(__NR_munmap, addr, length);
-}
 os_vm_address_t os_allocate(os_vm_size_t len) {
-    void* answer = sys_mmap(0, len, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, 0, 0);
+    void* answer = sbcl_mmap(0, len, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, 0, 0);
     if (answer == MAP_FAILED) return 0;
     return answer;
 }
 void os_deallocate(os_vm_address_t addr, os_vm_size_t len) {
-    sys_munmap(addr, len);
+    sbcl_munmap(addr, len);
 }
 #else
 os_vm_address_t
@@ -209,7 +180,7 @@ void os_link_runtime()
         return; // Linkage was already performed by coreparse
 
     struct vector* symbols = VECTOR(SymbolValue(REQUIRED_FOREIGN_SYMBOLS,0));
-    lisp_linkage_table_n_prelinked = fixnum_value(symbols->length);
+    lisp_linkage_table_n_prelinked = vector_len(symbols);
     for (j = 0 ; j < lisp_linkage_table_n_prelinked ; ++j)
     {
         lispobj item = symbols->data[j];
@@ -264,7 +235,16 @@ void* load_core_bytes(int fd, os_vm_offset_t offset, os_vm_address_t addr, os_vm
 {
     int fail = 0;
     os_vm_address_t actual;
+#ifdef LISP_FEATURE_64_BIT
+    actual = sbcl_mmap(addr, len,
+#else
+    /* FIXME: why does using sbcl_mmap cause failure here? I would guess that it can't
+     * pass 'offset' correctly if LARGEFILE is mandatory, which it isn't on 64-bit.
+     * Deadlock should be impossible this early in core loading, I suppose, hence
+     * on one hand I don't care; but on the other, it would be nice to not to see
+     * any use of a potentially hooked mmap() API within this file. */
     actual = mmap(addr, len,
+#endif
                   // If mapping to a random address, then the assumption is
                   // that we're not going to execute the core; nor should we write to it.
                   // However, the addr=0 case is for 'editcore' which unfortunately _does_
@@ -296,10 +276,11 @@ void* load_core_bytes_jit(int fd, os_vm_offset_t offset, os_vm_address_t addr, o
 
     lseek(fd, offset, SEEK_SET);
 
-    char* buf = malloc(65536);
+    size_t n_bytes = 65536;
+    char* buf = malloc(n_bytes);
 
     while (len) {
-        count = read(fd, buf, len);
+        count = read(fd, buf, n_bytes);
 
         if (count <= -1) {
             perror("read");

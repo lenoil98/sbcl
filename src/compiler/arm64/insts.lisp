@@ -117,6 +117,7 @@
   (define-arg-type cond :printer #'print-cond)
 
   (define-arg-type ldr-str-annotation :printer #'annotate-ldr-str-imm)
+  (define-arg-type ldr-str-pair-annotation :printer #'annotate-ldr-str-pair)
 
   (define-arg-type ldr-str-reg-annotation :printer #'annotate-ldr-str-reg)
   (define-arg-type ldr-literal-annotation :printer #'annotate-ldr-literal :sign-extend t)
@@ -165,24 +166,18 @@
      (integer
       (emit-dword segment word)))))
 
-(defun emit-header-data (segment type)
-  (emit-back-patch segment
-                   8
-                   (lambda (segment posn)
-                     (emit-dword segment
-                                 (logior type
-                                         (ash (+ posn
-                                                 (component-header-length))
-                                              (- n-widetag-bits
-                                                 word-shift)))))))
-
 (define-instruction simple-fun-header-word (segment)
   (:emitter
-   (emit-header-data segment simple-fun-widetag)))
+   (emit-back-patch segment
+                    8
+                    (lambda (segment posn)
+                      (emit-dword segment
+                                  (logior simple-fun-widetag
+                                          (ash (+ posn
+                                                  (component-header-length))
+                                               (- n-widetag-bits
+                                                  word-shift))))))))
 
-(define-instruction lra-header-word (segment)
-  (:emitter
-   (emit-header-data segment return-pc-widetag)))
 
 ;;;; Addressing mode 1 support
 
@@ -508,6 +503,10 @@
 
 (def-add-sub add #b00
   (:printer add-sub-imm ((op #b00)))
+  (:printer add-sub-imm ((op #b00) (rd #.nsp-offset) (imm 0))
+            '('mov :tab rd ", " rn))
+  (:printer add-sub-imm ((op #b00) (rn #.nsp-offset) (imm 0))
+            '('mov :tab rd ", " rn))
   (:printer add-sub-ext-reg ((op #b00)))
   (:printer add-sub-shift-reg ((op #b00))))
 
@@ -979,7 +978,14 @@
   (:printer move-wide ((op #b10)))
   (:emitter
    (aver (not (ldb-test (byte 4 0) shift)))
-   (emit-move-wide segment +64-bit-size+ #b10 (/ shift 16) imm (tn-offset rd))))
+   (emit-move-wide segment +64-bit-size+ #b10 (/ shift 16)
+                   (cond ((and (fixup-p imm)
+                               (eq (fixup-flavor imm) :symbol-tls-index))
+                          (note-fixup segment :move-wide imm)
+                          0)
+                         (t
+                          imm))
+                   (tn-offset rd))))
 
 (define-instruction movk (segment rd imm &optional (shift 0))
   (:printer move-wide ((op #b11)))
@@ -1321,14 +1327,21 @@
                             size)
                     size))
          (dst (tn-offset dst)))
-    (cond ((and (typep offset 'unsigned-byte)
-                (not (ldb-test (byte scale 0) offset))
-                (typep (ash offset (- scale)) '(unsigned-byte 12))
+    (cond ((and (or
+                 (and (fixup-p offset)
+                      (eq (fixup-flavor offset) :symbol-tls-index))
+                 (and (typep offset 'unsigned-byte)
+                      (not (ldb-test (byte scale 0) offset))
+                      (typep (ash offset (- scale)) '(unsigned-byte 12))))
                 (register-p base)
                 (eq mode :offset))
            (emit-ldr-str-unsigned-imm segment size
                                       v opc
-                                      (ash offset (- scale))
+                                      (cond ((fixup-p offset)
+                                             (note-fixup segment :ldr-str offset)
+                                             0)
+                                            (t
+                                             (ash offset (- scale))))
                                       (tn-offset base)
                                       dst))
           ((and (eq mode :offset)
@@ -1429,7 +1442,7 @@
 
 (define-instruction-format
     (ldr-str-pair 32
-     :default-printer '(:name :tab rt ", " rt2 ", [" rn pair-imm-writeback)
+     :default-printer '(:name :tab rt ", " rt2 ", [" rn pair-imm-writeback ldr-str-annotation)
      :include ldr-str)
   (size :field (byte 2 30))
   (op2 :value #b101)
@@ -1439,7 +1452,8 @@
   (pair-imm-writeback :fields (list (byte 2 23) (byte 2 30) (byte 7 15) (byte 1 26))
                       :type 'pair-imm-writeback)
   (rt2 :fields (list (byte 2 30) (byte 5 10)) :type 'reg-float-reg)
-  (rt :fields (list (byte 2 30) (byte 5 0))))
+  (rt :fields (list (byte 2 30) (byte 5 0)))
+  (ldr-str-annotation :fields (list (byte 5 5) (byte 7 15)) :type 'ldr-str-pair-annotation))
 
 (defun ldp-stp-offset-p (offset size)
   (multiple-value-bind (quot rem) (truncate offset (ecase size
@@ -1745,7 +1759,7 @@
                (not label))
           (note-fixup segment :uncond-branch cond-or-label)
           (emit-uncond-branch segment 0 0))
-         ((and (fixup-p label))
+         ((fixup-p label)
           (note-fixup segment :cond-branch cond-or-label)
           (emit-cond-branch segment 0 (conditional-opcode cond-or-label)))
          (t
@@ -1766,7 +1780,7 @@
 (define-instruction bl (segment label)
   (:printer uncond-branch ((op 1)))
   (:emitter
-   (ecase label
+   (etypecase label
      (fixup
       (note-fixup segment :uncond-branch label)
       (emit-uncond-branch segment 1 0))
@@ -1893,9 +1907,77 @@
                                             (ldb (byte 5 0) bit)
                                             (ash (- (label-position label) posn) -2)
                                             (tn-offset rt))))))
+
+(define-instruction tbnz* (segment rt bit label)
+  (:emitter
+   (aver (label-p label))
+   (check-type bit (integer 0 63))
+   (labels ((compute-delta (position &optional magic-value)
+              (- (label-position label
+                                 (when magic-value position)
+                                 magic-value)
+                 position))
+            (multi-instruction-emitter (segment position)
+              (declare (ignore position))
+              (assemble (segment)
+                (inst tst rt (ash 1 bit))
+                (inst b :ne label)))
+            (one-instruction-emitter (segment posn)
+              (emit-test-branch-imm segment
+                                    (ldb (byte 1 5) bit)
+                                    1
+                                    (ldb (byte 5 0) bit)
+                                    (ash (- (label-position label) posn) -2)
+                                    (tn-offset rt)))
+            (multi-instruction-maybe-shrink (segment chooser posn magic-value)
+              (declare (ignore chooser))
+              (let ((delta (compute-delta posn magic-value)))
+                (when (typep delta '(signed-byte 14))
+                  (emit-back-patch segment 4
+                                   #'one-instruction-emitter)
+                  t))))
+     (emit-chooser
+      segment 8 2
+      #'multi-instruction-maybe-shrink
+      #'multi-instruction-emitter))))
+
+(define-instruction tbz* (segment rt bit label)
+  (:emitter
+   (aver (label-p label))
+   (check-type bit (integer 0 63))
+   (labels ((compute-delta (position &optional magic-value)
+              (- (label-position label
+                                 (when magic-value position)
+                                 magic-value)
+                 position))
+            (multi-instruction-emitter (segment position)
+              (declare (ignore position))
+              (assemble (segment)
+                (inst tst rt (ash 1 bit))
+                (inst b :eq label)))
+            (one-instruction-emitter (segment posn)
+              (emit-test-branch-imm segment
+                                    (ldb (byte 1 5) bit)
+                                    0
+                                    (ldb (byte 5 0) bit)
+                                    (ash (- (label-position label) posn) -2)
+                                    (tn-offset rt)))
+            (multi-instruction-maybe-shrink (segment chooser posn magic-value)
+              (declare (ignore chooser))
+              (let ((delta (compute-delta posn magic-value)))
+                (when (typep delta '(signed-byte 14))
+                  (emit-back-patch segment 4
+                                   #'one-instruction-emitter)
+                  t))))
+     (emit-chooser
+      segment 8 2
+      #'multi-instruction-maybe-shrink
+      #'multi-instruction-emitter))))
+
+
 ;;;
 (def-emitter exception
-  (#b11010100 8 24)
+    (#b11010100 8 24)
   (opc 3 21)
   (imm 16 5)
   (#b000 3 2)
@@ -2384,70 +2466,6 @@
                                     #b111)
                                 (tn-offset rn) (tn-offset rd)))))))
 
-;;;; Boxed-object computation instructions (for LRA and CODE)
-
-;;; Compute the address of a CODE object by parsing the header of a
-;;; nearby LRA or SIMPLE-FUN.
-
-(defun emit-compute (segment vop dest lip compute-delta)
-  (labels ((multi-instruction-emitter (segment position)
-             (let* ((delta (funcall compute-delta position))
-                    (negative (minusp delta))
-                    (delta (abs delta))
-                    (low (* (if negative -1 1)
-                            (ldb (byte 19 0) delta)))
-                    (high (ldb (byte 16 19) delta)))
-               ;; ADR
-               (emit-pc-relative segment 0
-                                 (ldb (byte 2 0) low)
-                                 (ldb (byte 19 2) low)
-                                 (tn-offset lip))
-               (assemble (segment vop)
-                 (inst movz dest high 16)
-                 (if negative
-                     (inst sub dest lip (lsl dest 3))
-                     (inst add dest lip (lsl dest 3))))))
-           (one-instruction-emitter (segment position)
-             (let ((delta (funcall compute-delta position)))
-               ;; ADR
-               (emit-pc-relative segment 0
-                                 (ldb (byte 2 0) delta)
-                                 (ldb (byte 19 2) delta)
-                                 (tn-offset dest))))
-           (multi-instruction-maybe-shrink (segment chooser posn magic-value)
-             (declare (ignore chooser))
-             (when (typep (funcall compute-delta posn magic-value)
-                          '(signed-byte 21))
-               (emit-back-patch segment 4
-                                #'one-instruction-emitter)
-               t)))
-    (emit-chooser
-     segment 12 2
-     #'multi-instruction-maybe-shrink
-     #'multi-instruction-emitter)))
-
-(define-instruction compute-code (segment code lip object-label)
-  (:vop-var vop)
-  (:declare (ignore object-label))
-  (:emitter
-   (emit-compute segment vop code lip
-                 (lambda (position &optional magic-value)
-                   (declare (ignore magic-value))
-                   (- other-pointer-lowtag
-                      position
-                      (component-header-length))))))
-
-(define-instruction compute-lra (segment dest lip lra-label)
-  (:vop-var vop)
-  (:emitter
-   (emit-compute segment vop dest lip
-                 (lambda (position &optional magic-value)
-                   (- (+ (label-position lra-label
-                                         (when magic-value position)
-                                         magic-value)
-                         other-pointer-lowtag)
-                      position)))))
-
 (define-instruction load-from-label (segment dest label &optional lip)
   (:vop-var vop)
   (:emitter
@@ -2493,9 +2511,56 @@
           #'multi-instruction-emitter)
          (emit-back-patch segment 4 #'one-instruction-emitter)))))
 
+(define-instruction load-constant (segment dest index &optional lip)
+  (:vop-var vop)
+  (:emitter
+   (labels ((compute-delta (position &optional magic-value)
+              (+ (- (label-position (segment-origin segment)
+                                    (when magic-value position)
+                                    magic-value)
+                    (component-header-length)
+                    position)
+                 index))
+            (multi-instruction-emitter (segment position)
+              (let* ((delta (compute-delta position))
+                     (negative (minusp delta))
+                     (low (ldb (byte 19 0) delta))
+                     (high (ldb (byte 16 19) delta)))
+                ;; ADR
+                (emit-pc-relative segment 0
+                                  (ldb (byte 2 0) low)
+                                  (ldb (byte 19 2) low)
+                                  (tn-offset lip))
+                (assemble (segment vop)
+                  (inst movz dest high 16)
+                  (inst ldr dest (@ lip (extend dest (if negative
+                                                         :sxtw
+                                                         :lsl)
+                                                3))))))
+            (one-instruction-emitter (segment position)
+              (emit-ldr-literal segment
+                                #b01
+                                0
+                                (ldb (byte 19 0)
+                                     (ash (compute-delta position) -2))
+                                (tn-offset dest)))
+            (multi-instruction-maybe-shrink (segment chooser posn magic-value)
+              (declare (ignore chooser))
+              (let ((delta (compute-delta posn magic-value)))
+                (when (typep delta '(signed-byte 21))
+                  (emit-back-patch segment 4
+                                   #'one-instruction-emitter)
+                  t))))
+     (if lip
+         (emit-chooser
+          segment 12 2
+          #'multi-instruction-maybe-shrink
+          #'multi-instruction-emitter)
+         (emit-back-patch segment 4 #'one-instruction-emitter)))))
+
 ;;; SIMD
 (def-emitter simd-three-diff
-  (#b0 1 31)
+    (#b0 1 31)
   (q 1 30)
   (u 1 29)
   (#b01110 5 24)
@@ -2870,13 +2935,25 @@
              (ash (- value (+ (sap-int sap) offset)) -2)))
       (:uncond-branch
        (setf (ldb (byte 26 0) (sb-vm::sap-ref-32-jit sap offset))
-             (ash (- value (+ (sap-int sap) offset)) -2)))))
+             (ash (- value (+ (sap-int sap) offset)) -2)))
+      (:ldr-str
+       (setf (ldb (byte 12 10) (sb-vm::sap-ref-32-jit sap offset))
+             (ash (the (unsigned-byte #.(+ 12 word-shift)) value)
+                  (- word-shift))))
+      (:move-wide
+       (setf (ldb (byte 16 5) (sb-vm::sap-ref-32-jit sap offset))
+             (the (unsigned-byte 16) value)))))
   nil)
 
-(define-instruction store-coverage-mark (segment path-index temp #+darwin-jit vector)
+;;; Even though non darwin-jit arm64 targets can store directly in the
+;;; code object, having two codepaths is cumbersome and, now that
+;;; there's no reg-code, STRB needs to load a literal first, which
+;;; isn't clearly a win compared to using a vector.
+(define-instruction store-coverage-mark (segment path-index temp vector)
   (:emitter
    ;; No backpatch is needed to compute the offset into the code header
    ;; because COMPONENT-HEADER-LENGTH is known at this point.
+   segment path-index temp vector
    (flet ((encode-index (offset &optional word)
             (cond
               ((if word
@@ -2892,28 +2969,69 @@
                temp)
               (t
                (error "Bad offset ~a" offset)))))
-    #-darwin-jit
-    (let* ((offset (+ (component-header-length)
-                      n-word-bytes      ; skip over jump table word
-                      path-index
-                      (- other-pointer-lowtag)))
-           (addr
-             (@ sb-vm::code-tn (encode-index offset))))
-      (inst* segment 'strb sb-vm::null-tn addr))
-    #+darwin-jit
-    (let* ((vector-offset (-
-                           (* n-word-bytes
+     (let* ((vector-offset (* n-word-bytes
                               (- (length (ir2-component-constants
                                           (component-info *component-being-compiled*)))
-                                 2))
-                           other-pointer-lowtag))
-           (vector-addr
-             (@ sb-vm::code-tn
-                (encode-index vector-offset t)))
-           (offset (+ (* sb-vm:vector-data-offset n-word-bytes)
-                      path-index
-                      (- other-pointer-lowtag)))
-           (addr
-             (@ vector (encode-index offset))))
-      (inst* segment 'ldr vector vector-addr)
-      (inst* segment 'strb sb-vm::null-tn addr)))))
+                                 2)))
+            (offset (+ (* sb-vm:vector-data-offset n-word-bytes)
+                       path-index
+                       (- other-pointer-lowtag)))
+            (addr
+              (@ vector (encode-index offset))))
+       (inst* segment 'load-constant vector vector-offset)
+       (inst* segment 'strb sb-vm::null-tn addr)))))
+
+(defun conditional-branch-p (stmt)
+  (and (eq (stmt-mnemonic stmt) 'b)
+       (= (length (stmt-operands stmt)) 2)))
+
+(defpattern "cmp 0 + branch" ((subs) (b)) (stmt next)
+  (let ((next-next (stmt-next next)))
+    (when (and (not (stmt-labels next))
+               next-next
+               (not (conditional-branch-p next-next)))
+      (destructuring-bind (target value cmp) (stmt-operands stmt)
+        (when (and (eql cmp 0)
+                   (eq target zr-tn))
+          (destructuring-bind (flag label) (stmt-operands next)
+            (when (case flag
+                    (:eq
+                     (setf (stmt-mnemonic stmt) 'cbz
+                           (stmt-operands stmt)
+                           (list value label)))
+                    (:ne
+                     (setf (stmt-mnemonic stmt) 'cbnz
+                           (stmt-operands stmt)
+                           (list value label)))
+                    (:ge
+                     (setf (stmt-mnemonic stmt) 'tbz*
+                           (stmt-operands stmt)
+                           (list value (1- n-word-bits) label)))
+                    (:lt
+                     (setf (stmt-mnemonic stmt) 'tbnz*
+                           (stmt-operands stmt)
+                           (list value (1- n-word-bits) label))))
+              (delete-stmt next)
+              next-next)))))))
+
+(defpattern "tst one bit + branch" ((ands) (b)) (stmt next)
+  (let ((next-next (stmt-next next)))
+    (when (and (not (stmt-labels next))
+               next-next
+               (not (conditional-branch-p next-next)))
+      (destructuring-bind (target value mask) (stmt-operands stmt)
+        (when (and (integerp mask)
+                   (= (logcount (ldb (byte n-word-bits 0) mask)) 1)
+                   (eq target zr-tn))
+          (destructuring-bind (flag label) (stmt-operands next)
+            (when (case flag
+                    (:eq
+                     (setf (stmt-mnemonic stmt) 'tbz
+                           (stmt-operands stmt)
+                           (list value (1- (integer-length mask)) label)))
+                    (:ne
+                     (setf (stmt-mnemonic stmt) 'tbnz
+                           (stmt-operands stmt)
+                           (list value (1- (integer-length mask)) label))))
+              (delete-stmt next)
+              next-next)))))))

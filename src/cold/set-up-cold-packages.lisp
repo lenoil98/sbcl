@@ -272,6 +272,8 @@
 
     ;; The cross-compiler itself shouldn't really need to use the host
     ;; versions of these in target code except in exceptional cases.
+    "CHAR-CODE"
+    "CODE-CHAR"
     "COMPILE-FILE"
     "COMPILE-FILE-PATHNAME"
     "*COMPILE-FILE-PATHNAME*"
@@ -285,7 +287,9 @@
     "LISP-IMPLEMENTATION-TYPE" "LISP-IMPLEMENTATION-VERSION"
     "MACRO-FUNCTION"
     "MACROEXPAND" "MACROEXPAND-1" "*MACROEXPAND-HOOK*"
+    "MAKE-LOAD-FORM"
     "MAKE-LOAD-FORM-SAVING-SLOTS"
+    "PROCLAIM"
     "SPECIAL-OPERATOR-P"
     "SUBTYPEP"
     "UPGRADED-ARRAY-ELEMENT-TYPE"
@@ -345,21 +349,17 @@
 ;; compilation of the target.
 ;;
 (let ((package-name "SB-XC"))
-  (dolist (name (append (append *undefineds* *dual-personality-math-symbols*)))
+  (dolist (name (append *undefineds* *dual-personality-math-symbols*))
     (export (intern name package-name) package-name))
   (dolist (name '("*READ-DEFAULT-FLOAT-FORMAT*"
                   "ARRAY-ELEMENT-TYPE"
-                  "CHAR-CODE"
-                  "CODE-CHAR"
                   "DEFMACRO" "DEFSTRUCT" "DEFTYPE"
                   "GENSYM"
                   "MAKE-ARRAY"
-                  "MAKE-LOAD-FORM"
-                  "PROCLAIM"
                   "SIMPLE-VECTOR"
                   "TYPEP"
                   ))
-      (export (intern name package-name) package-name)))
+    (export (intern name package-name) package-name)))
 
 (defun count-symbols (pkg)
   (let ((n 0))
@@ -378,7 +378,7 @@
            (import x cl-model-package)
            (export x cl-model-package)))
     (reexport (list nil))
-    (dolist (string (read-from-file "common-lisp-exports.lisp-expr"))
+    (dolist (string (read-from-file "^common-lisp-exports.lisp-expr"))
       (unless (string= string "NIL") ; already done
         (cond ((member string *undefineds* :test #'string=)
                (new-external string cl-model-package))
@@ -482,7 +482,7 @@
 (export '*undefined-fun-allowlist*)
 (defvar *undefined-fun-allowlist* (make-hash-table :test 'equal))
 (let ((list
-       (with-open-file (data (prepend-genfile-path "package-data-list.lisp-expr"))
+       (with-open-file (data (find-bootstrap-file "^package-data-list.lisp-expr"))
          ;; There's no need to use the precautionary READ-FROM-FILE function
          ;; with package-data-list because it is not a customization file.
          (create-target-packages (let ((*readtable* *xc-readtable*)) (read data)))
@@ -515,7 +515,7 @@
 
 (defun package-list-for-genesis ()
   (append (let ((*readtable* *xc-readtable*))
-            (read-from-file "package-data-list.lisp-expr" nil))
+            (read-from-file "^package-data-list.lisp-expr" nil))
           (let ((asm-package (backend-asm-package-name)))
             (list (make-package-data :name asm-package
                                      :use (list* "CL" *asm-package-use-list*)
@@ -525,7 +525,8 @@
 ;;; by the tree-shaker as intended.
 #+nil
 (defun show-unused-exports (&aux nonexistent uninteresting)
-  (dolist (entry (with-open-file (f "package-data-list.lisp-expr") (read f)))
+  (dolist (entry (with-open-file (find-bootstrap-file "^package-data-list.lisp-expr")
+                   (read f)))
     (let ((pkg (find-package (package-data-name entry))))
       (dolist (string (mapcan (lambda (x) (if (stringp x) (list x) x))
                               (package-data-export entry)))

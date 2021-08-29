@@ -390,14 +390,6 @@
   (created nil :type (or unsigned-byte null))
   ;; Additional information from (WITH-COMPILATION-UNIT (:SOURCE-PLIST ...))
   (plist *source-plist* :read-only t))
-(def!struct (core-debug-source (:pure t)
-                               (:copier nil)
-                               (:include debug-source))
-  ;; Compilation to memory stores each toplevel form given to %COMPILE.
-  ;; That form can generate multiple functions, and those functions can
-  ;; be in one or more code components. They all point at the same form.
-  form
-  (function nil :read-only t))
 
 ;;;; DEBUG-INFO structures
 
@@ -420,7 +412,7 @@
   (contexts nil :type t :read-only t)
   ;; Packed integers. Also can be a cons of that plus an alist which
   ;; maps SB-C::COMPILED-DEBUG-FUN to SB-DI::COMPILED-DEBUG-FUN instances.
-  (tlf-num+offset nil :type (or integer cons)))
+  (tlf-num+offset (missing-arg) :type (or integer cons)))
 
 ;;; The TLF-NUMBER and CHAR-OFFSET of a compiled-debug-info can each be NIL,
 ;;; but aren't often. However, to allow that, convert NIL to 0 and non-nil
@@ -447,17 +439,18 @@
              (:copier nil)
              (:print-object (lambda (s stream)
                               (print-unreadable-object (s stream :type t)
-                                (princ (file-info-name s) stream)))))
+                                (princ (file-info-truename s) stream)))))
   ;; If a file, the truename of the corresponding source file. If from
-  ;; a Lisp form, :LISP. If from a stream, :STREAM.
-  (name (missing-arg) :type (or pathname (eql :lisp)) :read-only t)
+  ;; a Lisp form, :LISP. In COMPILE-FILE, this gets filled lazily
+  ;; after the file gets opened.
+  (truename nil :type (or pathname null (eql :lisp)))
   ;; the external format that we'll call OPEN with, if NAME is a file.
   (external-format nil  :read-only t)
   ;; the defaulted, but not necessarily absolute file name (i.e. prior
   ;; to TRUENAME call.) Null if not a file. This is used to set
   ;; *COMPILE-FILE-PATHNAME*, and if absolute (a harmful constraint to be sure),
   ;; is dumped in the debug-info.
-  (untruename nil :type (or pathname null) :read-only t)
+  (pathname nil :type (or pathname null) :read-only t)
   ;; the file's write date (if relevant)
   (write-date nil :type (or unsigned-byte null)  :read-only t)
   ;; parallel vectors containing the forms read out of the file and

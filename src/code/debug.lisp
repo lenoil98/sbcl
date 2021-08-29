@@ -918,11 +918,19 @@ the current thread are replaced with dummy objects which can safely escape."
   ;; until bug 403 is fixed, PPRINT-LOGICAL-BLOCK (STREAM NIL) is
   ;; definitely preferred, because the FORMAT alternative was acting odd.
   (pprint-logical-block (stream nil)
+    #-sb-thread
+    (format stream "debugger invoked on a ~S: ~2I~_~A" (type-of condition) condition)
+    #+sb-thread
     (format stream
-            "debugger invoked on a ~S~@[ in thread ~_~A~]: ~2I~_~A"
+            "debugger invoked on a ~S~@[ @~x~] in thread ~_~A: ~2I~_~A"
             (type-of condition)
-            #+sb-thread sb-thread:*current-thread*
-            #-sb-thread nil
+            (when (boundp '*current-internal-error-context*)
+              (if (system-area-pointer-p *current-internal-error-context*)
+                  (sb-alien:with-alien ((context (* os-context-t)
+                                                 sb-kernel:*current-internal-error-context*))
+                    (sap-int (sb-vm:context-pc context)))
+                  (sap-int (sb-vm:context-pc *current-internal-error-context*))))
+            sb-thread:*current-thread*
             condition))
   (terpri stream))
 
@@ -1810,6 +1818,8 @@ forms that explicitly control this kind of evaluation.")
                            (funcall thunk))
                          #+unbind-in-unwind thunk
                          #+unbind-in-unwind unbind-to
+                         #+(and unbind-in-unwind (not c-stack-is-control-stack))
+                         (%primitive sb-c:current-nsp)
                          #+unbind-in-unwind catch-block)))
   #-unwind-to-frame-and-call-vop
   (let ((tag (gensym)))

@@ -21,38 +21,38 @@
   (addr system-area-pointer)
   (bytes unsigned))
 
-(!define-load-time-global *allocator-mutex* (sb-thread:make-mutex :name "Allocator"))
+(define-load-time-global *allocator-mutex* (sb-thread:make-mutex :name "Allocator"))
 
 (defun allocate-static-vector (widetag length words)
   (declare (type (unsigned-byte #.n-widetag-bits) widetag)
            (type word words)
            (type index length))
-  ;; This does not need WITHOUT-GCING, but it will be implicitly wrapped
-  ;; in WITHOUT-INTERRUPTS due to the default behavior of system mutexes,
-  ;; which is important so that we don't leave an inconsistent state.
-  ;; To think about why it is OK to leave GC enabled, consider that
-  ;; neither GC nor another thread will examine static space above the
-  ;; current value of *STATIC-SPACE-FREE-POINTER*.
-  (or (with-system-mutex (*allocator-mutex*)
-        (let* ((pointer *static-space-free-pointer*)
-               (nbytes (pad-data-block (+ words vector-data-offset)))
-               (new-pointer (sap+ pointer nbytes)))
-          (when (sap<= new-pointer (int-sap static-space-end))
+  ;; Static space starts out zeroed, so it looks a bunch of cons cells
+  ;; containing (0 . 0) above the free pointer. Therefore bumping the pointer
+  ;; merely exposes a new range of cons cells, if GC should happen to run
+  ;; while executing this code. And because we assign the LENGTH of the vector
+  ;; prior to setting the widetag, and LENGTH is a fixnum, then at worst
+  ;; someone can transiently observe a cons of (0 . a-fixnum).
+  (let* ((nbytes (pad-data-block (+ words vector-data-offset)))
+         (pointer (alien-funcall (extern-alien "atomic_bump_static_space_free_ptr"
+                                               (function system-area-pointer int))
+                                 nbytes)))
+    (if (/= (sap-int pointer) 0)
             ;; By storing the length prior to the widetag, the word at the old
             ;; free pointer decodes as a cons instead of a 0-length vector.
             ;; Not that it should matter, but it seems slightly better to change
             ;; the new object atomically to a correctly-sized vector rather than
             ;; a cons changing into the wrong vector into the right vector.
-            (setf (sap-ref-word pointer (ash vector-length-slot word-shift))
-                  (fixnumize length))
+        (let ((v (%make-lisp-obj (sap-int (sap+ pointer other-pointer-lowtag)))))
+          (setf (%array-fill-pointer v) length
             ;; then store the widetag
-            (setf (sap-ref-word pointer 0) widetag)
-            ;; then the new free pointer
-            (setf *static-space-free-pointer* new-pointer)
-            (%make-lisp-obj (logior (sap-int pointer) other-pointer-lowtag)))))
-      (error 'simple-storage-condition
-             :format-control
-             "Not enough room left in static space to allocate vector.")))
+                (sap-ref-8 pointer #+big-endian (1- sb-vm:n-word-bytes)
+                                   #+little-endian 0)
+                widetag)
+          v)
+        (error 'simple-storage-condition
+               :format-control
+               "Not enough room left in static space to allocate vector."))))
 
 #+darwin-jit
 (defun allocate-static-code-vector (widetag length words)
@@ -100,7 +100,7 @@
 ;;; A better structure would be just a sorted array of sizes
 ;;; with each entry pointing to the holes which are threaded through
 ;;; some bytes in the storage itself rather than through cons cells.
-(!define-load-time-global *immobile-freelist* nil)
+(define-load-time-global *immobile-freelist* nil)
 
 ;;; Return the zero-based index within the varyobj subspace of immobile space.
 (defun varyobj-page-index (address)
@@ -224,10 +224,10 @@
     (let ((n-trailing-bytes
            (- (nth-value 1 (ceiling free-ptr immobile-card-bytes)))))
       (setf (sap-ref-word (int-sap free-ptr) 0) simple-array-fixnum-widetag
-            (sap-ref-word (int-sap free-ptr) n-word-bytes)
+            (%array-fill-pointer
+             (%make-lisp-obj (logior free-ptr sb-vm:other-pointer-lowtag)))
             ;; Convert bytes to words, subtract the header and vector length.
-            (ash (- (ash n-trailing-bytes (- word-shift)) 2)
-                 n-fixnum-tag-bits)))))
+            (- (ash n-trailing-bytes (- word-shift)) 2)))))
 
 (defun unallocate (hole)
   #+immobile-space-debug
@@ -378,9 +378,8 @@
      (setf (sap-ref-word (int-sap addr) 0) word0
            (sap-ref-word (int-sap addr) n-word-bytes) word1)
      ;; 0-fill the remainder of the object
-     (#+64-bit system-area-ub64-fill
-      #-64-bit system-area-ub32-fill
-      0 (int-sap addr) 2 (- (ash n-bytes (- word-shift)) 2))
+     (alien-funcall (extern-alien "memset" (function void system-area-pointer int unsigned))
+                    (sap+ (int-sap addr) (* 2 n-word-bytes)) 0 (- n-bytes (* 2 n-word-bytes)))
      ;; Only after making the new object can we reduce the size of the hole
      ;; that contained the new allocation (if it entailed chopping a hole
      ;; into parts). In this way, heap scans do not read junk.

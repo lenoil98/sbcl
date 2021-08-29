@@ -24,34 +24,26 @@
 (defsetf context-register %set-context-register)
 (defsetf boxed-context-register %set-boxed-context-register)
 (defsetf context-float-register %set-context-float-register)
-;;; from bit-bash.lisp
-(defsetf word-sap-ref %set-word-sap-ref)
 
-;;; from debug-int.lisp
-(in-package "SB-DI")
-(defsetf stack-ref %set-stack-ref)
-(defsetf debug-var-value %set-debug-var-value)
-(defsetf breakpoint-info %set-breakpoint-info)
+#-x86-64
+(progn
+  (declaim (inline assign-vector-flags logior-header-bits reset-header-bits))
+  (defun assign-vector-flags (vector flags)
+    (set-header-data vector (dpb flags (byte 8 0) (get-header-data vector)))
+    (values))
+  (defun logior-header-bits (vector bits)
+    (set-header-data vector (logior (get-header-data vector) bits))
+    vector)
+  (defun reset-header-bits (vector bits)
+    (set-header-data vector (logand (get-header-data vector) (lognot bits)))
+    (values)))
 
-;;; from bignum.lisp
 (in-package "SB-IMPL")
-(defsetf %bignum-ref %bignum-set)
 
-;;; from defstruct.lisp
-(defsetf %instance-ref %instance-set)
-
-(defsetf %raw-instance-ref/word %raw-instance-set/word)
-(defsetf %raw-instance-ref/signed-word %raw-instance-set/signed-word)
-(defsetf %raw-instance-ref/single %raw-instance-set/single)
-(defsetf %raw-instance-ref/double %raw-instance-set/double)
-(defsetf %raw-instance-ref/complex-single %raw-instance-set/complex-single)
-(defsetf %raw-instance-ref/complex-double %raw-instance-set/complex-double)
-
-(defsetf %instance-layout %set-instance-layout)
-(defsetf %funcallable-instance-info %set-funcallable-instance-info)
-;;; The writer is named after the reader, but only operates on FUNCALLABLE-INSTANCE
-;;; even if the reader operates on any FUNCTION.
-(defsetf %fun-layout %set-fun-layout)
+(declaim (inline (setf %funcallable-instance-info)))
+(defun (setf %funcallable-instance-info) (value instance index)
+  (%set-funcallable-instance-info instance index value)
+  value)
 
 ;;; from early-setf.lisp
 
@@ -154,27 +146,14 @@
 (defsetf svref %svset)
 (defsetf char %charset)
 (defsetf schar %scharset)
-(defsetf %array-dimension %set-array-dimension)
-(defsetf %vector-raw-bits %set-vector-raw-bits)
+(declaim (inline (setf %vector-raw-bits)))
+(defun (setf %vector-raw-bits) (bits vector index)
+  (%set-vector-raw-bits vector index bits)
+  bits)
 (defsetf symbol-value set)
 (defsetf symbol-global-value set-symbol-global-value)
 (defsetf symbol-plist %set-symbol-plist)
 (defsetf fill-pointer %set-fill-pointer)
-(defsetf sap-ref-8 %set-sap-ref-8)
-(defsetf signed-sap-ref-8 %set-signed-sap-ref-8)
-(defsetf sap-ref-16 %set-sap-ref-16)
-(defsetf signed-sap-ref-16 %set-signed-sap-ref-16)
-(defsetf sap-ref-32 %set-sap-ref-32)
-(defsetf signed-sap-ref-32 %set-signed-sap-ref-32)
-(defsetf sap-ref-64 %set-sap-ref-64)
-(defsetf signed-sap-ref-64 %set-signed-sap-ref-64)
-(defsetf sap-ref-word %set-sap-ref-word)
-(defsetf signed-sap-ref-word %set-signed-sap-ref-word)
-(defsetf sap-ref-sap %set-sap-ref-sap)
-(defsetf sap-ref-lispobj %set-sap-ref-lispobj)
-(defsetf sap-ref-single %set-sap-ref-single)
-(defsetf sap-ref-double %set-sap-ref-double)
-#+long-float (defsetf sap-ref-long %set-sap-ref-long)
 (defsetf subseq (sequence start &optional end) (v)
   `(progn (replace ,sequence ,v :start1 ,start :end1 ,end) ,v))
 
@@ -182,7 +161,12 @@
 (defsetf fdefinition %set-fdefinition)
 
 ;;; from kernel.lisp
-(defsetf code-header-ref code-header-set)
+#-darwin-jit
+(progn
+(declaim (inline (setf code-header-ref)))
+(defun (setf code-header-ref) (value code index)
+  (code-header-set code index value)
+  value))
 
 ;;; from pcl
 (defsetf slot-value sb-pcl::set-slot-value)

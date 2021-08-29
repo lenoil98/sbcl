@@ -48,7 +48,7 @@
 ;;;; sufficient, though interaction between parallel intern and use-package
 ;;;; needs to be considered with some care.
 
-(!define-load-time-global *package-graph-lock* (sb-thread:make-mutex :name "Package Graph Lock"))
+(define-load-time-global *package-graph-lock* nil)
 
 (defmacro with-package-graph ((&key) &body forms)
   ;; FIXME: Since name conflicts can be signalled while holding the
@@ -219,10 +219,6 @@
      (sb-thread::with-recursive-system-lock ((info-env-mutex ,table-var))
        ,@body)))
 
-(defmethod make-load-form ((p package) &optional environment)
-  (declare (ignore environment))
-  `(find-undeleted-package-or-lose ,(package-name p)))
-
 ;;;; iteration macros
 
 (defmacro with-package-iterator ((mname package-list &rest symbol-types) &body body)
@@ -547,7 +543,7 @@ error if any of PACKAGES is not a valid package designator."
 ;;; making this a generic function then packages with custom package classes
 ;;; could hook into this to provide their own resolution.
 ;;; (Any such generic solution will turn the performance to crap, so let's not)
-(declaim (inline find-package-using-package))
+(declaim (maybe-inline find-package-using-package))
 (defun find-package-using-package (package-designator base)
   (let ((string (typecase package-designator
                   (package
@@ -579,11 +575,11 @@ Example:
 
 See also: ADD-PACKAGE-LOCAL-NICKNAME, PACKAGE-LOCAL-NICKNAMES,
 REMOVE-PACKAGE-LOCAL-NICKNAME, and the DEFPACKAGE option :LOCAL-NICKNAMES."
-  (declare (explicit-check))
+  (declare (explicit-check)
+           (inline find-package-using-package))
   ;; We had a BOUNDP check on *PACKAGE* here, but it's effectless due to the
   ;; always-bound proclamation.
   (find-package-using-package package-designator *package*))
-(declaim (notinline find-package-using-package))
 
 ;;; ANSI says (in the definition of DELETE-PACKAGE) that these, and
 ;;; most other operations, are unspecified for deleted packages. We
@@ -1014,6 +1010,12 @@ implementation it is ~S." *!default-package-use-list*)
         "Clobber existing package."
         "A package named ~S already exists" name)
        (setf clobber t))
+     (when (and sb-c::*compile-time-eval*
+                (eq (sb-c::block-compile sb-c::*compilation*) t))
+       (style-warn "Package creation forms limit block compilation and ~
+       may cause failure with the use of specified entry ~
+       points. Consider moving the package creation form outside the ~
+       scope of a block compilation."))
      (with-package-graph ()
        ;; Check for race, signal the error outside the lock.
        (when (and (not clobber) (find-package name))
@@ -1047,7 +1049,7 @@ implementation it is ~S." *!default-package-use-list*)
          (return package)))
      (bug "never")))
 
-(flet ((remove-names (package name-table)
+(flet ((remove-names (package name-table keep-primary-name)
          ;; An INFO-HASHTABLE does not support REMHASH. We can simulate it
          ;; by changing the value to :DELETED.
          ;; (NIL would be preferable, but INFO-GETHASH does not return
@@ -1058,6 +1060,7 @@ implementation it is ~S." *!default-package-use-list*)
          (dx-let ((names (cons (package-name package)
                                (package-nicknames package)))
                   (i 0))
+           (when keep-primary-name (pop names))
            (dolist (name names)
              ;; Aver that the following SETF doesn't insert a new <k,v> pair.
              (aver (info-gethash name name-table))
@@ -1113,10 +1116,21 @@ implementation it is ~S." *!default-package-use-list*)
            (unless (eq package (find-package package-designator))
              (go :restart))
            ;; Do the renaming.
-           (remove-names package table)
-           (%register-package table name package)
+           ;; As a special case, do not allow the package to transiently disappear
+           ;; if PACKAGE-NAME is unchanged. This avoids glitches with build systems
+           ;; which try to operate on subcomponents in parallel, where one of the
+           ;; built subcomponents needs to add nicknames to an existing package.
+           ;; We could be clever here as well by not removing nicknames that
+           ;; will ultimately be re-added, but that didn't seem as critical.
+           (let ((keep-primary-name (string= name (package-%name package))))
+             (remove-names package table keep-primary-name)
+             (unless keep-primary-name
+               (%register-package table name package)))
            (setf (package-%name package) name
                  (package-%nicknames package) ()))
+         ;; Adding each nickname acquires and releases the table lock,
+         ;; because it's potentially interactive (on failure) and therefore
+         ;; not ideal to hold the lock for the entire duration.
          (%enter-new-nicknames package nicks))
        (atomic-incf *package-names-cookie*)
        (return package))))
@@ -1166,7 +1180,7 @@ implementation it is ~S." *!default-package-use-list*)
                   (do-symbols (sym package)
                     (unintern sym package))
                   (with-package-names (table)
-                    (remove-names package table)
+                    (remove-names package table nil)
                     (setf (package-%name package) nil
                           ;; Setting PACKAGE-%NAME to NIL is required in order to
                           ;; make PACKAGE-NAME return NIL for a deleted package as
@@ -1852,12 +1866,12 @@ PACKAGE."
 
 (defun pkg-name= (a b) (and (not (eql a 0)) (string= a b)))
 (defun !package-cold-init ()
+  (setf *package-graph-lock* (sb-thread:make-mutex :name "Package Graph Lock"))
   (setf *package-names* (make-info-hashtable :comparator #'pkg-name=
-                                             :hash-function #'sxhash)
-        *package-nickname-ids*
-        (cons (make-info-hashtable :comparator #'pkg-name=
-                                   :hash-function #'sxhash)
-              1))
+                                             :hash-function #'sxhash))
+  (setf *package-nickname-ids* (cons (make-info-hashtable :comparator #'pkg-name=
+                                                          :hash-function #'sxhash)
+                                     1))
   (setf (sb-thread:mutex-name (info-env-mutex *package-names*)) "package names"
         (sb-thread:mutex-name (info-env-mutex (car *package-nickname-ids*)))
         "package nicknames")

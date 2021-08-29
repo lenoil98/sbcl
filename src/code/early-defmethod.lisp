@@ -19,8 +19,8 @@
 ;;; - The simple methods can be installed later by the full CLOS implementation.
 ;;;   They play nice by using the same call signature for the "fast function"
 
-(sb-xc:defmacro defmethod (&whole form name lambda-list &rest body
-                           &aux qualifier)
+(defmacro defmethod (&whole form name lambda-list &rest body
+                     &aux qualifier)
   (when (member name '((setf documentation) documentation) :test 'equal)
     (return-from defmethod `(push ',form *!documentation-methods*)))
   (when (keywordp lambda-list)
@@ -90,28 +90,30 @@
   (let* ((methods (the simple-vector
                        (cdr (or (assoc gf-name *!trivial-methods*)
                                 (error "No methods on ~S" gf-name)))))
+         ;; WRAPPER-OF can't be called until its constants have been patched in,
+         ;; which is potentially too early in cold init especially if trying
+         ;; to debug to figure out what has been patched in.
+         ;; And sometimes the thing we need to print is a FMT-CONTROL,
+         ;; which means we can see a funcallable-instance here.
+         (arg-wrapper
+          (cond ((%instancep specialized-arg) (%instance-wrapper specialized-arg))
+                ((funcallable-instance-p specialized-arg) (%fun-wrapper specialized-arg))
+                ;; Non-instance-like types always call a predicate.
+                (t #.(find-layout 't))))
          (applicable-method
           ;; Each "method" is represented as a vector:
           ;;  #(#<GUARD> QUALIFIER SPECIALIZER #<FMF> LAMBDA-LIST SOURCE-LOC)
           ;; SPECIALIZER is either a symbol for a classoid, or a genesis-time #<LAYOUT>.
           ;; Pick the first applicable one.
           (find-if (lambda (method)
-                     ;; LAYOUT-OF can't be called until its constants have been patched in,
-                     ;; which is potentially too early in cold init especially if trying
-                     ;; to debug to figure out what has been patched in.
-                     (let ((arg-layout (if (%instancep specialized-arg)
-                                           (%instance-layout specialized-arg)
-                                           ;; Non-instance types always call a predicate.
-                                           #.(find-layout 't))))
-                       (and (null (svref method 1)) ; only primary methods are candidates
-                            (let ((guard (the symbol (svref method 0))))
-                              (if (fboundp guard)
-                                  (funcall guard specialized-arg)
-                                  (let ((test-layout (svref method 2)))
-                                    (and (sb-kernel::layout-p test-layout)
-                                         (or (eq test-layout arg-layout)
-                                             (find test-layout
-                                                   (layout-inherits arg-layout))))))))))
+                     (and (null (svref method 1)) ; only primary methods are candidates
+                          (let ((guard (the symbol (svref method 0))))
+                            (if (fboundp guard)
+                                (funcall guard specialized-arg)
+                                (let ((test-wrapper (svref method 2)))
+                                  (and (sb-kernel::wrapper-p test-wrapper)
+                                       (or (find test-wrapper (wrapper-inherits arg-wrapper))
+                                           (eq arg-wrapper test-wrapper))))))))
                    methods)))
     (if applicable-method
         ;; Call using no permutation-vector / no precomputed next method.

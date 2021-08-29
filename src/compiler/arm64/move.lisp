@@ -20,13 +20,49 @@
          (inst movn y (ldb (byte 64 0) (lognot val))))
         ((encode-logical-immediate val)
          (inst orr y zr-tn val))
-        ((loop for i below 64 by 16
-               for part = (ldb (byte 16 i) val)
-               for zeroed = (dpb 0 (byte 16 i) val)
-               thereis (cond ((encode-logical-immediate zeroed)
-                              (inst orr y zr-tn zeroed)
-                              (inst movk y part i)
-                              t))))
+        ((let ((descriptorp (memq (tn-offset y) descriptor-regs)))
+           (flet ((try (i part fill)
+                    (let ((filled (dpb fill (byte 16 i) val)))
+                      (cond ((and (encode-logical-immediate filled)
+                                  (not (and descriptorp
+                                            (logtest filled fixnum-tag-mask))))
+                             (inst orr y zr-tn filled)
+                             (inst movk y part i)
+                             t)))))
+             (loop for i below 64 by 16
+                   for part = (ldb (byte 16 i) val)
+                   thereis (or (try i part #xFFFF)
+                               (try i part 0)
+                               (try i part
+                                    (ldb (byte 16 (mod (+ i 16) 64))
+                                         val)))))))
+        ((let ((a (ldb (byte 16 0) val))
+               (b (ldb (byte 16 16) val))
+               (c (ldb (byte 16 32) val))
+               (d (ldb (byte 16 48) val)))
+           (let ((descriptorp (memq (tn-offset y) descriptor-regs)))
+             (flet ((try (part val1 hole1 val2 hole2)
+                      (let* ((whole (dpb part (byte 16 16) part))
+                             (whole (dpb whole (byte 32 32) whole)))
+                        (when (and (encode-logical-immediate whole)
+                                   (not (and descriptorp
+                                             (logtest whole fixnum-tag-mask))))
+                          (inst orr y zr-tn whole)
+                          (inst movk y val1 hole1)
+                          (inst movk y val2 hole2)
+                          t))))
+               (cond ((= a b)
+                      (try a c 32 d 48))
+                     ((= a c)
+                      (try a b 16 d 48))
+                     ((= a d)
+                      (try a b 16 c 32))
+                     ((= b c)
+                      (try b a 0 d 48))
+                     ((= b d)
+                      (try b a 0 c 32))
+                     ((= c d)
+                      (try c a 0 b 16)))))))
         ((minusp val)
          (loop with first = t
                for i below 64 by 16
@@ -90,13 +126,7 @@
 
 (define-move-fun (load-constant 5) (vop x y)
   ((constant) (descriptor-reg))
-  (let ((offset (- (tn-byte-offset x) other-pointer-lowtag)))
-    (cond
-      ((ldr-str-offset-encodable offset)
-       (inst ldr y (@ code-tn offset)))
-      (t
-       (load-immediate-word tmp-tn offset)
-       (inst ldr y (@ code-tn tmp-tn))))))
+  (inst load-constant y (tn-byte-offset x)))
 
 (define-move-fun (load-stack 5) (vop x y)
   ((control-stack) (any-reg descriptor-reg))
@@ -355,14 +385,12 @@
   (:note "integer to untagged word coercion")
   (:generator 4
     #.(assert (= fixnum-tag-mask 1))
-    (inst tbnz x 0 BIGNUM)
     (sc-case y
       (signed-reg
        (inst asr y x n-fixnum-tag-bits))
       (unsigned-reg
        (inst lsr y x n-fixnum-tag-bits)))
-    (inst b DONE)
-    BIGNUM
+    (inst tbz x 0 DONE)
     (loadw y x bignum-digits-offset other-pointer-lowtag)
     DONE))
 
@@ -395,8 +423,12 @@
     (move x arg)
     (inst adds y x x)
     (inst b :vc DONE)
-    (with-fixed-allocation (y pa-flag bignum-widetag (1+ bignum-digits-offset) :lip lip)
-      (storew x y bignum-digits-offset other-pointer-lowtag))
+    (with-fixed-allocation (y pa-flag bignum-widetag (1+ bignum-digits-offset) :lip lip
+                            :store-type-code nil)
+      ;; TMP-TN has the untagged address coming from ALLOCATION
+      ;; that way STP can be used on an aligned address.
+      ;; PA-FLAG has the widetag computed by WITH-FIXED-ALLOCATION
+      (storew-pair pa-flag 0 x bignum-digits-offset tmp-tn))
     DONE))
 (define-move-vop move-from-signed :move
   (signed-reg) (descriptor-reg))
@@ -439,18 +471,18 @@
     (inst b :eq DONE)
 
     (with-fixed-allocation
-        (y pa-flag bignum-widetag (+ 2 bignum-digits-offset) :lip lip)
+        (y pa-flag bignum-widetag (+ 2 bignum-digits-offset) :lip lip
+         :store-type-code nil)
       ;; WITH-FIXED-ALLOCATION, when using a supplied type-code,
       ;; leaves PA-FLAG containing the computed header value.  In our
       ;; case, configured for a 2-word bignum.  If the sign bit in the
       ;; value we're boxing is CLEAR, we need to shrink the bignum by
       ;; one word, hence the following:
-      (inst tst x x)
-      (inst b :mi STORE)
-      (inst sub pa-flag pa-flag #x100)
-      (storew pa-flag y 0 other-pointer-lowtag)
+      (inst tbnz x (1- n-word-bits) STORE)
+      (load-immediate-word pa-flag (compute-object-header (+ 1 bignum-digits-offset) bignum-widetag))
       STORE
-      (storew x y bignum-digits-offset other-pointer-lowtag))
+      ;; See the comment in move-from-signed
+      (storew-pair pa-flag 0 x bignum-digits-offset tmp-tn))
     DONE))
 (define-move-vop move-from-unsigned :move
   (unsigned-reg) (descriptor-reg))

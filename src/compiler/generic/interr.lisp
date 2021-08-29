@@ -110,6 +110,7 @@
    ("unknown &KEY argument" unknown-key-arg 1)
    ("invalid array index" invalid-array-index 3)
    ("invalid vector index" invalid-vector-index 2)
+   ("uninitialized element" uninitialized-element 2)
    ("A function with declared result type NIL returned." nil-fun-returned 1)
    ("An array with element-type NIL was accessed." nil-array-accessed 1)
    ("Object layout is invalid. (indicates obsolete instance)" layout-invalid 2)
@@ -186,7 +187,7 @@
   sb-c::vop
   sb-c::basic-combination
   sb-sys:fd-stream
-  layout
+  wrapper
   (sb-assem:segment object-not-assem-segment)
   sb-c::cblock
   sb-disassem:disassem-state

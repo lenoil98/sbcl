@@ -19,6 +19,21 @@
 #include "getallocptr.h"
 #include "genesis/code.h"
 
+lispobj* atomic_bump_static_space_free_ptr(int nbytes)
+{
+    gc_assert((nbytes & LOWTAG_MASK) == 0);
+    lispobj* claimed_ptr = static_space_free_pointer;
+    do {
+        lispobj* new = (lispobj*)((char*)claimed_ptr + nbytes);
+        // Fail if space exhausted or bogusly wrapped around
+        if (new > (lispobj*)STATIC_SPACE_END || new < claimed_ptr) return 0;
+        lispobj* actual_old = __sync_val_compare_and_swap(&static_space_free_pointer,
+                                                          claimed_ptr, new);
+        if (actual_old == claimed_ptr) return claimed_ptr;
+        claimed_ptr = actual_old;
+    } while (1);
+}
+
 // Work space for the deterministic allocation profiler.
 // Only supported on x86-64, but the variables are always referenced
 // to reduce preprocessor conditionalization.
@@ -95,8 +110,7 @@ void allocation_profiler_start()
     int __attribute__((unused)) ret = thread_mutex_lock(&alloc_profiler_lock);
     gc_assert(ret == 0);
     if (!alloc_profiling && simple_vector_p(alloc_profile_data)) {
-        max_alloc_point_counters =
-            fixnum_value(VECTOR(alloc_profile_data)->length)/2;
+        max_alloc_point_counters = vector_len(VECTOR(alloc_profile_data))/2;
         size_t size = N_WORD_BYTES * max_alloc_point_counters;
         os_vm_address_t old_buffer = 0;
         if (size != profile_buffer_size) {
@@ -154,3 +168,25 @@ void allocation_profiler_stop()
     }
 #endif
 }
+
+#ifdef LISP_FEATURE_METASPACE
+#include "gc-private.h"
+lispobj valid_metaspace_ptr_p(void* addr)
+{
+    struct slab_header* slab = (void*)ALIGN_DOWN((lispobj)addr, METASPACE_SLAB_SIZE);
+    fprintf(stderr, "slab base %p chunk_size %d capacity %d\n", slab, slab->chunksize, slab->capacity);
+    if (!slab->capacity) return 0;
+    lispobj slab_end = (lispobj)slab + METASPACE_SLAB_SIZE;
+    int index = (slab_end - (lispobj)addr) / slab->chunksize;
+    //    for(int i=0; i<slab->capacity; ++i) fprint(stderr, "goober @ %p\n", slab_end - (1+i)*chunksize);
+    //    fprintf(stderr, "index=%d\n", index);
+    if (index < slab->capacity) {
+        lispobj* obj_base = (lispobj*)(slab_end - (index+1)*slab->chunksize);
+        if (widetag_of(obj_base) == INSTANCE_WIDETAG) {
+            fprintf(stderr, "word @ %p is good\n", obj_base);
+            return (lispobj)obj_base;
+        }
+    }
+    return 0;
+}
+#endif

@@ -40,9 +40,7 @@
 ;;;; !COLD-INIT
 
 ;;; a list of toplevel things set by GENESIS
-(defvar *!cold-toplevels*)   ; except for DEFUNs and SETF macros
-(defvar *!cold-setf-macros*) ; just SETF macros
-(defvar *!cold-defuns*)      ; just DEFUNs
+(defvar *!cold-toplevels*)
 (defvar *!cold-defsymbols*)  ; "easy" DEFCONSTANTs and DEFPARAMETERs
 
 ;;; a SIMPLE-VECTOR set by GENESIS
@@ -58,27 +56,44 @@
 
 (defun !c-runtime-noinform-p () (/= (extern-alien "lisp_startup_options" char) 0))
 
+(defun !format-cold-init ()
+  (sb-format::!late-format-init)
+  (sb-format::!format-directives-init))
+
 ;;; called when a cold system starts up
 (defun !cold-init (&aux (real-choose-symbol-out-fun #'choose-symbol-out-fun)
                         (real-failed-aver-fun #'%failed-aver))
   "Give the world a shove and hope it spins."
 
   (/show0 "entering !COLD-INIT")
-  (setf (symbol-function '%failed-aver) #'!cold-failed-aver)
   (!readtable-cold-init)
-  (setq *readtable* (make-readtable)
-        *print-length* 6 *print-level* 3)
-  (setq *error-output* (!make-cold-stderr-stream)
-                      *standard-output* *error-output*
-                      *trace-output* *error-output*)
+  (setq *print-length* 6 *print-level* 3)
+  (/show0 "cold-initializing streams")
+  (sb-impl::!cold-stream-init)
   (/show "testing '/SHOW" *print-length* *print-level*) ; show anything
+  ;; This allows FORMAT to work, and can go as early needed for
+  ;; debugging.
+  (show-and-call !format-cold-init)
   (unless (!c-runtime-noinform-p)
     ;; I'd like FORMAT to remain working in cold-init, where it does work,
     ;; hence the conditional.
     #+(or x86 x86-64) (format t "COLD-INIT... ")
     #-(or x86 x86-64) (write-string "COLD-INIT... "))
+
+  ;; Anyone might call RANDOM to initialize a hash value or something;
+  ;; and there's nothing which needs to be initialized in order for
+  ;; this to be initialized, so we initialize it right away.
+  (show-and-call !random-cold-init)
+
+  ;; All sorts of things need INFO and/or (SETF INFO).
+  (/show0 "about to SHOW-AND-CALL !GLOBALDB-COLD-INIT")
+  (show-and-call !globaldb-cold-init)
+  (show-and-call !function-names-init)
+
+  (setf (symbol-function '%failed-aver) #'!cold-failed-aver)
+
   (!cold-init-hash-table-methods)
-  ;; And now *CURRENT-THREAD* and *HANDLER-CLUSTERS*
+  ;; And now *CURRENT-THREAD*
   (sb-thread::init-main-thread)
 
   ;; Assert that FBOUNDP doesn't choke when its answer is NIL.
@@ -86,15 +101,10 @@
   ;; And be extra paranoid - ensure that it really gets called.
   (locally (declare (notinline fboundp)) (fboundp '(setf !zzzzzz)))
 
-  ;; Anyone might call RANDOM to initialize a hash value or something;
-  ;; and there's nothing which needs to be initialized in order for
-  ;; this to be initialized, so we initialize it right away.
-  (show-and-call !random-cold-init)
-
   ;; Printing of symbols requires that packages be filled in, because
   ;; OUTPUT-SYMBOL calls FIND-SYMBOL to determine accessibility.
   (show-and-call !package-cold-init)
-  (setq *print-pprint-dispatch* (sb-pretty::make-pprint-dispatch-table nil nil nil))
+  (setq *print-pprint-dispatch* (sb-pretty::make-pprint-dispatch-table #() nil nil))
   ;; Because L-T-V forms have not executed, CHOOSE-SYMBOL-OUT-FUN doesn't work.
   (setf (symbol-function 'choose-symbol-out-fun)
         (lambda (&rest args) (declare (ignore args)) #'output-preserve-symbol))
@@ -106,24 +116,14 @@
   ;; Must be done before any non-opencoded array references are made.
   (show-and-call sb-vm::!hairy-data-vector-reffer-init)
 
-  (show-and-call !character-database-cold-init)
-  (show-and-call !character-name-database-cold-init)
-  (show-and-call sb-unicode::!unicode-properties-cold-init)
-
-  ;; All sorts of things need INFO and/or (SETF INFO).
-  (/show0 "about to SHOW-AND-CALL !GLOBALDB-COLD-INIT")
-  (show-and-call !globaldb-cold-init)
-
   ;; Various toplevel forms call MAKE-ARRAY, which calls SUBTYPEP, so
   ;; the basic type machinery needs to be initialized before toplevel
   ;; forms run.
   (show-and-call !type-class-cold-init)
-  (show-and-call sb-kernel::!primordial-type-cold-init)
   (show-and-call !classes-cold-init)
-  (show-and-call !pred-cold-init)
-  (show-and-call !early-type-cold-init)
-  (show-and-call !late-type-cold-init)
-  (show-and-call !alien-type-cold-init)
+  (show-and-call sb-kernel::!primordial-type-cold-init)
+
+  (show-and-call !type-cold-init)
   ;; FIXME: It would be tidy to make sure that that these cold init
   ;; functions are called in the same relative order as the toplevel
   ;; forms of the corresponding source files.
@@ -148,19 +148,14 @@
     (destructuring-bind (fun name source-loc . docstring) x
       (aver (boundp name)) ; it's a bug if genesis didn't initialize
       (ecase fun
-        (sb-c::%defconstant
-         (apply #'sb-c::%defconstant name (symbol-value name) source-loc docstring))
-        (sb-impl::%defparameter ; use %DEFVAR which will not clobber
+        (%defconstant
+         (apply #'%defconstant name (symbol-value name) source-loc docstring))
+        (%defparameter ; use %DEFVAR which will not clobber
          (apply #'%defvar name source-loc nil docstring)))))
-  (dolist (x *!cold-defuns*)
-    (destructuring-bind (name inline-expansion dxable-args) x
-      (%defun name (fdefinition name) inline-expansion dxable-args)))
 
   (unless (!c-runtime-noinform-p)
-    #+(or x86 x86-64) (format t "[Length(TLFs)=~D]~%" (length *!cold-toplevels*))
-    #-(or x86 x86-64)
-    (progn (write `("Length(TLFs)=" ,(length *!cold-toplevels*)) :escape nil)
-           (terpri)))
+    #+(or x86 x86-64) (format t "[Length(TLFs)=~D]" (length *!cold-toplevels*))
+    #-(or x86 x86-64) (write `("Length(TLFs)=" ,(length *!cold-toplevels*)) :escape nil))
 
   (loop with *package* = *package* ; rebind to self, as if by LOAD
         for index-in-cold-toplevels from 0
@@ -181,16 +176,17 @@
            (aver (typep object 'code-component))
            (aver (unbound-marker-p (code-header-ref object index)))
            (setf (code-header-ref object index) (svref *!load-time-values* value))))
-        ((cons (eql defstruct))
-         (apply 'sb-kernel::%defstruct (cdr toplevel-thing)))
+        ((cons (eql :begin-file))
+         (unless (!c-runtime-noinform-p) (print (cdr toplevel-thing))))
         (t
          (!cold-lose "bogus operation in *!COLD-TOPLEVELS*"))))
   (/show0 "done with loop over cold toplevel forms and fixups")
+  (unless (!c-runtime-noinform-p) (terpri))
 
   ;; Precise GC seems to think these symbols are live during the final GC
   ;; which in turn enlivens a bunch of other "*!foo*" symbols.
   ;; Setting them to NIL helps a little bit.
-  (setq *!cold-defuns* nil *!cold-defsymbols* nil *!cold-toplevels* nil)
+  (setq *!cold-defsymbols* nil *!cold-toplevels* nil)
 
   ;; Now that L-T-V forms have executed, the symbol output chooser works.
   (setf (symbol-function 'choose-symbol-out-fun) real-choose-symbol-out-fun)
@@ -349,8 +345,8 @@ process to continue normally."
   ;; re-disable ldb again.
   (when (eq *invoke-debugger-hook* 'sb-debug::debugger-disabled-hook)
     (sb-debug::disable-debugger))
-  #+sb-thread (finalizer-thread-start)
-  (call-hooks "initialization" *init-hooks*))
+  (call-hooks "initialization" *init-hooks*)
+  #+sb-thread (finalizer-thread-start))
 
 ;;;; some support for any hapless wretches who end up debugging cold
 ;;;; init code

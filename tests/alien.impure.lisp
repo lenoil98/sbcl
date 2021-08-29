@@ -374,8 +374,10 @@
 
 ;;; Skip for MSAN. Instead of returning 0, the intercepted malloc is configured
 ;;; to cause process termination by default on failure to allocate memory.
+;;; Skip also for UBSAN which has a smaller ARRAY-TOTAL-SIZE-LIMIT
+;;; and so doesn't get ENOMEM.
 (with-test (:name :malloc-failure
-                  :skipped-on :msan)
+                  :skipped-on (or :ubsan :msan))
   (assert (eq :enomem
               (handler-case
                   (loop repeat 128
@@ -531,6 +533,17 @@
     (t (c)
       (assert (typep c 'sb-kernel::undefined-alien-function-error))
       (assert (equal (cell-error-name c) "bar")))))
+
+(with-test (:name :undefined-alien-name-via-linkage-table-trampoline
+            :skipped-on (not (or :x86-64 :arm :arm64)))
+  (handler-case (funcall (checked-compile
+                          `(lambda ()
+                             (with-alien ((fn (* (function (values)))
+                                              (sb-sys:int-sap (sb-sys:foreign-symbol-address "baz"))))
+                               (alien-funcall fn)))))
+    (t (c)
+      (assert (typep c 'sb-kernel::undefined-alien-function-error))
+      (assert (equal (cell-error-name c) "baz")))))
 
 (defconstant fleem 3)
 ;; We used to expand into

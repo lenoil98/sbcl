@@ -223,15 +223,16 @@ See also :POLICY option in WITH-COMPILATION-UNIT."
 ;;; OPTIMIZE forms have messed with it.
 #-sb-xc-host
 (defun !policy-cold-init-or-resanify ()
-  (macrolet ((init (policy-symbol) ; Act like MAKE-LOAD-FORM essentially
-               (let ((policy (symbol-value policy-symbol)))
-                 `(setq ,policy-symbol
+  (macrolet ((reflect-host-value (target-policy &optional (host-policy target-policy))
+               ;; Act like MAKE-LOAD-FORM essentially
+               (let ((policy (symbol-value host-policy)))
+                 `(setq ,target-policy
                         (make-policy ,(policy-primary-qualities policy)
                                      ,(policy-presence-bits policy)
                                      ,(policy-dependent-qualities policy))))))
-    (init **baseline-policy**)
-    (init **zero-typecheck-policy**)
-    (setq *policy* (copy-policy **baseline-policy**))))
+    (reflect-host-value **baseline-policy**)
+    (reflect-host-value **zero-typecheck-policy**)
+    (reflect-host-value *policy* **baseline-policy**)))
 
 #+sb-xc-host
 (defun init-xc-policy (&optional baseline-qualities)
@@ -242,11 +243,11 @@ See also :POLICY option in WITH-COMPILATION-UNIT."
                            sum (ash #b01 (* i 2))))
         *policy* (copy-policy **baseline-policy**))
   (when baseline-qualities
-    (sb-xc:proclaim `(optimize ,@baseline-qualities))
+    (proclaim `(optimize ,@baseline-qualities))
     ;; Copy altered policy back as the baseline policy
     (setq **baseline-policy** (copy-policy *policy*)))
   (let ((*policy* *policy*))
-    (sb-xc:proclaim '(optimize (type-check 0)))
+    (proclaim '(optimize (type-check 0)))
     (setq **zero-typecheck-policy** *policy*)))
 
 ;;; Look up a named optimization quality in POLICY. This is only

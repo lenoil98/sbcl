@@ -106,7 +106,7 @@
   (def-type-predicate-wrapper integerp)
   (def-type-predicate-wrapper listp)
   (def-type-predicate-wrapper long-float-p)
-  #-(or x86 x86-64) (def-type-predicate-wrapper lra-p)
+  #-(or x86 x86-64 arm64) (def-type-predicate-wrapper lra-p)
   (def-type-predicate-wrapper null)
   (def-type-predicate-wrapper numberp)
   (def-type-predicate-wrapper rationalp)
@@ -155,59 +155,6 @@
   (and (fixnump x)
        (<= 0 x limit)))
 
-;;; a vector that maps widetags to layouts, used for quickly finding
-;;; the layouts of built-in classes
-(define-load-time-global **primitive-object-layouts** nil)
-(declaim (type simple-vector **primitive-object-layouts**))
-(defun !pred-cold-init ()
-  ;; This vector is allocated in immobile space when possible. There isn't
-  ;; a way to do that from lisp, so it's special-cased in genesis.
-  #-immobile-space (setq **primitive-object-layouts** (make-array 256))
-  (map-into **primitive-object-layouts**
-            (lambda (name) (classoid-layout (find-classoid name)))
-            #.(let ((table (make-array 256 :initial-element 'sb-kernel::random-class)))
-                (dolist (x sb-kernel::*builtin-classoids*)
-                  (destructuring-bind (name &key codes &allow-other-keys) x
-                    (dolist (code codes)
-                      (setf (svref table code) name))))
-                (loop for i from sb-vm:list-pointer-lowtag by (* 2 sb-vm:n-word-bytes)
-                      below 256
-                      do (setf (aref table i) 'cons))
-                (loop for i from sb-vm:even-fixnum-lowtag by (ash 1 sb-vm:n-fixnum-tag-bits)
-                      below 256
-                      do (setf (aref table i) 'fixnum))
-                table)))
-
-;;; Return the layout for an object. This is the basic operation for
-;;; finding out the "type" of an object, and is used for generic
-;;; function dispatch. The standard doesn't seem to say as much as it
-;;; should about what this returns for built-in objects. For example,
-;;; it seems that we must return NULL rather than LIST when X is NIL
-;;; so that GF's can specialize on NULL.
-;;; x86-64 has a vop that implements this without even needing to place
-;;; the vector of layouts in the constant pool of the containing code.
-#-(and compact-instance-header x86-64)
-(progn
-(declaim (inline layout-of))
-(defun layout-of (x)
-  (declare (optimize (speed 3) (safety 0)))
-  (cond ((%instancep x) (%instance-layout x))
-        ((funcallable-instance-p x) (%fun-layout x))
-        ;; Compiler can dump literal layouts, which handily sidesteps
-        ;; the question of when cold-init runs L-T-V forms.
-        ((null x) #.(find-layout 'null))
-        (t
-         ;; Note that WIDETAG-OF is slightly suboptimal here and could be
-         ;; improved - we've already ruled out some of the lowtags.
-         (svref (load-time-value **primitive-object-layouts** t)
-                (widetag-of x))))))
-
-(declaim (inline classoid-of))
-#-sb-xc-host
-(defun classoid-of (object)
-  "Return the class of the supplied object, which may be any Lisp object, not
-   just a CLOS STANDARD-OBJECT."
-  (layout-classoid (layout-of object)))
 
 ;;; Return the specifier for the type of object. This is not simply
 ;;; (TYPE-SPECIFIER (CTYPE-OF OBJECT)) because CTYPE-OF has different
@@ -244,7 +191,7 @@
            ((eq (sb-xc:symbol-package object) *keyword-package*) 'keyword)
            (t 'symbol)))
     (array
-     (let ((etype (specifier-type (array-element-type object))))
+     (let ((etype (sb-vm::array-element-ctype object)))
        ;; Obviously :COMPLEXP is known to be T or NIL, but it's not allowed to
        ;; return (NOT SIMPLE-ARRAY), so use :MAYBE in lieu of T.
        (type-specifier
@@ -256,24 +203,32 @@
      (type-specifier (ctype-of object)))
     (simple-fun 'compiled-function)
     (t
-     (let ((layout (layout-of object)))
-       (if (eq (get-lisp-obj-address layout) 0)
-            ;; An empty instance, e.g. created by with-output-to-string
-            'instance
-            (let* ((classoid (layout-classoid layout))
-                   (name (classoid-name classoid)))
-              (if (%instancep object)
-                  (case name
-                    (sb-alien-internals:alien-value
-                     `(alien
-                       ,(sb-alien-internals:unparse-alien-type
-                         (sb-alien-internals:alien-value-type object))))
-                    (t
-                     (let ((pname (classoid-proper-name classoid)))
-                       (if (classoid-p pname)
-                           (classoid-pcl-class pname)
-                           pname))))
-                  name)))))))
+     #+metaspace ; WRAPPER-OF can't be called on layoutless objects.
+     (unless (logtest (get-lisp-obj-address (%instanceoid-layout object))
+                      sb-vm:widetag-mask)
+       ;; [fun-]instances momentarily have no layout in any code interrupted
+       ;; just after allocating and before assigning slots.
+       ;; OUTPUT-UGLY-OBJECT has a similar precaution as this.
+       (return-from type-of (if (functionp object) 'funcallable-instance 'instance)))
+     (let ((wrapper (wrapper-of object)))
+       #-metaspace ; already checked for a good layout if metaspace
+       (when (= (get-lisp-obj-address wrapper) 0)
+         (return-from type-of
+           (if (functionp object) 'funcallable-instance 'instance)))
+       (let* ((classoid (wrapper-classoid wrapper))
+              (name (classoid-name classoid)))
+         ;; FIXME: should the first test be (not (or (%instancep) (%funcallable-instance-p)))?
+         ;; God forbid anyone makes anonymous classes of generic functions.
+         (cond ((not (%instancep object))
+                name)
+               ((eq name 'sb-alien-internals:alien-value)
+                `(alien ,(sb-alien-internals:unparse-alien-type
+                          (sb-alien-internals:alien-value-type object))))
+               (t
+                (let ((pname (classoid-proper-name classoid)))
+                  (if (classoid-p pname)
+                      (classoid-pcl-class pname)
+                      pname)))))))))
 
 ;;;; equality predicates
 
@@ -293,8 +248,8 @@
   ;; Anyway it suffices to disable type checking and pretend its the always
   ;; the first arg that's an integer, but that won't work on the host because
   ;; it might enforce the type since we can't portably unenforce after declaring.
-  #-sb-xc-host (declare (optimize (sb-c::type-check 0)))
-  (eql #+sb-xc-host obj1 #-sb-xc-host (the integer obj1) obj2))
+  (declare (optimize (sb-c::type-check 0)))
+  (eql (the integer obj1) obj2))
 
 (declaim (inline %eql))
 (defun %eql (obj1 obj2)
@@ -553,7 +508,8 @@ length and have identical components. Other arrays must be EQ to be EQUAL."
                 (and (logtest (logior +structure-layout-flag+ +pathname-layout-flag+)
                               (layout-flags layout))
                      (eq (%instance-layout y) layout)
-                     (funcall (layout-equalp-impl layout) x y)))))
+                     (funcall (wrapper-equalp-impl (layout-friend layout))
+                              x y)))))
         ((arrayp x)
          (and (arrayp y)
               ;; string-equal is nearly 2x the speed of array-equalp for comparing strings

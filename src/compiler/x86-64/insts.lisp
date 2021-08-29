@@ -1001,13 +1001,9 @@
 (define-bitfield-emitter emit-word 16
   (byte 16 0))
 
-;; FIXME: a nice enhancement would be to save all sexprs of small functions
-;; within the same file, and drop them at the end.
-;; Expressly declaimed inline definitions would be saved as usual though.
-(declaim (inline emit-dword))
+(declaim (maybe-inline emit-dword))
 (define-bitfield-emitter emit-dword 32
   (byte 32 0))
-(declaim (notinline emit-dword))
 
 (define-bitfield-emitter emit-qword 64
   (byte 64 0))
@@ -1020,7 +1016,7 @@
 (defun emit-signed-dword (segment value)
   (declare (type sb-assem:segment segment)
            (type (signed-byte 32) value))
-  (declare (inline emit-dword))
+  #-sb-xc-host (declare (inline emit-dword))
   (emit-dword segment value))
 
 (define-bitfield-emitter emit-mod-reg-r/m-byte 8
@@ -1054,7 +1050,11 @@
                          (:predicate nil)
                          (:copier nil))
   (label nil :type label)
-  (addend 0 :type (signed-byte 32)))
+  ;; The addend of :CODE computes the tagged code object.
+  ;; It could be represented by just a label, except that the assembler can't
+  ;; directly reference labels in the boxed header. A label would need a negative
+  ;; POSN to represent such a location.
+  (addend 0 :type (or (signed-byte 32) (eql :code))))
 (declaim (freeze-type label+addend))
 
 ;;;; the effective-address (ea) structure
@@ -1230,13 +1230,6 @@
 (defun emit-byte+reg (seg byte reg)
   (emit-byte seg (+ byte (reg-encoding reg seg))))
 
-(defmethod print-object ((reg reg) stream)
-  (if *print-readably*
-      ;; cross-compiled DEFMETHOD can't use call-next-method
-      #+sb-xc (default-structure-print reg stream *current-level-in-print*)
-      #-sb-xc (call-next-method)
-      (write-string (reg-name reg) stream)))
-
 ;;; The GPR for any size and register number is a unique atom. Return it.
 (defun get-gpr (size number)
   (svref (load-time-value
@@ -1329,6 +1322,8 @@
                  (if (typep disp 'label+addend)
                      (values (label+addend-label disp) (label+addend-addend disp))
                      (values disp 0))
+               (when (eq addend :code)
+                 (setq addend (- sb-vm:other-pointer-lowtag (component-header-length))))
                ;; To point at ADDEND bytes beyond the label, pretend that the PC
                ;; at which the EA occurs is _smaller_ by that amount.
                (emit-dword-displacement-backpatch
@@ -1666,15 +1661,6 @@
          (let ((dst-size (cadr sizes)) ; DST-SIZE size governs the OPERAND-SIZE
                (src-size (car sizes))) ; SRC-SIZE is controlled by the opcode
            (aver (> (size-nbyte dst-size) (size-nbyte src-size)))
-           ;; Zero-extending into a 64-bit register is the same as zero-extending
-           ;; into the 32-bit register.
-           (when (and (not signed-p) (eq dst-size :qword))
-             ;; It's slightly strange for the assembler to output a different instruction
-             ;; from the one you said to. I'm not sure how to feel about this.
-             ;; There might be reasons you wanted to emit a certain thing.
-             (when (eq src-size :dword) ; this is a straight MOV
-               (return-from emit* (emit-mov segment :dword dst src)))
-             (setf dst-size :dword))
            (emit-prefixes segment (sized-thing src src-size) dst dst-size)
            (if (eq src-size :dword)
                ;; AMD calls this MOVSXD. If emitted without REX.W, it writes
@@ -1696,7 +1682,8 @@
 
   (define-instruction movzx (segment sizes dst src)
     (:printer move-with-extension ((op #b1011011)))
-    (:emitter (emit* segment sizes dst src nil))))
+    (:emitter (aver (not (equal sizes '(:dword :qword)))) ; should use MOV instead
+              (emit* segment sizes dst src nil))))
 
 (flet ((emit* (segment thing gpr-opcode mem-opcode subcode)
          (let ((size (or (operand-size thing) :qword)))
@@ -1877,7 +1864,7 @@
             ((and (neq size :byte) (plausible-signed-imm8-operand-p src size))
              (emit-prefixes segment dst nil size :lock (lockp prefix))
              (emit-byte segment #x83)
-             (emit-ea segment dst opcode)
+             (emit-ea segment dst opcode :remaining-bytes 1)
              (emit-byte segment it))
             ((or (integerp src)
                  (and (fixup-p src)
@@ -1991,7 +1978,7 @@
               (if imm
                   (emit-byte segment (if (eq imm-size :byte) #x6B #x69))
                   (emit-bytes segment #x0F #xAF))
-              (emit-ea segment src dst)
+              (emit-ea segment src dst :remaining-bytes (if imm (size-nbyte imm-size) 0))
               (if imm
                   (emit-imm-operand segment imm imm-size))))))))
 
@@ -2083,7 +2070,7 @@
                  (t   (values #b11000000 t)))
              (emit-prefixes segment (sized-thing dst size) nil size)
              (emit-byte segment (opcode+size-bit opcode size))
-             (emit-ea segment dst subcode)
+             (emit-ea segment dst subcode :remaining-bytes (if immed 1 0))
              (when immed
                (emit-byte segment amount))))))
   (macrolet ((define (name subop)
@@ -2108,7 +2095,7 @@
            (emit-bytes segment #x0F
                        ;; SHLD = A4 or A5; SHRD = AC or AD
                        (dpb opcode (byte 1 3) (if (eq amt :cl) #xA5 #xA4)))
-           (emit-ea segment dst src)
+           (emit-ea segment dst src :remaining-bytes (if (eq amt :cl) 0 1))
            (unless (eq amt :cl)
              (emit-byte segment (the (mod 64) amt))))))
   (macrolet ((define (name direction-bit op)
@@ -2146,7 +2133,7 @@
                    (emit-byte segment (opcode+size-bit #xA8 size)))
                   (t
                    (emit-byte segment (opcode+size-bit #xF6 size))
-                   (emit-ea segment this #b000)))
+                   (emit-ea segment this #b000 :remaining-bytes 1)))
             (emit-imm-operand segment that size))
            (t
             (emit-byte segment (opcode+size-bit #x84 size))
@@ -2165,30 +2152,25 @@
     (:printer string-op ((op #b1010011)))
     (:emitter (emit* segment #b1010011 size)))
 
-  (define-instruction lods (segment acc)
+  (define-instruction lods (segment size)
     (:printer string-op ((op #b1010110)))
-    (:emitter (aver (accumulator-p acc))
-              (emit* segment #b1010110 (operand-size acc))))
+    (:emitter (emit* segment #b1010110 size)))
 
-  (define-instruction scas (segment acc)
+  (define-instruction scas (segment size)
     (:printer string-op ((op #b1010111)))
-    (:emitter (aver (accumulator-p acc))
-              (emit* segment #b1010111 (operand-size acc))))
+    (:emitter (emit* segment #b1010111 size)))
 
-  (define-instruction stos (segment acc)
+  (define-instruction stos (segment size)
     (:printer string-op ((op #b1010101)))
-    (:emitter (aver (accumulator-p acc))
-              (emit* segment #b1010101 (operand-size acc))))
+    (:emitter (emit* segment #b1010101 size)))
 
-  (define-instruction ins (segment acc)
+  (define-instruction ins (segment size)
     (:printer string-op ((op #b0110110)))
-    (:emitter (aver (accumulator-p acc))
-              (emit* segment #b0110110 (operand-size acc))))
+    (:emitter (emit* segment #b0110110 size)))
 
-  (define-instruction outs (segment acc)
+  (define-instruction outs (segment size)
     (:printer string-op ((op #b0110111)))
-    (:emitter (aver (accumulator-p acc))
-              (emit* segment #b0110111 (operand-size acc)))))
+    (:emitter (emit* segment #b0110111 size))))
 
 (define-instruction xlat (segment)
   (:printer byte ((op #b11010111)))
@@ -2221,7 +2203,7 @@
            (emit-prefixes segment src index size :lock (lockp prefix))
            (cond ((integerp index)
                   (emit-bytes segment #x0F #xBA)
-                  (emit-ea segment src opcode)
+                  (emit-ea segment src opcode :remaining-bytes 1)
                   (emit-byte segment index))
                  (t
                   (emit-bytes segment #x0F (dpb opcode (byte 3 3) #b10000011))
@@ -2384,7 +2366,7 @@
 
 ;;;; conditional byte set
 
-(define-instruction set (segment dst cond)
+(define-instruction set (segment cond dst) ; argument order is like JMPcc
   (:printer cond-set ())
   (:emitter
    (emit-prefixes segment (sized-thing dst :byte) nil :byte)
@@ -2923,8 +2905,7 @@
 ;;;     This is simply saying that we can faithfully round-trip our own asm.
 ;;; (3) On top of that, we'll _require_ that MOVD only operate on 32 bits,
 ;;;     and MOVQ on 64 bits. This is stricter than other assemblers.
-;;;     The rationale is after removing REG-IN-SIZE, the correct behavior
-;;;     is obtained with no further "opcode modifier" such as
+;;;     Furthermore MOVD does not accept a size prefix such as
 ;;;     (INST MOVD :QWORD X Y) ; <- What is this, I can't even.
 ;;;
 ;;; For further reading:
@@ -3495,6 +3476,10 @@
       ;; These are used for jump tables and are not recorded in code fixups.
       ;; GC knows to adjust the values if code is moved.
       (setf (sap-ref-64 sap offset) value))))
+  #-immobile-code
+  ;; Change asm routine indirect calls to not store the fixup,
+  ;; because the indirect address is in static space.
+  (when (and (eq flavor :assembly-routine*) (eq kind :absolute)) (setq kind :static))
   ;; An absolute fixup is stored in the code header's %FIXUPS slot if it
   ;; references an immobile-space (but not static-space) object.
   ;; Note that:
@@ -3598,6 +3583,31 @@
       (add-stmt-labels next (stmt-labels stmt))
       (delete-stmt stmt)
       next)))
+
+;;; In "{AND,OR,...} reg, src ; TEST reg, reg ; {JMP,SET} {:z,:nz,:s,:ns}"
+;;; the TEST is unnecessary since ALU operations set the Z and S flags.
+;;; Per the processor manual, TEST clears OF and CF, so presumably
+;;; there is not a branch-if on either of those flags.
+;;; It shouldn't be a problem that removal of TEST leaves more flags affected.
+(defpattern "ALU + test" ((add adc sub sbb and or xor neg sar shl shr) (test)) (stmt next)
+  (binding* (((size1 dst1 src1) (parse-2-operands stmt))
+             ((size2 dst2 src2) (parse-2-operands next))
+             (next-next (stmt-next next)))
+    (declare (ignore src1))
+    (when (and (not (stmt-labels next))
+               (gpr-tn-p dst2)
+               (location= dst1 dst2) ; they can have different SCs
+               (eq dst2 src2)
+               next-next
+               (memq (stmt-mnemonic next-next) '(jmp set))
+               ;; TODO: figure out when it would be correct to omit TEST for the carry flag
+               (case (car (stmt-operands next-next))
+                 ((:s :ns)
+                  (eq size2 size1))
+                 ((:ne :e :nz :z)
+                  (or (eq size2 size1) (and (eq size1 :dword) (eq size2 :qword))))))
+      (delete-stmt next)
+      next-next)))
 
 ;;; "fixnumize" + "SHR reg, N" where N > n-tag-bits skips the fixnumize.
 ;;; (could generalize: masking out N bits with AND, following by shifting

@@ -862,13 +862,13 @@
                       (node-reoptimize ref) nil)
                 (use-lvar ref lambda-lvar)
                 (setf (lvar-dest lambda-lvar) call)
-                (insert-node-before-no-split bind call)
+                (insert-node-before bind call)
                 (setf (combination-kind call) :local
                       (combination-args call) args)
                 (loop for arg in args
                       when arg
                       do (setf (lvar-dest arg) call))
-                (insert-node-before-no-split call ref))
+                (insert-node-before call ref))
               t))))))
 
 ;; Finally, duplicate EQ-nil tests
@@ -974,6 +974,13 @@
   (when (and (null (node-lvar node))
              (ir1-attributep (fun-info-attributes info) important-result)
              (neq (combination-info node) :important-result-discarded))
+    (when (lvar-fun-is (combination-fun node) '(adjust-array))
+      (let ((type (lvar-type (car (combination-args node)))))
+        ;; - if the array is simple, then result is important
+        ;; - if non-simple, then result is not important
+        ;; - if not enough information, then don't warn
+        (when (or (not (array-type-p type)) (array-type-complexp type)) ; T or :MAYBE
+          (return-from check-important-result))))
     (let ((*compiler-error-context* node))
       (setf (combination-info node) :important-result-discarded)
       (compiler-style-warn
@@ -1078,12 +1085,12 @@
 ;;; the code - it does; but compiler doesn't appear to respect the DX-FLET.
 (defglobal *dxify-args-transform*
   (make-transform :type (specifier-type 'function)
-                  :function (lambda (node)
+                  :%fun (lambda (node)
+                              "auto-DX"
                               (or (let ((name (combination-fun-source-name node)))
                                     (dxify-downward-funargs
                                      node (fun-name-dx-args name) name))
-                                  (give-up-ir1-transform)))
-                  :note "auto-DX"))
+                                  (give-up-ir1-transform)))))
 
 (defun check-proper-sequences (combination info)
   (when (fun-info-annotation info)
@@ -1101,7 +1108,7 @@
 
 ;;; Do IR1 optimizations on a COMBINATION node.
 (declaim (ftype (function (combination) (values)) ir1-optimize-combination))
-(defun ir1-optimize-combination (node)
+(defun ir1-optimize-combination (node &aux (show *show-transforms-p*))
   (when (lvar-reoptimize (basic-combination-fun node))
     (propagate-fun-change node)
     (when (node-deleted node)
@@ -1199,14 +1206,14 @@
                     ;; Are type checks getting in the way?
                     (or (try-equality-constraint node)
                         (dolist (x (fun-info-transforms info))
-                          (when (eq *show-transforms-p* :all)
+                          (when (eq show :all)
                             (let* ((lvar (basic-combination-fun node))
                                    (fname (lvar-fun-name lvar t)))
                               (format *trace-output*
                                       "~&trying transform ~s for ~s"
                                       (transform-type x) fname)))
-                          (unless (ir1-transform node x)
-                            (when (eq *show-transforms-p* :all)
+                          (unless (ir1-transform node x show)
+                            (when (eq show :all)
                               (format *trace-output*
                                       "~&quitting because IR1-TRANSFORM result was NIL"))
                             (return))))))))))))))
@@ -1493,11 +1500,11 @@
 ;;; finalize to pick up. We return true if the transform failed, and
 ;;; thus further transformation should be attempted. We return false
 ;;; if either the transform succeeded or was aborted.
-(defun ir1-transform (node transform)
+(defun ir1-transform (node transform show)
   (declare (type combination node) (type transform transform))
   (declare (notinline warn)) ; See COMPILER-WARN for rationale
   (let* ((type (transform-type transform))
-         (fun (transform-function transform))
+         (fun (transform-%fun transform))
          (constrained (fun-type-p type))
          (table (component-failed-optimizations *component-being-compiled*))
          (flame (case (transform-important transform)
@@ -1511,14 +1518,13 @@
                (valid-fun-use node type))
            (multiple-value-bind (severity args)
                (catch 'give-up-ir1-transform
-                 (transform-call node
-                                 (let ((new-form (funcall fun node)))
-                                   (when *show-transforms-p*
-                                     (show-transform "ir"
-                                                     (combination-fun-source-name node)
-                                                     new-form))
-                                   new-form)
-                                 (combination-fun-source-name node))
+                 (let ((new-form (if (listp fun) ; the deftransform had :INFO
+                                     (funcall (car fun) node (cdr fun))
+                                     (funcall fun node)))
+                       (fun-name (combination-fun-source-name node)))
+                   (when (show-transform-p show fun-name)
+                     (show-transform "ir" fun-name new-form))
+                   (transform-call node new-form fun-name))
                  (values :none nil))
              (ecase severity
                (:none
@@ -2739,39 +2745,36 @@
                  (filter-lvar
                   value
                   (if (cast-single-value-p cast)
-                      `(list 'dummy)
-                      `(multiple-value-call #'list 'dummy))))
+                      (lambda (dummy) `(list ,dummy))
+                      (lambda (dummy) `(multiple-value-call #'list ,dummy)))))
                (filter-lvar
                 (cast-value cast)
                 ;; FIXME: Derived type.
                 (if (cast-silent-conflict cast)
-                    (let ((dummy-sym (gensym)))
-                      `(let ((,dummy-sym 'dummy))
-                         ,@(and (eq (cast-silent-conflict cast) :style-warning)
-                                `((%compile-time-type-style-warn ,dummy-sym
-                                                                 ',(type-specifier atype)
-                                                                 ',(type-specifier value-type)
-                                                                 ',detail
-                                                                 ',(compile-time-type-error-context source-form)
-                                                                 ',context)))
-                         ,(internal-type-error-call dummy-sym atype context)
-                         ,dummy-sym))
-                    `(%compile-time-type-error 'dummy
-                                               ',(type-specifier atype)
-                                               ',(type-specifier value-type)
-                                               ',detail
-                                               ',(compile-time-type-error-context source-form)
-                                               ',context))))
-             ;; KLUDGE: FILTER-LVAR does not work for non-returning
-             ;; functions, so we declare the return type of
-             ;; %COMPILE-TIME-TYPE-ERROR to be * and derive the real type
-             ;; here.
-             (setq value (cast-value cast))
-             (derive-node-type (lvar-uses value) *empty-type*)
-             (maybe-terminate-block (lvar-uses value) nil)
-             ;; FIXME: Is it necessary?
-             (aver (null (block-pred (node-block cast))))
-             (delete-block-lazily (node-block cast))
+                    (lambda (dummy)
+                      (let ((dummy-sym (gensym)))
+                        `(let ((,dummy-sym ,dummy))
+                           ,@(and (eq (cast-silent-conflict cast) :style-warning)
+                                  `((%compile-time-type-style-warn ,dummy-sym
+                                                                   ',(type-specifier atype)
+                                                                   ',(type-specifier value-type)
+                                                                   ',detail
+                                                                   ',(compile-time-type-error-context source-form)
+                                                                   ',context)))
+                           ,(internal-type-error-call dummy-sym atype context)
+                           ,dummy-sym)))
+                    (lambda (dummy)
+                      `(%compile-time-type-error ,dummy
+                                                 ',(type-specifier atype)
+                                                 ',(type-specifier value-type)
+                                                 ',detail
+                                                 ',(compile-time-type-error-context source-form)
+                                                 ',context))))
+               ;; maybe-terminate-block during ir1-convert (in filter-lvar) doesn't
+               ;; properly terminate blocks for NIL returning functions, do it manually here.
+               (setq value (cast-value cast))
+               (derive-node-type (lvar-uses value) *empty-type*)
+               (maybe-terminate-block (lvar-uses value) nil))
              (return-from ir1-optimize-cast)))
       (when (eq (node-derived-type cast) *empty-type*)
         (maybe-terminate-block cast nil))

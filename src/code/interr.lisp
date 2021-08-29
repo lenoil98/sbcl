@@ -20,8 +20,8 @@
                `(progn
                   (defconstant n-internal-error-handlers ,n)
                   (declaim ((simple-vector ,n) **internal-error-handlers**))
-                  (!define-load-time-global **internal-error-handlers**
-                              ,(make-array n :initial-element 0))))))
+                  (define-load-time-global **internal-error-handlers**
+                      ,(make-array n :initial-element 0))))))
   (def-it))
 
 (defmacro deferr (name args &rest body)
@@ -325,7 +325,7 @@
   (if (invalid-array-p object)
       (invalid-array-error object)
       (error (if (and (%instancep object)
-                      (layout-invalid (%instance-layout object)))
+                      (wrapper-invalid (%instance-wrapper object)))
                  ;; Signaling LAYOUT-INVALID is dubious, but I guess it provides slightly
                  ;; more information in that it says that the object may have at some point
                  ;; been TYPE. Anyway, it's not wrong - it's a subtype of TYPE-ERROR.
@@ -335,8 +335,8 @@
              :expected-type (typecase type
                               (classoid-cell
                                (classoid-cell-name type))
-                              (layout
-                               (layout-proper-name type))
+                              (wrapper
+                               (wrapper-proper-name type))
                               (t
                                type))
              :context (sb-di:error-context))))
@@ -360,6 +360,8 @@
   (invalid-array-index-error array index bound))
 (deferr invalid-vector-index-error (vector index)
   (invalid-array-index-error vector index (length vector)))
+(deferr uninitialized-element-error (vector index)
+  (error 'uninitialized-element-error :name (cons vector index)))
 
 (deferr tls-exhausted-error ()
   ;; There is nothing we can do about it. A number of entries in the

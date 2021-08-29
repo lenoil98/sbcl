@@ -435,26 +435,48 @@
 (defun two-arg-string-not-greaterp (string1 string2)
   (string-not-greaterp* string1 string2 0 nil 0 nil))
 
-(defun make-string (count &key
-                    (element-type 'character)
-                    ((:initial-element fill-char)))
+(defun make-string (count &key (element-type 'character)
+                               (initial-element nil iep))
   "Given a character count and an optional fill character, makes and returns a
 new string COUNT long filled with the fill character."
   (declare (index count))
   (declare (explicit-check))
-  ;; FIXME: while this is a correct implementation relying on an IR1 transform,
-  ;; it would be better if in the following example (assuming NOTINLINE):
-  ;;  (MAKE-STRING 1000 :ELEMENT-TYPE 'BIT :INITIAL-element #\a)
-  ;; we could report that "BIT is not a subtype of CHARACTER"
-  ;; instead of "#\a is not of type BIT". Additionally, in this case:
-  ;;  (MAKE-STRING 200000000 :ELEMENT-TYPE 'WORD :INITIAL-ELEMENT #\a)
-  ;; the error reported is heap exhaustion rather than type mismatch.
-  (if fill-char
-      (make-string count :element-type element-type
-                         :initial-element (the character fill-char))
-      (make-string count :element-type element-type)))
+  (cond ((eq element-type 'character)
+         (let ((c (if iep (the character initial-element)))
+               (s (make-string count :element-type 'character)))
+           (when c (sb-vm::unpoison s) (fill s c))
+           s))
+         ((or (eq element-type 'base-char)
+              (eq element-type 'standard-char)
+              ;; What's the "most specialized" thing possible that's still a string?
+              ;; Well clearly it's a string whose elements have the smallest domain.
+              ;; So that would be 8 bits per character, not 32 bits per character.
+              (eq element-type nil))
+          (let ((c (if iep (the base-char initial-element)))
+                (s (make-string count :element-type 'base-char)))
+            (when c (sb-vm::unpoison s) (fill s c))
+            s))
+         (t
+          (multiple-value-bind (widetag n-bits-shift)
+              (sb-vm::%vector-widetag-and-n-bits-shift element-type)
+            (unless (or #+sb-unicode (= widetag sb-vm:simple-character-string-widetag)
+                        (= widetag sb-vm:simple-base-string-widetag))
+              (error "~S is not a valid :ELEMENT-TYPE for MAKE-STRING" element-type))
+            ;; If you give a ridiculous type such as (member #\EN_SPACE) as your
+            ;; :ELEMENT-TYPE, then you get what you deserve - slow type checking.
+            (when (and iep (not (typep initial-element element-type)))
+              (error 'simple-type-error
+                     :datum initial-element
+                     :expected-type element-type
+                     :format-control "~S is not a ~S"
+                     :format-arguments (list initial-element element-type)))
+            (let ((string
+                   (sb-vm::allocate-vector-with-widetag
+                    #+ubsan nil widetag count n-bits-shift)))
+              (when initial-element (fill string initial-element))
+              string)))))
 
-(declaim (inline nstring-upcase))
+(declaim (maybe-inline nstring-upcase))
 (defun nstring-upcase (string &key (start 0) end)
   (declare (explicit-check))
   (if (typep string '(array nil (*)))
@@ -467,27 +489,24 @@ new string COUNT long filled with the fill character."
                     string))
         (with-one-string (string start end)
           (do ((index start (1+ index))
-               (cases **character-cases**)
-               (case-pages **character-case-pages**))
+               (cases +character-cases+))
               ((>= index end))
             (declare (optimize (sb-c::insert-array-bounds-checks 0)))
             (let ((char (schar string index)))
               (with-case-info (char case-index cases
-                               :cases cases
-                               :case-pages case-pages)
+                               :cases cases)
                 (let ((code (aref cases (1+ case-index))))
                   (unless (zerop code)
                     (setf (schar string index)
                           (code-char (truly-the char-code code)))))))))
         string)))
-(declaim (notinline nstring-upcase))
 
 (defun string-upcase (string &key (start 0) end)
   (declare (explicit-check)
            (inline nstring-upcase))
   (nstring-upcase (copy-seq (%string string)) :start start :end end))
 
-(declaim (inline nstring-downcase))
+(declaim (maybe-inline nstring-downcase))
 (defun nstring-downcase (string &key (start 0) end)
   (declare (explicit-check))
   (if (typep string '(array nil (*)))
@@ -500,8 +519,7 @@ new string COUNT long filled with the fill character."
                     string))
         (with-one-string (string start end)
           (do ((index start (1+ index))
-               (cases **character-cases**)
-               (case-pages **character-case-pages**))
+               (cases +character-cases+))
               ((>= index end))
             (declare (optimize (sb-c::insert-array-bounds-checks 0)))
             (let ((char (schar (truly-the (or simple-base-string
@@ -509,14 +527,12 @@ new string COUNT long filled with the fill character."
                                           string)
                                index)))
               (with-case-info (char case-index cases
-                               :cases cases
-                               :case-pages case-pages)
+                               :cases cases)
                 (let ((code (aref cases case-index)))
                   (unless (zerop code)
                     (setf (schar string index)
                           (code-char (truly-the char-code code)))))))))
         string)))
-(declaim (notinline nstring-downcase))
 
 (defun string-downcase (string &key (start 0) end)
   (declare (explicit-check)
@@ -604,9 +620,14 @@ new string COUNT long filled with the fill character."
   ;; "Always" means that regardless of whether the user want
   ;; coalescing of strings used as literals in code compiled to memory,
   ;; the string is shareable.
-  ;;  #b01_ ; symbol name, literal compiled to fasl, some other stuff
-  ;;  #b10_ ; literal compiled to core
-  (set-header-data (the (simple-array * 1) vector)
-                   (if always-shareable
-                       sb-vm:+vector-shareable+
-                       sb-vm:+vector-shareable-nonstd+)))
+  (when (eq (heap-allocated-p vector) :dynamic)
+    (logior-header-bits (the (simple-array * 1) vector)
+                        (if always-shareable
+                            sb-vm:+vector-shareable+
+                            sb-vm:+vector-shareable-nonstd+)))
+  vector)
+
+(clear-info :function :inlining-data 'nstring-upcase)
+(clear-info :function :inlinep 'nstring-upcase)
+(clear-info :function :inlining-data 'nstring-downcase)
+(clear-info :function :inlinep 'nstring-downcase)

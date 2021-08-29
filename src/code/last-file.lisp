@@ -38,13 +38,15 @@
                                                     '(:extra-artifact) :target-compile)
                           :direction :output :if-exists :supersede)
     (dolist (root '(structure-object function))
-      (dolist (pair (sort (%hash-table-alist
-                           (classoid-subclasses (find-classoid root)))
-                          #'string<
-                          ;; pair = (#<classoid> . #<layout>)
-                          :key (lambda (pair) (classoid-name (car pair)))))
-        (let* ((layout (cdr pair))
-               (dd (layout-info layout)))
+      (dolist (pair (let ((subclassoids (classoid-subclasses (find-classoid root))))
+                      (if (listp subclassoids)
+                          subclassoids
+                          (sort (%hash-table-alist subclassoids)
+                                #'string<
+                                ;; pair = (#<classoid> . #<layout>)
+                                :key (lambda (pair) (classoid-name (car pair)))))))
+        (let* ((wrapper (cdr pair))
+               (dd (wrapper-info wrapper)))
           (cond
            (dd
             (let* ((*print-pretty* nil) ; output should be insensitive to host pprint
@@ -53,11 +55,10 @@
                    (*package* (cl:symbol-package classoid-name)))
               (format output "~/sb-ext:print-symbol-with-prefix/ ~S (~%"
                       classoid-name
-                      (list* (the (unsigned-byte 16) (layout-flags layout))
-                             (layout-depthoid layout)
-                             (map 'list
-                                  (lambda (x) (classoid-name (layout-classoid x)))
-                                  (layout-inherits layout))))
+                      (list* (the (unsigned-byte 16) (wrapper-flags wrapper))
+                             (wrapper-depthoid wrapper)
+                             (map 'list #'sb-kernel::wrapper-classoid-name
+                                  (wrapper-inherits wrapper))))
               (dolist (dsd (dd-slots dd) (format output ")~%"))
                 (format output "  (~d ~S ~S)~%"
                         (sb-kernel::dsd-bits dsd)

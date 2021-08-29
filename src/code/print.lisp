@@ -54,7 +54,7 @@ Does not affect the cases that are already controlled by *PRINT-LENGTH*")
    style conditional newlines are turned on, and all indentations are
    turned off. If NIL, never use miser mode.")
 (defvar *print-pprint-dispatch*
-  (sb-pretty::make-pprint-dispatch-table nil nil nil) ; for type-correctness
+  (sb-pretty::make-pprint-dispatch-table #() nil nil) ; for type-correctness
   "The pprint-dispatch-table that controls how to pretty-print objects.")
 (defparameter *suppress-print-errors* nil
   "Suppress printer errors when the condition is of the type designated by this
@@ -378,17 +378,24 @@ variable: an unreadable object representing the error is printed instead.")
         (return-from output-ugly-object
           (print-unreadable-object (object stream :identity t)
             (prin1 'instance stream))))
-      (let ((classoid (layout-classoid layout)))
+      (let* ((wrapper (layout-friend layout))
+             (classoid (wrapper-classoid wrapper)))
         ;; Additionally, don't crash if the object is an obsolete thing with
         ;; no update protocol.
         (when (or (sb-kernel::undefined-classoid-p classoid)
-                  (and (layout-invalid layout)
+                  (and (wrapper-invalid wrapper)
                        (logtest (layout-flags layout)
                                 (logior +structure-layout-flag+
                                         +condition-layout-flag+))))
           (return-from output-ugly-object
             (print-unreadable-object (object stream :identity t)
               (format stream "UNPRINTABLE instance of ~W" classoid)))))))
+  (when (funcallable-instance-p object)
+    (let ((layout (%fun-layout object)))
+      (unless (logtest (get-lisp-obj-address layout) sb-vm:widetag-mask)
+        (return-from output-ugly-object
+          (print-unreadable-object (object stream :identity t)
+            (prin1 'funcallable-instance stream))))))
   (print-object object stream))
 
 ;;;; symbols
@@ -497,7 +504,7 @@ variable: an unreadable object representing the error is printed instead.")
                                :initial-element 36)))
       (dotimes (i 36 a)
         (let ((char (digit-char i 36)))
-          (setf (aref a (sb-xc:char-code char)) i))))
+          (setf (aref a (char-code char)) i))))
   #'equalp)
 
 (defconstant-eqx +character-attributes+
@@ -506,7 +513,7 @@ variable: an unreadable object representing the error is printed instead.")
                                :element-type '(unsigned-byte 16)
                                :initial-element 0)))
       (flet ((set-bit (char bit)
-               (let ((code (sb-xc:char-code char)))
+               (let ((code (char-code char)))
                  (setf (aref a code) (logior bit (aref a code))))))
 
         (dolist (char '(#\! #\@ #\$ #\% #\& #\* #\= #\~ #\[ #\] #\{ #\}
@@ -516,12 +523,12 @@ variable: an unreadable object representing the error is printed instead.")
         (dotimes (i 10)
           (set-bit (digit-char i) number-attribute))
 
-        (do ((code (sb-xc:char-code #\A) (1+ code))
-             (end (sb-xc:char-code #\Z)))
+        (do ((code (char-code #\A) (1+ code))
+             (end (char-code #\Z)))
             ((> code end))
           (declare (fixnum code end))
-          (set-bit (sb-xc:code-char code) uppercase-attribute)
-          (set-bit (char-downcase (sb-xc:code-char code)) lowercase-attribute))
+          (set-bit (code-char code) uppercase-attribute)
+          (set-bit (char-downcase (code-char code)) lowercase-attribute))
 
         (set-bit #\- sign-attribute)
         (set-bit #\+ sign-attribute)
@@ -1358,8 +1365,14 @@ variable: an unreadable object representing the error is printed instead.")
             (double-float double-float-min-e)
             #+long-float
             (long-float long-float-min-e))))
-    (multiple-value-bind (f e)
-        (integer-decode-float float)
+    (multiple-value-bind (f e) (integer-decode-float float)
+      ;; An extra step became necessary here for subnormals because the
+      ;; algorithm assumes that the fraction is left-aligned in a field
+      ;; that is FLOAT-DIGITS wide.
+      (when (< (float-precision float) float-digits)
+        (let ((shift (- float-digits (integer-length f))))
+          (setq f (ash f shift)
+                e (- e shift))))
       (let ( ;; FIXME: these even tests assume normal IEEE rounding
             ;; mode.  I wonder if we should cater for non-normal?
             (high-ok (evenp f))
@@ -1699,7 +1712,7 @@ variable: an unreadable object representing the error is printed instead.")
                       (write-string ", " stream)
                       (output-object (sb-c::debug-info-name dinfo) stream)))))))))
 
-#-(or x86 x86-64)
+#-(or x86 x86-64 arm64)
 (defmethod print-object ((lra lra) stream)
   (print-unreadable-object (lra stream :identity t)
     (write-string "return PC object" stream)))
@@ -1823,6 +1836,9 @@ variable: an unreadable object representing the error is printed instead.")
     ;; If specifically the unbound marker with 0 data,
     ;; as opposed to any other unbound marker.
     (print-unreadable-object (object stream) (write-string "unbound" stream))
+    (return-from print-object))
+  (when (eql (get-lisp-obj-address object) sb-vm:no-tls-value-marker-widetag)
+    (print-unreadable-object (object stream) (write-string "novalue" stream))
     (return-from print-object))
   (print-unreadable-object (object stream :identity t)
     (let ((lowtag (lowtag-of object)))

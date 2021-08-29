@@ -45,7 +45,7 @@
             (setf *report-skipped-tests* t))
            ((string= arg "--no-color"))
            (t
-            (push (truename (parse-namestring arg)) *explicit-test-files*))))
+            (push (merge-pathnames (parse-namestring arg)) *explicit-test-files*))))
   (setf *explicit-test-files* (nreverse *explicit-test-files*))
   (with-open-file (log "test.log" :direction :output
                        :if-exists :supersede
@@ -154,16 +154,23 @@
              (namestring (make-pathname :name (pathname-name thing)
                                         :type (pathname-type thing))))
            (stem= (a b)
-             (string= (stem-of a) (stem-of b))))
+             (string= (stem-of a) (stem-of b)))
+           (starts-with-p (string prefix)
+             (= (mismatch string prefix) (length prefix))))
     (unless (eq (pathname-host filename) sb-impl::*physical-host*)
       (return-from check-manifest))
     (let ((string (namestring filename)))
       (when (or (find #\* (stem-of filename)) ; wild
-                (= (mismatch string "/dev/") 5) ; dev/null and dev/random
-                (= (mismatch string "/tmp/") 5)
-                (= (mismatch string "/var/tmp/") 9)
-                (= (mismatch string "/proc/self") 10)
-                (eql (search "/private/var/folders/" string) 0)
+                (starts-with-p string "/dev/") ; dev/null and dev/random
+                (starts-with-p string "/proc/self")
+                ;; Temp files created by test-util's scratch file routine
+                (starts-with-p (stem-of string) *scratch-file-prefix*)
+                ;; These have been accepted as okay for a while.  Test
+                ;; files should never explicitly create files in these
+                ;; directories, but should always use a scratch file.
+                (starts-with-p string "/tmp/")
+                (starts-with-p string "/var/tmp/")
+                (starts-with-p string "/private/var/folders/")
                 (string= string "exists")
                 (member (stem-of filename) '("compiler-test-util.lisp"
                                              "a.txt" "b.lisp"
@@ -201,14 +208,14 @@
                   (make-package
                    (format nil "TEST~36,5,'_R" (random (expt 36 5)))
                    :use (append packages-to-use standard-use-list))
-                  (find-package "CL-USER")))
-             (*allowed-inputs*
+                  (find-package "CL-USER"))))
+        (setq *allowed-inputs*
               (if (eq *input-manifest* :ignore)
                   :any
                   (append (cdr (assoc (namestring (make-pathname :name (pathname-name file)
                                                                  :type (pathname-type file)))
                                       *input-manifest* :test #'string=))
-                          (list file)))))
+                          (list file))))
         (sb-int:encapsulate
          'open 'open-guard
          (lambda (f filename &rest args &key direction &allow-other-keys)
@@ -264,6 +271,7 @@
                             sb-kernel::%compiler-defclass))
             (sb-int:unencapsulate symbol 'defblah-guard))
           (delete-package test-package))))
+    (makunbound '*allowed-inputs*)
     ;; after all the files are done
     (append-failures)))
 
@@ -339,7 +347,12 @@
       (loop for file in *explicit-test-files*
             when (pathname-match-p file wild-mask)
             collect file)
-      (directory wild-mask)))
+      (directory wild-mask
+                 ;; If we're in a tree whose non-directories are
+                 ;; symlinks, the truenames of those symlinks might
+                 ;; not have the same relationships to each other as
+                 ;; we need.
+                 :resolve-symlinks nil)))
 
 (defun pure-load-files ()
   (filter-test-files "*.pure.lisp"))

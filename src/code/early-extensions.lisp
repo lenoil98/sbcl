@@ -13,6 +13,38 @@
 
 (in-package "SB-IMPL")
 
+;;; FIXME: a lot of places in the code that should use ARRAY-RANGE
+;;; instead use INDEX and vice-versa, but the thing is, we have
+;;; a ton of fenceposts errors all over the place regardless.
+;;; CLHS glosary reference:
+;;; "array total size n. the total number of elements in an array,
+;;;  computed by taking the product of the dimensions of the array."
+;;; and ARRAY-TOTAL-SIZE-LIMIT:
+;;; "The upper exclusive bound on the array total size of an array."
+
+;;; Consider a reduced example for the sake of argument in which
+;;; ARRAY-TOTAL-SIZE-LIMIT were 21.
+;;; - the largest vector would have LENGTH 20.
+;;; - the largest legal index for AREF on it would be 19.
+;;; - the largest legal :END on sequence functions would be 20.
+;;; Nothing should allow 21. So DEFTYPE ARRAY-RANGE is wrong
+;;; and must never be used for anything.
+;;; Unfortunately, it's all over mb-util and enc-utf etc.
+;;;
+;;; *Also* INDEX is wrong, as the comment there says.
+;;; To fix these and also SEQUENCE-END:
+;;; - INDEX should be `(integer 0 (,1- array-dimension-limit))
+;;; - ARRAY-RANGE should be `(integer 0 (,array-dimension-limit))
+;;; - SEQUENCE-END (in deftypes-for-target) should be
+;;;   `(OR NULL ARRAY-RANGE)
+;;;
+;;; A further consideration for INDEX on 64-bit machines is that
+;;; if INDEX were equivalent to (UNSIGNED-BYTE n) for some 'n'
+;;; then (TYPEP X 'INDEX) can combines FIXNUMP and the range test into
+;;; one bit-masking test, depending on the architecture.
+;;; Probably it should be (UNSIGNED-BYTE 61) except on ppc64
+;;; where it would have to be (UNSIGNED-BYTE 59).
+
 ;;; A number that can represent an index into a vector, including
 ;;; one-past-the-end
 (deftype array-range ()
@@ -436,6 +468,7 @@ NOTE: This interface is experimental and subject to change."
 
 ;; Make a new hash-cache and optionally create the statistics vector.
 (defun alloc-hash-cache (size symbol)
+  (declare (type index size))
   (let (cache)
     ;; It took me a while to figure out why infinite recursion could occur
     ;; in VALUES-SPECIFIER-TYPE. It's because SET calls VALUES-SPECIFIER-TYPE.
@@ -605,7 +638,7 @@ NOTE: This interface is experimental and subject to change."
                  (values ,@result-temps))))))
     `(progn
        (pushnew ',var-name *cache-vector-symbols*)
-       (!define-load-time-global ,var-name nil)
+       (define-load-time-global ,var-name nil)
        ,@(when *profile-hash-cache*
            `((declaim (type (simple-array fixnum (3)) ,statistics-name))
              (defvar ,statistics-name)))
@@ -1203,7 +1236,7 @@ NOTE: This interface is experimental and subject to change."
 (defun setup-type-in-final-deprecation
     (software version name replacement-spec)
   (declare (ignore software version replacement-spec))
-  (%compiler-deftype name (constant-type-expander name t) nil))
+  (%deftype name (constant-type-expander name t) nil))
 
 ;; Given DECLS as returned by from parse-body, and SYMBOLS to be bound
 ;; (with LET, MULTIPLE-VALUE-BIND, etc) return two sets of declarations:

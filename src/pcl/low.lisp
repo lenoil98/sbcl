@@ -46,8 +46,7 @@
 (defun defstruct-classoid-p (classoid)
   ;; It is non-obvious to me why STRUCTURE-CLASSOID-P doesn't
   ;; work instead of this. -- NS 2008-03-14
-  (typep #-metaspace (layout-info (classoid-layout classoid))
-         #+metaspace (sb-kernel::wrapper-%info (sb-kernel::classoid-wrapper classoid))
+  (typep (sb-kernel::wrapper-%info (classoid-wrapper classoid))
          'defstruct-description))
 
 ;;; This excludes structure types created with the :TYPE option to
@@ -75,10 +74,11 @@
   (and (symbolp type)
        (condition-classoid-p (find-classoid type nil))))
 
+(eval-when (:compile-toplevel)
 (defmacro dotimes-fixnum ((var count &optional (result nil)) &body body)
   `(dotimes (,var (the fixnum ,count) ,result)
      (declare (fixnum ,var))
-     ,@body))
+     ,@body)))
 
 (define-load-time-global *pcl-misc-random-state* (make-random-state))
 
@@ -92,6 +92,7 @@
 ;;; This formerly punted with slightly greater than 50% probability,
 ;;; and there was a periodicity to the nonrandomess.
 ;;; If that was intentional, it should have been commented to that effect.
+(eval-when (:compile-toplevel)
 (defmacro randomly-punting-lambda (lambda-list &body body)
   (with-unique-names (drops drop-pos)
     `(let ((,drops (random-fixnum)) ; means a POSITIVE fixnum
@@ -103,15 +104,14 @@
            (locally ,@body))
          (when (zerop ,drop-pos)
            (setf ,drops (random-fixnum)
-                 ,drop-pos sb-vm:n-positive-fixnum-bits))))))
+                 ,drop-pos sb-vm:n-positive-fixnum-bits)))))))
 
 (defun set-funcallable-instance-function (fin new-value)
   (declare (type function new-value))
   ;; It's not worth bothering to teach the compiler to efficiently transform
-  ;; a type declaration involving FUNCALLABLE-STANDARD-OBJECT, not the least
+  ;; a type test involving FUNCALLABLE-STANDARD-OBJECT, not the least
   ;; of the problems being that the type isn't known during make-host-2.
-  (unless (and #+compact-instance-header (functionp fin)
-               #-compact-instance-header (funcallable-instance-p fin)
+  (unless (and (function-with-layout-p fin)
                (logtest (layout-flags (%fun-layout fin))
                         +pcl-object-layout-flag+))
     (error 'type-error :datum fin :expected-type 'funcallable-standard-object))
@@ -191,28 +191,15 @@
     (setf (fdefinition new-name) fun))
   fun)
 
-;;; FIXME: probably no longer needed after init
-(defmacro precompile-random-code-segments (&optional system)
-  `(progn
-     (eval-when (:compile-toplevel)
-       (update-dispatch-dfuns))
-     (precompile-function-generators ,system)
-     (precompile-dfun-constructors ,system)
-     (precompile-ctors)))
-
 ;;; This definition is for interpreted code.
 ;;; FIXME: (1) is EXPLICIT-CHECK really doing anything here?
 ;;;        (2) why isn't this named STANDARD-OBJECT-P?
 (defun pcl-instance-p (x) (declare (explicit-check)) (%pcl-instance-p x))
 
-(defmacro %std-instance-slots (x)
-  `(%instance-ref ,x ,sb-vm:instance-data-start))
 (defmacro std-instance-slots (x)
-  `(truly-the simple-vector (%std-instance-slots ,x)))
-(defmacro %fsc-instance-slots (fin)
-  `(%funcallable-instance-info ,fin 0))
+  `(truly-the simple-vector (%instance-ref ,x ,sb-vm:instance-data-start)))
 (defmacro fsc-instance-slots (x)
-  `(truly-the simple-vector (%fsc-instance-slots ,x)))
+  `(truly-the simple-vector (%funcallable-instance-info ,x 0)))
 
 ;;; FIXME: These functions are called every place we do a
 ;;; CALL-NEXT-METHOD, and probably other places too. It's likely worth
@@ -308,7 +295,7 @@
       (let ((setter 0))
         (lambda (newval instance)
           (if (eql setter 0)
-              (let* ((dd (layout-info (%instance-layout instance)))
+              (let* ((dd (wrapper-info (%instance-wrapper instance)))
                      (f (compile nil (slot-setter-lambda-form dd slotd))))
                 (if (functionp f)
                     (funcall (setq setter f) newval instance)

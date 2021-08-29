@@ -74,10 +74,10 @@
                      (type-specifier type))
               t)
           (or (eq (array-type-specialized-element-type type) *wild-type*)
+              ;; FIXME: see whether this TYPE= can be reduced to EQ.
+              ;; (Each specialized element type should be an interned ctype)
               (values (type= (array-type-specialized-element-type type)
-                             ;; FIXME: not the most efficient.
-                             (specifier-type (array-element-type
-                                              object)))))))
+                             (sb-vm::array-element-ctype object))))))
     (member-type
      (when (member-type-member-p object type)
        t))
@@ -86,7 +86,7 @@
          (funcall (built-in-classoid-predicate type) object)
          (and (or (%instancep object)
                   (functionp object))
-              (classoid-typep (layout-of object) type object))))
+              (classoid-typep (wrapper-of object) type object))))
     (union-type
      (some (lambda (union-type-type) (recurse object union-type-type))
            (union-type-types type)))
@@ -133,7 +133,7 @@
            ((functionp) (functionp object)) ; least strict
            ((nil) ; medium strict
             (and (functionp object)
-                 (csubtypep (specifier-type (sb-impl::%fun-type object)) type)))
+                 (csubtypep (specifier-type (sb-impl::%fun-ftype object)) type)))
            (t ; strict
             (error "Function types are not a legal argument to TYPEP:~%  ~S"
                    (type-specifier type))))))))
@@ -154,9 +154,8 @@
                       (block nil
                         (classoid-typep
                          (typecase object
-                           (instance (%instance-layout object))
-                           (funcallable-instance
-                            (%fun-layout object))
+                           (instance (%instance-wrapper object))
+                           (funcallable-instance (%fun-wrapper object))
                            (t (return)))
                          (cdr (truly-the cons cache))
                          object)))
@@ -178,23 +177,27 @@
     (unless classoid
       (error "The class ~S has not yet been defined."
              (classoid-cell-name cell)))
-    (classoid-typep layout classoid object)))
+    (classoid-typep (layout-friend layout) classoid object)))
 
 ;;; Return true of any object which is either a funcallable-instance,
 ;;; or an ordinary instance that is not a structure-object.
 (declaim (inline %pcl-instance-p))
 (defun %pcl-instance-p (x)
-  ;; The COND is more efficient than LAYOUT-OF.
-  (layout-for-pcl-obj-p (cond ((%instancep x) (%instance-layout x))
-                              ((function-with-layout-p x) (%fun-layout x))
-                              (t (return-from %pcl-instance-p nil)))))
+  ;; read-time eval so that vop-existsp isn't part of the inline expansion
+  #.(if (sb-c::vop-existsp :translate %instanceoid-layout)
+        '(logtest (layout-flags (%instanceoid-layout x)) +pcl-object-layout-flag+)
+        ;; The COND is slightly more efficient than LAYOUT-OF.
+        '(layout-for-pcl-obj-p
+          (cond ((%instancep x) (%instance-layout x))
+                ((function-with-layout-p x) (%fun-layout x))
+                (t (return-from %pcl-instance-p nil))))))
 
 ;;; Try to ensure that the object's layout is up-to-date only if it is an instance
 ;;; or funcallable-instance of other than a static or structure classoid type.
 (defun update-object-layout (object)
-  (if (%pcl-instance-p object)
-      (sb-pcl::check-wrapper-validity object)
-      (layout-of object)))
+  (wrapper-friend (if (%pcl-instance-p object)
+                      (sb-pcl::check-wrapper-validity object)
+                      (wrapper-of object))))
 
 ;;; Test whether OBJ-LAYOUT is from an instance of CLASSOID.
 
@@ -226,6 +229,7 @@
 ;;; of thousands of iterations of 'classoid-typep.impure.lisp'
 
 (defun classoid-typep (obj-layout classoid object)
+  (declare (type wrapper obj-layout))
   ;; FIXME & KLUDGE: We could like to grab the *WORLD-LOCK* here (to ensure that
   ;; class graph doesn't change while we're doing the typep test), but in
   ;; practice that causes trouble -- deadlocking against the compiler
@@ -240,24 +244,24 @@
              ;; that we're testing against. Whether obj-layout is "valid" has no relevance.
              ;; This is racy though because %ENSURE-CLASSOID-VALID should return
              ;; the most up-to-date layout for the classoid, but it doesn't. Oh well.
-             (%ensure-classoid-valid classoid (classoid-layout classoid) "typep")
-             (values obj-layout (classoid-layout classoid)))
+             (%ensure-classoid-valid classoid (classoid-wrapper classoid) "typep")
+             (values obj-layout (classoid-wrapper classoid)))
             (t
              ;; And this case is even more racy, naturally.
-             (do ((layout (classoid-layout classoid) (classoid-layout classoid))
+             (do ((layout (classoid-wrapper classoid) (classoid-wrapper classoid))
                   (i 0 (+ i 1))
                   (obj-layout obj-layout))
-                 ((and (not (layout-invalid obj-layout))
-                       (not (layout-invalid layout)))
+                 ((and (not (wrapper-invalid obj-layout))
+                       (not (wrapper-invalid layout)))
                   (values obj-layout layout))
                (aver (< i 2))
                (%ensure-classoid-valid classoid layout "typep")
-               (when (zerop (layout-clos-hash obj-layout))
+               (when (zerop (wrapper-clos-hash obj-layout))
                  (setq obj-layout (sb-pcl::check-wrapper-validity object))))))
     ;; FIXME: if LAYOUT is for a structure, use the STRUCTURE-IS-A test
     ;; which avoids iterating.
     (or (eq obj-layout layout)
-        (let ((obj-inherits (layout-inherits obj-layout)))
+        (let ((obj-inherits (wrapper-inherits obj-layout)))
           (dotimes (i (length obj-inherits) nil)
             (when (eq (svref obj-inherits i) layout)
               (return t)))))))
@@ -297,7 +301,7 @@
          (if (if (csubtypep type (specifier-type 'function))
                  (funcallable-instance-p obj)
                  (%instancep obj))
-             (if (eq (classoid-layout type)
+             (if (eq (classoid-wrapper type)
                      (info :type :compiler-layout (classoid-name type)))
                  (values (sb-xc:typep obj type) t)
                  (values nil nil))
@@ -383,7 +387,7 @@
       (function
        (if (funcallable-instance-p x)
            (classoid-of x)
-           (let ((type (sb-impl::%fun-type x)))
+           (let ((type (sb-impl::%fun-ftype x)))
              (if (typep type '(cons (eql function))) ; sanity test
                  (try-cache type)
                  (classoid-of x)))))
@@ -456,7 +460,7 @@
                                            sb-vm:n-widetag-bits)
                                       (array-underlying-widetag array)))))
   ;; The value computed on cache miss.
-  (let ((etype (specifier-type (array-element-type array))))
+  (let ((etype (sb-vm::array-element-ctype array)))
     (make-array-type (array-dimensions array)
                      :complexp (not (simple-array-p array))
                      :element-type etype

@@ -215,37 +215,40 @@
          ;; This should pick off the most frequently-occurring things first.
          ;; CONS and INSTANCE of course top the list.
          (typecase object
-           (cons 2)
+           (list (if object 2 sizeof-nil-in-words))
            (instance (1+ (instance-length object)))
            (function
-            (when (= (fun-subtype object) simple-fun-widetag)
+            (when (= (%fun-pointer-widetag object) simple-fun-widetag)
               (return-from primitive-object-size
                 (code-object-size (fun-code-header (truly-the simple-fun object)))))
             (1+ (get-closure-length object)))
+           ;; Must be an OTHER pointer now
            (code-component
             (return-from primitive-object-size (code-object-size object)))
-           ;; Most everything else is an OTHER pointer, except for NIL.
-           ;; Arrays (especially strings and simple-vector) and symbols tend to be the
-           ;; next-most-common heap object, for which we need the ROOM-INFO.
+           (fdefn 4) ; constant length not stored in the header
+           ((satisfies array-header-p)
+            (+ array-dimensions-offset (array-rank object)))
+           ((simple-array nil (*)) 2) ; no payload
+           (bignum
+            #+bignum-assertions
+            (+ (* (sb-bignum:%bignum-length object) 2) 2)
+            #-bignum-assertions
+            ;; 64-bit machines might want to store the bignum length in the upper 4
+            ;; bytes of the header which would simplify %bignum-set-length.
+            (1+ (sb-bignum:%bignum-length object)))
            (t
             (let ((room-info (aref *room-info* (%other-pointer-widetag object))))
-              (cond ((typep room-info 'specialized-array-element-type-properties)
-                     (let ((n-data-octets (vector-n-data-octets object room-info)))
-                       (+ (ceiling n-data-octets n-word-bytes) ; N data words
-                          vector-data-offset)))
-                    (t
-                     (typecase object
-                       (fdefn 4) ; constant length not stored in the header
-                       ((satisfies array-header-p)
-                        (+ array-dimensions-offset (array-rank object)))
-                       ((simple-array nil (*)) 2) ; no payload
-                       (null sizeof-nil-in-words)
-                       (t
-                        ;; GET-HEADER-DATA works for everything that's left
-                        (1+ (logand (get-header-data object)
-                                    (room-info-mask room-info))))))))))))
+              (if (typep room-info 'specialized-array-element-type-properties)
+                  (let ((n-data-octets (vector-n-data-octets object room-info)))
+                    (+ (ceiling n-data-octets n-word-bytes) ; N data words
+                       vector-data-offset))
+                  ;; GET-HEADER-DATA works for everything that's left
+                  (1+ (logand (get-header-data object)
+                              (room-info-mask room-info)))))))))
         (* (align-up words 2) n-word-bytes)))
 
+;;; Macros not needed after this file (and avoids a redefinition warning this way)
+(eval-when (:compile-toplevel)
 (defmacro widetag@baseptr (sap)
   #+big-endian `(sap-ref-8 ,sap ,(1- n-word-bytes))
   #+little-endian `(sap-ref-8 ,sap 0))
@@ -254,7 +257,7 @@
   `(%make-lisp-obj
     (logior (sap-int ,sap)
             (logand (deref (extern-alien "widetag_lowtag" (array char 256)) ,widetag)
-                    lowtag-mask))))
+                    lowtag-mask)))))
 
 ;;; This uses the funny fixnum representation of ADDRESS. I'd like to change this
 ;;; to take a SAP but god forbid people are using it?
@@ -562,7 +565,7 @@ We could try a few things to mitigate this:
   #+gencgc
   (let ((region-struct
           #+sb-thread (sap+ (sb-thread::current-thread-sap)
-                            (ash thread-alloc-region-slot word-shift))
+                            (ash thread-boxed-tlab-slot word-shift))
           ;; If no threads, the alloc_region struct is in static space.
           #-sb-thread (int-sap boxed-region)))
     ;; The 'start_addr' field is at word index 3 of the structure (see gencgc-alloc-region.h).
@@ -777,9 +780,9 @@ We could try a few things to mitigate this:
                  (eql type funcallable-instance-widetag))
          (incf total-objects)
          (let* ((layout (if (eql type funcallable-instance-widetag)
-                            (%fun-layout obj)
-                            (%instance-layout obj)))
-                (classoid (layout-classoid layout))
+                            (%fun-wrapper obj)
+                            (%instance-wrapper obj)))
+                (classoid (wrapper-classoid layout))
                 (found (ensure-gethash classoid totals (cons 0 0)))
                 (size size))
            (declare (fixnum size))
@@ -1049,12 +1052,9 @@ We could try a few things to mitigate this:
          ;; These two are in fact generally the most frequently occurring type.
          ,.(make-case 'cons `(car ,obj) `(cdr ,obj))
          ,.(make-case* 'instance
-            `(let ((.l. (%instance-layout ,obj)))
-               ;; Though we've bound %INSTANCE-LAYOUT to a variable,
-               ;; pass the form %INSTANCE-LAYOUT to functoid
-               ;; in case it wants to examine the form
+            `(progn
                (,functoid (%instance-layout ,obj) ,@more)
-               (do-instance-tagged-slot (.i. ,obj :layout .l. :pad nil)
+               (do-instance-tagged-slot (.i. ,obj nil)
                  (,functoid (%instance-ref ,obj .i.) ,@more))))
          (function
           (typecase ,obj
@@ -1066,7 +1066,7 @@ We could try a few things to mitigate this:
                   ;; if functoid is a macro that does nothing.
                   (,functoid .o. ,@more)))
             ,.(make-case* 'funcallable-instance
-               `(let ((.l. (%fun-layout ,obj)))
+               `(progn
                   ;; As for INSTANCE, allow the functoid to see the access form
                   (,functoid (%fun-layout ,obj) ,@more)
                   (,functoid (%funcallable-instance-fun ,obj) ,@more)
@@ -1076,7 +1076,7 @@ We could try a few things to mitigate this:
                   ;; both tricky and unnecessary to generalize iteration.
                   ;; So just hardcode the few cases that exist.
                   #+compact-instance-header
-                  (ecase (layout-bitmap .l.)
+                  (ecase (wrapper-bitmap (%fun-wrapper ,obj))
                     (-1 ; external trampoline, all slots are tagged
                      ;; In this case, the trampoline word is scanned, with no ill effect.
                      (loop for .i. from 0
@@ -1090,7 +1090,7 @@ We could try a few things to mitigate this:
                      (,functoid (%funcallable-instance-info ,obj 0) ,@more)))
                   #-compact-instance-header
                   (progn
-                    (aver (eql (layout-bitmap .l.) -4))
+                    (aver (eql (wrapper-bitmap (%fun-wrapper ,obj)) -4))
                     ;;            v ----trampoline
                     ;; = #b1...1100
                     ;;           ^----- layout
@@ -1160,6 +1160,7 @@ We could try a few things to mitigate this:
 ;;; code-components are considered to reference their embedded
 ;;; simple-funs for this purpose; if THIS is a simple-fun, it is ignored.
 (defun references-p (this that)
+  (declare (optimize (sb-c::aref-trapping 0)))
   (macrolet ((test (x) `(when (eq ,x that) (go win))))
     (tagbody
        (do-referenced-object (this test)
@@ -1274,7 +1275,8 @@ We could try a few things to mitigate this:
                                 &aux (n-code-bytes 0)
                                      (total-pages next-free-page)
                                      (pages
-                                      (make-array total-pages :element-type 'bit)))
+                                      (make-array total-pages :element-type 'bit
+                                                  :initial-element 0)))
   (flet ((dump-page (page-num)
            (format stream "~&Page ~D~%" page-num)
            (let ((where (+ dynamic-space-start (* page-num gencgc-card-bytes)))
@@ -1363,8 +1365,8 @@ We could try a few things to mitigate this:
 (defun !ensure-genesis-code/data-separation ()
   #+gencgc
   (let* ((n-bits (+ next-free-page 10))
-         (code-bits (make-array n-bits :element-type 'bit))
-         (data-bits (make-array n-bits :element-type 'bit))
+         (code-bits (make-array n-bits :element-type 'bit :initial-element 0))
+         (data-bits (make-array n-bits :element-type 'bit :initial-element 0))
          (total-code-size 0))
     (map-allocated-objects
      (lambda (obj type size)
@@ -1492,6 +1494,7 @@ We could try a few things to mitigate this:
                           #b1111111 ; all generations
                           3 3))))
 
+(export 'code-from-serialno)
 (defun code-from-serialno (serial)
   (dx-flet ((visit (obj)
               (when (= (%code-serialno obj) serial)
@@ -1499,10 +1502,10 @@ We could try a few things to mitigate this:
     (map-code-objects #'visit)))
 
 (defun show-all-layouts ()
-  (let ((l (sb-vm::list-allocated-objects :all :test #'sb-kernel::layout-p))
+  (let ((l (sb-vm::list-allocated-objects :all :test #'sb-kernel::wrapper-p))
         zero trailing-raw trailing-tagged vanilla)
     (dolist (x l)
-      (let ((m (sb-kernel::layout-bitmap x)))
+      (let ((m (wrapper-bitmap x)))
         (cond ((eql m +layout-all-tagged+) (push x vanilla))
               ((eql m 0) (push x zero))
               ((minusp m) (push x trailing-tagged))
@@ -1510,28 +1513,42 @@ We could try a few things to mitigate this:
     (flet ((legend (newline str list)
              (when newline (terpri))
              (let ((s (format nil str (length list))))
-               (format t "~A~%~A~%" s (make-string (length s) :initial-element #\-))))
-           (name (x) (classoid-name (layout-classoid x))))
+               (format t "~A~%~A~%" s (make-string (length s) :initial-element #\-)))))
       (when zero
         (legend nil "Zero bitmap (~d):" zero)
-        (dolist (x zero) (format t "~a~%" (name x))))
+        (dolist (x zero) (format t "~a~%" (wrapper-classoid-name x))))
       (when trailing-raw
         (legend t "Trailing raw (~d):" trailing-raw)
         (dolist (x trailing-raw)
-          (let ((m (sb-kernel::layout-bitmap x)))
+          (let ((m (wrapper-bitmap x)))
             (format t "~30a 0...~v,'0b~%"
-                    (name x)
-                    (acond ((layout-info x) (1+ (dd-length it))) (t 32))
+                    (wrapper-classoid-name x)
+                    (acond ((wrapper-info x) (1+ (dd-length it))) (t 32))
                     m))))
       (when trailing-tagged
         (legend t "Trailing tagged (~d):" trailing-tagged)
         (dolist (x trailing-tagged)
-          (let ((m (sb-kernel::layout-bitmap x)))
+          (let ((m (wrapper-bitmap x)))
             (format t "~30a 1...~b~%"
-                    (name x)
-                    (acond ((layout-info x) (ldb (byte (dd-length it) 0) m))
+                    (wrapper-classoid-name x)
+                    (acond ((wrapper-info x) (ldb (byte (dd-length it) 0) m))
                            (t (ldb (byte 32 0) m)))))))
       (legend t "Default: (~d) [not shown]" vanilla))))
+
+#+ubsan
+(defun find-poisoned-vectors (&aux result)
+  (dolist (v (sb-vm:list-allocated-objects :all :type sb-vm:simple-vector-widetag)
+             result)
+    (when (dotimes (i (length v))
+            (declare (optimize (sb-c::aref-trapping 0)))
+            (let ((val (svref v i)))
+              (when (= (get-lisp-obj-address val) no-tls-value-marker-widetag)
+                (return t))))
+      (push (make-weak-pointer v) result)
+      (let* ((origin (vector-extra-data v))
+             (code (sb-di::code-header-from-pc (ash origin -3)))
+             (*print-array* nil))
+        (format t "g~d ~a ~a~%" (sb-kernel:generation-of v) v code)))))
 
 (in-package "SB-C")
 ;;; As soon as practical in warm build it makes sense to add

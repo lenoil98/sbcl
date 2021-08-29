@@ -33,9 +33,9 @@
 
 (defun allocate-standard-instance (wrapper)
   (let* ((instance (%make-instance (1+ sb-vm:instance-data-start)))
-         (slots (make-array (layout-length wrapper) :initial-element +slot-unbound+)))
-    (setf (%instance-layout instance) wrapper)
-    (setf (std-instance-slots instance) slots)
+         (slots (make-array (wrapper-length wrapper) :initial-element +slot-unbound+)))
+    (setf (%instance-wrapper instance) wrapper)
+    (%instance-set instance sb-vm:instance-data-start slots)
     instance))
 
 (define-condition unset-funcallable-instance-function
@@ -52,15 +52,15 @@
           :format-arguments (list ,fin)))
 
 (defun allocate-standard-funcallable-instance (wrapper name)
-  (declare (layout wrapper))
+  (declare (wrapper wrapper))
   (let* ((hash (if name
                    (mix (sxhash name) (sxhash :generic-function)) ; arb. constant
                    (sb-impl::quasi-random-address-based-hash
                     (load-time-value (make-array 1 :element-type '(and fixnum unsigned-byte)))
                     most-positive-fixnum)))
-         (slots (make-array (layout-length wrapper) :initial-element +slot-unbound+))
+         (slots (make-array (wrapper-length wrapper) :initial-element +slot-unbound+))
          (fin (cond #+(and immobile-code)
-                    ((/= (layout-bitmap wrapper) +layout-all-tagged+)
+                    ((not (sb-kernel::bitmap-all-taggedp (wrapper-friend wrapper)))
                      (let ((f (truly-the funcallable-instance
                                          (sb-vm::make-immobile-funinstance wrapper slots))))
                        ;; set the upper 4 bytes of wordindex 5
@@ -70,7 +70,7 @@
                     (t
                      (let ((f (truly-the funcallable-instance
                                          (%make-standard-funcallable-instance slots hash))))
-                       (setf (%fun-layout f) wrapper)
+                       (setf (%fun-wrapper f) wrapper)
                        f)))))
     (setf (%funcallable-instance-fun fin)
           (lambda (&rest args)
@@ -104,51 +104,40 @@
 ;;;;
 ;;;; This function builds the base metabraid from the early class definitions.
 
-(defmacro !initial-classes-and-wrappers (&rest classes)
-  `(progn
-     ,@(mapcar (lambda (class)
-                 (let ((wr (format-symbol *pcl-package* "~A-WRAPPER" class)))
-                   `(setf ,wr ,(if (eq class 'standard-generic-function)
-                                   '*sgf-wrapper*
-                                   `(!boot-make-wrapper
-                                     (!early-class-size ',class)
-                                     ',class))
-                          ,class (allocate-standard-instance
-                                  ,(if (eq class 'standard-generic-function)
-                                       'funcallable-standard-class-wrapper
-                                       'standard-class-wrapper))
-                          (wrapper-class ,wr) ,class
-                          (find-class ',class) ,class)))
-               classes)))
-
-(defmacro wrapper-info (x) `(sb-kernel::layout-%info ,x))
 (declaim (inline wrapper-slot-list))
 (defun wrapper-slot-list (wrapper)
-  (let ((info (wrapper-info wrapper)))
+  (let ((info (sb-kernel::wrapper-%info wrapper)))
     (if (listp info) info)))
 (defun (setf wrapper-slot-list) (newval wrapper)
   ;; The current value must be a list, otherwise we'd clobber
   ;; a defstruct-description.
-  (aver (listp (wrapper-info wrapper)))
-  (setf (wrapper-info wrapper) newval))
+  (aver (listp (sb-kernel::wrapper-%info wrapper)))
+  (setf (sb-kernel::wrapper-%info wrapper) newval))
 
+(macrolet
+    ((with-initial-classes-and-wrappers ((&rest classes) &body body)
+       `(let* ((*create-classes-from-internal-structure-definitions-p* nil)
+               ,@(mapcar (lambda (class)
+                           `(,(symbolicate class "-WRAPPER")
+                              ,(if (eq class 'standard-generic-function)
+                                   '*sgf-wrapper*
+                                   `(!boot-make-wrapper (!early-class-size ',class)
+                                                        ',class))))
+                         classes)
+               ,@(mapcar (lambda (class)
+                           `(,class (allocate-standard-instance
+                                     ,(if (eq class 'standard-generic-function)
+                                          'funcallable-standard-class-wrapper
+                                          'standard-class-wrapper))))
+                         classes))
+          ,@(mapcan (lambda (class &aux (wr (symbolicate class "-WRAPPER")))
+                      `((setf (wrapper-class ,wr) ,class
+                              (find-class ',class) ,class)))
+                    classes)
+          ,@body)))
 (defun !bootstrap-meta-braid ()
-  (let* ((*create-classes-from-internal-structure-definitions-p* nil)
-         standard-class-wrapper standard-class
-         funcallable-standard-class-wrapper funcallable-standard-class
-         slot-class-wrapper slot-class
-         system-class-wrapper system-class
-         built-in-class-wrapper built-in-class
-         structure-class-wrapper structure-class
-         condition-class-wrapper condition-class
-         standard-direct-slot-definition-wrapper
-         standard-direct-slot-definition
-         standard-effective-slot-definition-wrapper
-         standard-effective-slot-definition
-         class-eq-specializer-wrapper class-eq-specializer
-         standard-generic-function-wrapper standard-generic-function)
-    (!initial-classes-and-wrappers
-     standard-class funcallable-standard-class
+  (with-initial-classes-and-wrappers
+    (standard-class funcallable-standard-class
      slot-class system-class built-in-class structure-class condition-class
      standard-direct-slot-definition standard-effective-slot-definition
      class-eq-specializer standard-generic-function)
@@ -182,7 +171,15 @@
           (multiple-value-bind (slots cpl default-initargs direct-subclasses)
               (!early-collect-inheritance name)
             (let* ((class (find-class name))
-                   (bitmap (if (memq name '(standard-generic-function))
+                   ;; With #+compact-instance-header there are two possible bitmaps
+                   ;; for funcallable instances - for self-contained trampoline
+                   ;; instructions and external trampoline instructions.
+                   ;; With #-compact-instance-header all funcallable layouts
+                   ;; need the same bitmap, which is that of standard-GF.
+                   ;; These requirements are checked in verify_range() of gencgc.
+                   (bitmap (if (memq name '(standard-generic-function
+                                            #-compact-instance-header funcallable-standard-object
+                                            #-compact-instance-header generic-function))
                                sb-kernel::standard-gf-primitive-obj-layout-bitmap
                                +layout-all-tagged+))
                    (wrapper (cond ((eq class slot-class)
@@ -234,7 +231,7 @@
                      name class slots
                      standard-effective-slot-definition-wrapper t))
 
-              (setf (layout-slot-table wrapper) (make-slot-table class slots t))
+              (setf (wrapper-slot-table wrapper) (make-slot-table class slots t))
               (when (layout-for-pcl-obj-p wrapper)
                 (setf (wrapper-slot-list wrapper) slots))
 
@@ -303,7 +300,7 @@
         (funcall set-slot '%generic-functions (make-gf-hash-table))
         (funcall set-slot '%documentation nil)
         (funcall set-slot 'options '(:most-specific-first))
-        (setq *or-method-combination* method-combination)))))
+        (setq *or-method-combination* method-combination))))))
 
 ;;; I have no idea why we care so much about being able to create an instance
 ;;; of STRUCTURE-OBJECT, when (almost) no other structure class in the system
@@ -364,7 +361,7 @@
                                  slot-class))
       (set-slot 'direct-slots direct-slots)
       (set-slot 'slots slots)
-      (setf (layout-slot-table wrapper)
+      (setf (wrapper-slot-table wrapper)
             (make-slot-table class slots
                              (member metaclass-name
                                      '(standard-class funcallable-standard-class))))
@@ -568,7 +565,7 @@
       (destructuring-bind (name supers subs cpl prototype) e
         (let* ((class (find-class name))
                (lclass (find-classoid name))
-               (wrapper (classoid-layout lclass)))
+               (wrapper (classoid-wrapper lclass)))
           (setf (classoid-pcl-class lclass) class)
 
           (!bootstrap-initialize-class 'built-in-class class
@@ -579,7 +576,7 @@
 
 (defun class-of (x)
   (declare (explicit-check))
-  (wrapper-class (layout-of x)))
+  (wrapper-class (wrapper-of x)))
 
 (defun eval-form (form)
   (lambda () (eval form)))
@@ -666,49 +663,47 @@
 
 (define-load-time-global *simple-stream-root-classoid* :unknown)
 
-(defun assign-layout-bitmap (layout)
+(defun set-bitmap-and-flags (wrapper &aux (inherits (wrapper-inherits wrapper))
+                                          (flags (wrapper-flags wrapper))
+                                          (layout (wrapper-friend wrapper)))
+  (when (eq (wrapper-classoid wrapper) *simple-stream-root-classoid*)
+    (setq flags (logior flags +simple-stream-layout-flag+)))
   ;; We decide only at class finalization time whether it is funcallable.
   ;; Picking the right bitmap could probably be done sooner given the metaclass,
   ;; but this approach avoids changing how PCL uses MAKE-LAYOUT.
   ;; The big comment above MAKE-IMMOBILE-FUNINSTANCE in src/code/x86-64-vm
   ;; explains why we differentiate between SGF and everything else.
-  (let ((inherits (layout-inherits layout)))
-    (when (find #.(find-layout 'stream) inherits)
-      (let ((flags 0))
-        (dovector (layout inherits)
-          (when (eq (layout-classoid layout) *simple-stream-root-classoid*)
-            (setq flags (logior flags +simple-stream-layout-flag+)))
-          (case layout
-            (#.(find-layout 'file-stream)
-             (setq flags (logior flags +file-stream-layout-flag+)))
-            (#.(find-layout 'string-stream)
-             (setq flags +string-stream-layout-flag+))))
-        (setf (layout-flags layout)
-              (logior flags +stream-layout-flag+ (layout-flags layout)))))
-    (when (find #.(find-layout 'sequence) inherits)
-      (setf (layout-flags layout) (logior (layout-flags layout) +sequence-layout-flag+)))
-    (when (find #.(find-layout 'function) inherits)
-      (setf (%raw-instance-ref/signed-word layout (sb-kernel::type-dd-length layout))
-             #+immobile-code ; there are two possible bitmaps
-             (if (or (find *sgf-wrapper* inherits) (eq layout *sgf-wrapper*))
-                 sb-kernel::standard-gf-primitive-obj-layout-bitmap
-                 +layout-all-tagged+)
-             ;; there is only one possible bitmap otherwise
-             #-immobile-code sb-kernel::standard-gf-primitive-obj-layout-bitmap))))
+  (dovector (ancestor inherits)
+    (when (eq ancestor #.(find-layout 'function))
+      (%raw-instance-set/signed-word layout (sb-kernel::type-dd-length sb-vm:layout)
+            #+immobile-code ; there are two possible bitmaps
+            (if (or (find *sgf-wrapper* inherits) (eq wrapper *sgf-wrapper*))
+                sb-kernel::standard-gf-primitive-obj-layout-bitmap
+                +layout-all-tagged+)
+            ;; there is only one possible bitmap otherwise
+            #-immobile-code sb-kernel::standard-gf-primitive-obj-layout-bitmap))
+    (setq flags (logior (logand (logior +sequence-layout-flag+
+                                        +stream-layout-flag+
+                                        +simple-stream-layout-flag+
+                                        +file-stream-layout-flag+
+                                        +string-stream-layout-flag+)
+                                (wrapper-flags ancestor))
+                        flags)))
+  (setf (layout-flags (wrapper-friend wrapper)) flags))
 
 ;;; Set the inherits from CPL, and register the layout. This actually
 ;;; installs the class in the Lisp type system.
-(defun %update-lisp-class-layout (class layout)
-  ;; Protected by *world-lock* in callers.
-  (let ((classoid (layout-classoid layout)))
-    (unless (eq (classoid-layout classoid) layout)
-      (set-layout-inherits layout
+(defun %update-lisp-class-layout (class wrapper)
+  ;; Protected by **world-lock** in callers.
+  (let ((classoid (wrapper-classoid wrapper)))
+    (unless (eq (classoid-wrapper classoid) wrapper)
+      (set-layout-inherits wrapper
                            (order-layout-inherits
                             (map 'simple-vector #'class-wrapper
                                  (reverse (rest (class-precedence-list class)))))
                            nil 0)
-      (assign-layout-bitmap layout)
-      (register-layout layout :invalidate t)
+      (set-bitmap-and-flags wrapper)
+      (register-layout wrapper :invalidate t)
 
       ;; FIXME: I don't think this should be necessary, but without it
       ;; we are unable to compile (TYPEP foo '<class-name>) in the
@@ -735,7 +730,7 @@
   (when (classoid-cell-pcl-class x)
     (let* ((class (find-class-from-cell name x))
            (layout (class-wrapper class))
-           (lclass (layout-classoid layout))
+           (lclass (wrapper-classoid layout))
            (lclass-pcl-class (classoid-pcl-class lclass))
            (olclass (find-classoid name nil)))
       (if lclass-pcl-class

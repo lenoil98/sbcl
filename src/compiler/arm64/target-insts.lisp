@@ -101,7 +101,7 @@
 (defun print-test-branch-immediate (value stream dstate)
   (declare (ignore dstate))
   (format stream "#~D"
-          (dpb (car value) (byte 1 5) (car value))))
+          (dpb (car value) (byte 1 5) (cadr value))))
 
 (defun decode-scaled-immediate (value)
   (destructuring-bind (size opc value simd) value
@@ -315,24 +315,37 @@
 
 (defun annotate-ldr-str (register offset dstate)
   (case register
-    (#.sb-vm::code-offset
-     (note-code-constant offset dstate))
     (#.sb-vm::null-offset
      (let ((offset (+ sb-vm:nil-value offset)))
-       (maybe-note-static-symbol (logior offset other-pointer-lowtag)
-                                              dstate)))
+       (or (maybe-note-static-symbol (logior offset other-pointer-lowtag)
+                                     dstate)
+           (maybe-note-assembler-routine offset nil dstate))))
     #+sb-thread
     (#.sb-vm::thread-offset
      (let* ((thread-slots
-             (load-time-value
-              (primitive-object-slots (primitive-object 'sb-vm::thread))
-              t))
-            (slot (find (ash offset (- word-shift)) thread-slots
-                        :key #'slot-offset)))
-       (when slot
-         (note (lambda (stream)
-                 (format stream "thread.~(~A~)" (slot-name slot)))
-               dstate))))))
+              (load-time-value
+               (primitive-object-slots (primitive-object 'sb-vm::thread))
+               t))
+            (slot (find (ash offset (- word-shift)) thread-slots :key #'slot-offset)))
+       (if slot
+           (note (lambda (stream)
+                   (format stream "~(~A~)" (slot-name slot)))
+                 dstate)
+           (flet ((guess-symbol (predicate)
+                    (binding* ((code-header (seg-code (dstate-segment dstate)) :exit-if-null)
+                               (header-n-words (code-header-words code-header)))
+                      (loop for word-num from code-constants-offset below header-n-words
+                            for obj = (code-header-ref code-header word-num)
+                            when (and (symbolp obj) (funcall predicate obj))
+                            do (return obj)))))
+             (let ((symbol (or (guess-symbol
+                                (lambda (s) (= (symbol-tls-index s) offset)))
+                               ;; static symbols aren't in the code header
+                               (find offset +static-symbols+
+                                     :key #'symbol-tls-index))))
+               (when symbol
+                 (note (lambda (stream) (format stream "tls: ~S" symbol))
+                       dstate)))))))))
 
 (defun find-value-from-previos-inst (register dstate)
   ;; Needs to be MOVZ REGISTER, imm, LSL #0
@@ -363,31 +376,73 @@
                             value)
                         dstate))))
 
+(defun annotate-ldr-str-pair (value stream dstate)
+  (declare (ignore stream))
+  (destructuring-bind (reg offset) value
+    (case reg
+      #+sb-thread
+      (#.sb-vm::thread-offset
+       (let* ((thread-slots
+                (load-time-value
+                 (primitive-object-slots (primitive-object 'sb-vm::thread))
+                 t))
+              (slot1 (find offset thread-slots :key #'slot-offset))
+              (slot2 (find (1+ offset) thread-slots :key #'slot-offset)))
+         (when slot1
+           (note (lambda (stream)
+                   (if (memq (slot-name slot1) '(sb-vm::boxed-tlab
+                                                 sb-vm::unboxed-tlab))
+                       (format stream "~(~a~).{free-pointer, end-addr}" (slot-name slot1))
+                       (format stream "~(~A, ~A~)" (slot-name slot1) (slot-name slot2))))
+                 dstate)))))))
+
 (defun annotate-ldr-literal (value stream dstate)
   (declare (ignore stream))
-  (let* ((addr (+ (dstate-cur-addr dstate) (* value 4))))
-    (let ((value (sap-ref-word (int-sap addr) 0)))
-      (maybe-note-assembler-routine value nil dstate))))
+  (let* ((value (* 4 value))
+         (seg (dstate-segment dstate))
+         (code (seg-code seg)))
+    (when code
+      (or (note-code-constant (sb-disassem::segment-offs-to-code-offs
+                               (+ (dstate-cur-offs dstate) value) seg)
+                              dstate)
+          (let ((addr (+ (dstate-cur-addr dstate) value)))
+            (and (sb-disassem::points-to-code-constant-p addr code)
+                 (maybe-note-assembler-routine (sap-ref-word (int-sap addr) 0)
+                                               nil dstate)))))))
 
 ;;;; special magic to support decoding internal-error and related traps
+;;; See EMIT-ERROR-BREAK for the scheme
 (defun snarf-error-junk (sap offset trap-number &optional length-only)
-  (declare (ignore trap-number))
   (let* ((inst (sap-ref-32 sap (- offset 4)))
-         (error-number (ldb (byte 8 13) inst))
+         (error-number (cond
+                         ((>= trap-number sb-vm:error-trap)
+                          (prog1
+                              (- trap-number sb-vm:error-trap)
+                            (setf trap-number sb-vm:error-trap)))
+                         (t
+                          (prog1 (sap-ref-8 sap offset)
+                            (incf offset)))))
+         (first-arg (ldb (byte 8 13) inst))
          (length (sb-kernel::error-length error-number))
          (index offset))
     (declare (type sb-sys:system-area-pointer sap)
              (type (unsigned-byte 8) length))
+    (unless (or (= first-arg sb-vm::zr-offset)
+                (zerop length))
+      (decf length))
     (cond (length-only
            (loop repeat length do (sb-c:sap-read-var-integerf sap index))
            (values 0 (- index offset) nil nil))
           (t
            (collect ((sc+offsets)
                      (lengths))
+             (unless (= first-arg sb-vm::zr-offset)
+               (sc+offsets (make-sc+offset sb-vm:descriptor-reg-sc-number first-arg))
+               (lengths 0))
              (loop repeat length do
-                  (let ((old-index index))
-                    (sc+offsets (sb-c:sap-read-var-integerf sap index))
-                    (lengths (- index old-index))))
+                   (let ((old-index index))
+                     (sc+offsets (sb-c:sap-read-var-integerf sap index))
+                     (lengths (- index old-index))))
              (values error-number
                      (- index offset)
                      (sc+offsets)
@@ -397,7 +452,9 @@
   (declare (ignore inst chunk))
   (let ((code (ldb (byte 8 5) (current-instruction dstate))))
     (flet ((nt (x) (if stream (note x dstate))))
-      (case code
+      (case (if (> code error-trap)
+                error-trap
+                code)
         (#.halt-trap
          (nt "Halt trap"))
         (#.pending-interrupt-trap

@@ -22,7 +22,7 @@
   (let ((res (info :type :compiler-layout name)))
     (cond ((not res)
            (error "Class is not yet defined or was undefined: ~S" name))
-          ((not (typep (layout-info res) 'defstruct-description))
+          ((not (typep (wrapper-%info res) 'defstruct-description))
            (error "Class is not a structure class: ~S" name))
           (t
            (check-deprecated-type name)
@@ -30,7 +30,7 @@
 
 (defun compiler-layout-ready-p (name)
   (let ((layout (info :type :compiler-layout name)))
-    (and layout (typep (layout-info layout) 'defstruct-description))))
+    (and layout (typep (wrapper-%info layout) 'defstruct-description))))
 
 (sb-xc:defmacro %make-structure-instance-macro (dd slot-specs &rest slot-vars)
   (if (compiler-layout-ready-p (dd-name dd))
@@ -59,53 +59,11 @@
 (defun %make-funcallable-structure-instance-allocator (dd slot-specs)
   (when slot-specs
     (bug "funcallable-structure-instance allocation with slots unimplemented"))
-  (let ((name (dd-name dd))
-        (length (dd-length dd))
-        (nobject (gensym "OBJECT")))
-    (values
+  (values
      (compile nil `(lambda ()
-                     (let ((,nobject (%make-funcallable-instance ,length)))
-                       (setf (%fun-layout ,nobject)
-                             (%delayed-get-compiler-layout ,name))
-                       ,nobject))))))
-
-;;; Delay looking for compiler-layout until the constructor is being
-;;; compiled, since it doesn't exist until after the EVAL-WHEN
-;;; (COMPILE) stuff is compiled. (Or, in the oddball case when
-;;; DEFSTRUCT is executing in a non-toplevel context, the
-;;; compiler-layout still doesn't exist at compilation time, and we
-;;; delay still further.)
-(sb-xc:defmacro %delayed-get-compiler-layout (name)
-  (let ((layout (info :type :compiler-layout name)))
-    (cond (layout
-           ;; ordinary case: When the DEFSTRUCT is at top level,
-           ;; then EVAL-WHEN (COMPILE) stuff will have set up the
-           ;; layout for us to use.
-           (unless (typep (layout-info layout) 'defstruct-description)
-             (error "Class is not a structure class: ~S" name))
-           `,layout)
-          (t
-           ;; KLUDGE: In the case that DEFSTRUCT is not at top-level
-           ;; the layout doesn't exist at compile time. In that case
-           ;; we laboriously look it up at run time. This code will
-           ;; run on every constructor call and will likely be quite
-           ;; slow, so if anyone cares about performance of
-           ;; non-toplevel DEFSTRUCTs, it should be rewritten to be
-           ;; cleverer. -- WHN 2002-10-23
-           (sb-c:compiler-notify
-            "implementation limitation: ~
-             Non-toplevel DEFSTRUCT constructors are slow.")
-           (with-unique-names (layout)
-             `(let ((,layout (info :type :compiler-layout ',name)))
-                (unless (typep (layout-info ,layout) 'defstruct-description)
-                  (error "Class is not a structure class: ~S" ',name))
-                ,layout))))))
-
-;;; re. %DELAYED-GET-COMPILER-LAYOUT and COMPILE-TIME-FIND-LAYOUT, above..
-;;;
-;;; FIXME: Perhaps both should be defined with SB-XC:DEFMACRO?
-;;; FIXME: Do we really need both? If so, their names and implementations
-;;; should probably be tweaked to be more parallel.
+                     (let ((object (%make-funcallable-instance ,(dd-length dd))))
+                       (setf (%fun-wrapper object) ,(find-layout (dd-name dd)))
+                       object)))))
 
 ;;;; DEFSTRUCT-DESCRIPTION
 
@@ -219,7 +177,7 @@
   (acond ((dsd-raw-slot-data dsd) (raw-slot-data-raw-type it))
          (t)))
 (defun dsd-primitive-accessor (dsd &aux (rsd (dsd-raw-slot-data dsd)))
-  (if rsd (raw-slot-data-accessor-name rsd) '%instance-ref))
+  (if rsd (raw-slot-data-reader-name rsd) '%instance-ref))
 
 ;;;; typed (non-class) structures
 
@@ -766,7 +724,7 @@ unless :NAMED is also specified.")))
               (let ((super (compiler-layout-or-lose (or (first (dd-include dd))
                                                         'structure-object))))
                 (concatenate 'simple-vector
-                             (layout-inherits super) (vector super)))))
+                             (wrapper-inherits super) (vector super)))))
          (proto-classoid
           (if (dd-class-p dd)
               ;; The classoid needs a layout whereby to convey inheritance.
@@ -775,9 +733,9 @@ unless :NAMED is also specified.")))
               ;; It's probably too dangerous to stack-allocate, because references
               ;; could leak from the type cache machinery.
               (let* ((classoid (make-structure-classoid :name (dd-name dd)))
-                     (layout (make-temporary-layout (hash-layout-name (dd-name dd))
+                     (layout (make-temporary-wrapper (hash-layout-name (dd-name dd))
                                                     classoid inherits)))
-                (setf (classoid-wrapper classoid) (layout-friend layout))
+                (setf (classoid-wrapper classoid) layout)
                 classoid)))
          (ancestor-slot-comparator-list))
     #+sb-xc-host
@@ -922,7 +880,8 @@ unless :NAMED is also specified.")))
       (setq ctype *universal-type*)) ; a harmless lie
 
     (unless ctype
-      (let ((context (make-type-context type proto-classoid nil)))
+      (let ((context (make-type-context type proto-classoid
+                                        +type-parse-cache-inhibit+)))
         (setq ctype (specifier-type type context)))) ; Parse once only
 
     (cond (included-slot
@@ -1008,7 +967,7 @@ unless :NAMED is also specified.")))
     (let* ((type (dd-type dd))
            (included-structure
             (if (dd-class-p dd)
-                (layout-info (compiler-layout-or-lose included-name))
+                (wrapper-info (compiler-layout-or-lose included-name))
                 (typed-structure-info-or-lose included-name))))
 
       ;; checks on legality
@@ -1022,8 +981,8 @@ unless :NAMED is also specified.")))
           ;; It's not particularly well-defined to :INCLUDE any of the
           ;; CMU CL INSTANCE weirdosities like CONDITION or
           ;; GENERIC-FUNCTION, and it's certainly not ANSI-compliant.
-          (let* ((included-layout (classoid-layout included-classoid))
-                 (included-dd (layout-dd included-layout)))
+          (let* ((included-layout (classoid-wrapper included-classoid))
+                 (included-dd (wrapper-dd included-layout)))
             (when (dd-alternate-metaclass included-dd)
               (error "can't :INCLUDE class ~S (has alternate metaclass)"
                      included-name)))))
@@ -1092,7 +1051,7 @@ unless :NAMED is also specified.")))
          (super
           (if include
               (compiler-layout-or-lose (first include))
-              (classoid-layout (find-classoid
+              (classoid-wrapper (find-classoid
                                 (or (first superclass-opt)
                                     'structure-object))))))
     (case (dd-name info)
@@ -1100,24 +1059,24 @@ unless :NAMED is also specified.")))
        ;; STREAM is an abstract class and you can't :include it,
        ;; so the inheritance has to be hardcoded.
        (concatenate 'simple-vector
-                    (layout-inherits super)
-                    (vector super (classoid-layout (find-classoid 'stream)))))
+                    (wrapper-inherits super)
+                    (vector super (classoid-wrapper (find-classoid 'stream)))))
       ((fd-stream) ; Similarly, FILE-STREAM is abstract
        (concatenate 'simple-vector
-                    (layout-inherits super)
+                    (wrapper-inherits super)
                     (vector super
-                            (classoid-layout (find-classoid 'file-stream)))))
+                            (classoid-wrapper (find-classoid 'file-stream)))))
       ((sb-impl::string-input-stream ; etc
         sb-impl::string-output-stream
         sb-impl::fill-pointer-output-stream)
        (concatenate 'simple-vector
-                    (layout-inherits super)
+                    (wrapper-inherits super)
                     (vector super
-                            (classoid-layout (find-classoid 'string-stream)))))
+                            (classoid-wrapper (find-classoid 'string-stream)))))
       (pathname (vector (find-layout 't)))
       (logical-pathname (vector (find-layout 't) (find-layout 'pathname)))
       (t (concatenate 'simple-vector
-                      (layout-inherits super)
+                      (wrapper-inherits super)
                       (vector super))))))
 
 ;;; Do miscellaneous (LOAD EVAL) time actions for the structure
@@ -1130,17 +1089,17 @@ unless :NAMED is also specified.")))
   (multiple-value-bind (classoid layout old-layout)
       (ensure-structure-class dd inherits "current" "new")
     (cond ((not old-layout)
-           (unless (eq (classoid-layout classoid) layout)
+           (unless (eq (classoid-wrapper classoid) layout)
              (register-layout layout)))
           (t
            (%redefine-defstruct classoid old-layout layout)
-           (let ((old-dd (layout-info old-layout)))
+           (let ((old-dd (wrapper-info old-layout)))
              (when (defstruct-description-p old-dd)
                (dolist (slot (dd-slots old-dd))
                  (fmakunbound (dsd-accessor-name slot))
                  (unless (dsd-read-only slot)
                    (fmakunbound `(setf ,(dsd-accessor-name slot)))))))
-           (setq layout (classoid-layout classoid))))
+           (setq layout (classoid-wrapper classoid))))
     ;; Don't want to (setf find-classoid) on a a built-in-classoid
     (unless (and (built-in-classoid-p classoid)
                  (eq (find-classoid (dd-name dd) nil) classoid))
@@ -1150,42 +1109,33 @@ unless :NAMED is also specified.")))
       (setf (classoid-source-location classoid) source-location))))
 
 
-;;; Return a form accessing the writable place used for the slot
-;;; described by DD and DSD in the INSTANCE (a form).
-(defun %accessor-place-form (dd dsd instance)
-  (let (;; Compute REF even if not using it, as a sanity-check of DD-TYPE.
-        (ref (ecase (dd-type dd)
-               (structure '%instance-ref)
-               (funcallable-structure '%funcallable-instance-info)
-               (list 'nth)
-               (vector 'aref)))
-        (index (dsd-index dsd))
-        (rsd (dsd-raw-slot-data dsd)))
-    (cond (rsd
-           (list (raw-slot-data-accessor-name rsd) instance index))
-          ((eq ref 'nth)
-           (list ref index instance))
-          (t
-           (list ref instance index)))))
-
-;;; Return the transform of conceptual FUNCTION one of {:READ,:WRITE,:SETF}
+;;; Return the transform of OPERATION which is either :READ or :SETF.
 ;;; as applied to ARGS, given SLOT-KEY which is a cons of a DD and a DSD.
+;;; FUN-OR-MACRO, which is used only for the :SETF operation,
+;;; indicates whether the argument order corresponds to
+;;;    (funcall #'(setf mystruct-myslot) newval s) ; :FUNCTION
+;;; versus
+;;;    (setf (mystruct-myslot s) newval) ; :MACRO
 ;;; Return NIL on failure.
-(defun slot-access-transform (function args slot-key)
-  (when (consp args) ; need at least one arg
-    (let* ((dd (car slot-key))
-           (dsd (cdr slot-key))
-           ;; optimistically compute PLACE before checking length of ARGS
-           ;; because we expect success, and this unifies the three cases.
-           ;; :SETF is like an invocation of the SETF macro - newval is
-           ;; the second arg, but :WRITER is #'(SETF fn) - newval is first.
-           (place
-            (%accessor-place-form
-             dd dsd `(the ,(dd-name dd)
-                       ,(car (if (eq function :write) (cdr args) args)))))
-           (type-spec (dsd-type dsd)))
-      (if (eq function :read)
-          (when (singleton-p args)
+(defun slot-access-transform (operation args slot-key &optional (fun-or-macro :macro))
+  (binding* ((dd (car slot-key))
+             (dsd (cdr slot-key))
+             (type-spec (dsd-type dsd))
+             (index (dsd-index dsd))
+             ((writer reader)
+              (acond ((dsd-raw-slot-data dsd)
+                      (values (raw-slot-data-writer-name it) (raw-slot-data-reader-name it)))
+                     (t
+                      (ecase (dd-type dd)
+                        (funcallable-structure
+                         (values '%set-funcallable-instance-info '%funcallable-instance-info))
+                        (structure
+                         (values '%instance-set '%instance-ref)))))))
+    (ecase operation
+      (:read
+       (when (singleton-p args)
+         (let* ((instance-form `(the ,(dd-name dd) ,(car args)))
+                (place `(,reader ,instance-form ,index)))
             ;; There are 4 cases of {safe,unsafe} x {always-boundp,possibly-unbound}
             ;; If unsafe - which implies TYPE-SPEC other than type T - then we must
             ;; check the type on each read. Assuming that type-checks reject
@@ -1194,28 +1144,37 @@ unless :NAMED is also specified.")))
                    `(the ,type-spec ,place))
                   (t
                    (unless (dsd-always-boundp dsd)
-                     (setf place `(the* ((not (satisfies sb-vm::unbound-marker-p))
-                                         :context (:struct-read ,(dd-name dd) . ,(dsd-name dsd)))
-                                         ,place)))
-                   (if (eq type-spec t) place `(the* (,type-spec :derive-type-only t) ,place)))))
-          (when (singleton-p (cdr args))
-            (let ((inverse (car (info :setf :expander (car place)))))
-              (flet ((check (newval)
-                       (if (eq type-spec t)
-                           newval
-                           `(the* (,type-spec :context
-                                              (:struct ,(dd-name dd) . ,(dsd-name dsd)))
-                                  ,newval))))
-                (ecase function
-                  (:setf
-                   ;; Instance setters take newval last, which matches
-                   ;; the order in which a use of SETF has them.
-                   `(,inverse ,@(cdr place) ,(check (second args))))
-                  (:write
-                   ;; The call to #'(SETF fn) had newval first.
-                   ;; We need to preserve L-to-R evaluation.
-                   (once-only ((new (first args)))
-                     `(,inverse ,@(cdr place) ,(check new))))))))))))
+                     (setf place
+                           `(the* ((not (satisfies sb-vm::unbound-marker-p))
+                                   :context (:struct-read ,(dd-name dd) . ,(dsd-name dsd)))
+                                  ,place)))
+                   (if (eq type-spec t) place
+                       `(the* (,type-spec :derive-type-only t) ,place)))))))
+      (:setf
+        ;; The primitive object slot setting vops take newval last, which matches
+        ;; the order in which a use of SETF has them, but because the vops
+        ;; do not return anything, we have to bind both arguments.
+        (when (and (listp args) (singleton-p (cdr args)))
+          (multiple-value-bind (newval-form instance-form)
+              (ecase fun-or-macro
+                (:function (values (first args) (second args)))
+                (:macro (values (second args) (first args))))
+            (if (eq fun-or-macro :function)
+                ;; This used only for source-transforming (funcall #'(setf myslot) ...).
+                ;; (SETF x) writer functions have been defined as source-transforms instead of
+                ;; inline functions, which improved the semantics around clobbering defstruct
+                ;; writers with random DEFUNs either deliberately or accidentally.
+                ;; Since users can't define source-transforms (not portably anyway),
+                ;; we can easily discern which functions were system-generated.
+                `(let ((#2=#:val
+                        #4=,(if (eq type-spec t)
+                                newval-form
+                                `(the* (,type-spec :context (:struct ,(dd-name dd) . ,(dsd-name dsd)))
+                                       ,newval-form)))
+                       (#1=#:instance #3=(the ,(dd-name dd) ,instance-form)))
+                   (,writer #1# ,index #2#)
+                   #2#)
+                `(let ((#1# #3#) (#2# #4#)) (,writer #1# ,index #2#) #2#))))))))
 
 ;;; Apply TRANSFORM - a special indicator stored in :SOURCE-TRANSFORM
 ;;; for a DEFSTRUCT copier, accessor, or predicate - to SEXPR.
@@ -1236,8 +1195,8 @@ unless :NAMED is also specified.")))
                       (:predicate `(sb-c::%instance-typep ,arg ',type))
                       (:copier `(copy-structure (the ,type ,arg)))))))
                 (t
-                 (slot-access-transform (if (consp name) :write :read)
-                                        (cdr sexpr) transform)))))
+                 (slot-access-transform (if (consp name) :setf :read)
+                                        (cdr sexpr) transform :function)))))
     (values result (not result))))
 
 ;;; Return a LAMBDA form which can be used to set a slot
@@ -1269,22 +1228,16 @@ unless :NAMED is also specified.")))
       ;; references are unknown types.
       (values-specifier-type-cache-clear)))
   (when subclasses-p
-    (let ((subclasses (classoid-subclasses classoid)))
-      (when subclasses
-        (collect ((subs))
-          (dohash ((classoid wrapper)
-                   subclasses
-                   :locked t)
-            (declare (ignore wrapper))
-            (undeclare-structure classoid nil)
-            (subs (classoid-proper-name classoid)))
+    (collect ((subs))
+      (do-subclassoids ((classoid wrapper) classoid)
+        (declare (ignore wrapper))
+        (undeclare-structure classoid nil)
+        (subs (classoid-proper-name classoid)))
           ;; Is it really necessary to warn about
           ;; undeclaring functions for subclasses?
-          (when (subs)
-            (warn "undeclaring functions for old subclasses ~
-                               of ~S:~%  ~S"
-                  (classoid-name classoid)
-                  (subs))))))))
+      (when (subs)
+        (warn "undeclaring functions for old subclasses of ~S:~%  ~S"
+              (classoid-name classoid) (subs))))))
 
 ;;; core compile-time setup of any class with a LAYOUT, used even by
 ;;; !DEFSTRUCT-WITH-ALTERNATE-METACLASS weirdosities
@@ -1300,17 +1253,17 @@ unless :NAMED is also specified.")))
                                 "the most recently loaded"
                                 :compiler-layout clayout))
     (cond (old-layout
-           (undeclare-structure (layout-classoid old-layout)
+           (undeclare-structure (wrapper-classoid old-layout)
                                 (and (classoid-subclasses classoid)
                                      (not (eq layout old-layout))))
-           (setf (layout-invalid layout) nil)
+           (setf (wrapper-invalid layout) nil)
            ;; FIXME: it might be polite to hold onto old-layout and
            ;; restore it at the end of the file.  -- RMK 2008-09-19
            ;; (International Talk Like a Pirate Day).
            (warn "~@<Clobbering the compiler's idea of the layout of ~A.~:@>"
                  classoid))
           (t
-           (unless (eq (classoid-layout classoid) layout)
+           (unless (eq (classoid-wrapper classoid) layout)
              (register-layout layout :invalidate nil))
            ;; Don't want to (setf find-classoid) on a a built-in-classoid
            (unless (and (built-in-classoid-p classoid)
@@ -1390,7 +1343,7 @@ unless :NAMED is also specified.")))
                            accessor-name
                            (dsd-name dsd))))))))
 
-    (awhen (remove-if-not #'sb-c::emitted-full-call-count fnames)
+    (awhen (remove-if-not #'sb-impl::emitted-full-call-count fnames)
       (sb-c:compiler-style-warn
        'sb-c:inlining-dependency-failure
        ;; This message omits the http://en.wikipedia.org/wiki/Serial_comma
@@ -1462,16 +1415,17 @@ or they must be declared locally notinline at each call site.~@:>"
 ;;; both the old and new structure are at the same depthoid.
 #-sb-xc-host
 (defun mutable-layout-p (old-layout new-layout)
-  (if (layout-info old-layout)
-      (let ((old-bitmap (layout-bitmap old-layout))
-            (new-bitmap (layout-bitmap new-layout)))
+  (declare (type wrapper old-layout new-layout))
+  (if (wrapper-info old-layout)
+      (let ((old-bitmap (wrapper-bitmap old-layout))
+            (new-bitmap (wrapper-bitmap new-layout)))
         ;; The number of extra ID words has to match, as does the number of bitmap
         ;; words, or else GC will croak when parsing the bitmap.
-        (and (= (calculate-extra-id-words (layout-depthoid old-layout))
-                (calculate-extra-id-words (layout-depthoid new-layout)))
-             (= (layout-bitmap-words new-layout)
-                (layout-bitmap-words old-layout))
-             (dotimes (i (dd-length (layout-dd old-layout)) t)
+        (and (= (calculate-extra-id-words (wrapper-depthoid old-layout))
+                (calculate-extra-id-words (wrapper-depthoid new-layout)))
+             (= (bitmap-nwords (wrapper-friend new-layout))
+                (bitmap-nwords (wrapper-friend old-layout)))
+             (dotimes (i (dd-length (wrapper-dd old-layout)) t)
                (when (and (logbitp i new-bitmap) ; a tagged (i.e. scavenged) slot
                           (not (logbitp i old-bitmap))) ; that was opaque bits
                  (return nil)))))
@@ -1483,7 +1437,7 @@ or they must be declared locally notinline at each call site.~@:>"
 ;;; be used.
 (defun %redefine-defstruct (classoid old-layout new-layout)
   (declare (type classoid classoid)
-           (type layout old-layout new-layout))
+           (type wrapper old-layout new-layout))
   (declare (ignorable old-layout)) ; for host
   (let ((name (classoid-proper-name classoid)))
     (restart-case
@@ -1513,7 +1467,7 @@ or they must be declared locally notinline at each call site.~@:>"
        ;; I hope you know what you're doing..."
        (register-layout new-layout
                         :invalidate nil
-                        :destruct-layout old-layout))))
+                        :modify old-layout))))
   (values))
 
 ;;; Compute DD's bitmap, storing 1 for each tagged word.
@@ -1628,7 +1582,7 @@ or they must be declared locally notinline at each call site.~@:>"
             (cond ((eq (dd-name dd) 'sb-lockless::list-node) t)
                   ((dd-include dd)
                    (has-custom-gc-method
-                    (layout-info (compiler-layout-or-lose (car (dd-include dd))))))))
+                    (wrapper-info (compiler-layout-or-lose (car (dd-include dd))))))))
       (aver (eq rest :unspecific))
       (return-from calculate-dd-bitmap minimal-bitmap))
 
@@ -1665,8 +1619,10 @@ or they must be declared locally notinline at each call site.~@:>"
 ;;; value is true if this is an incompatible redefinition, in which
 ;;; case it is the old layout.
 (defun ensure-structure-class (info inherits old-context new-context
-                                    &key compiler-layout)
+                                    &key compiler-layout
+                                    &aux (flags 0))
   (declare (type defstruct-description info))
+  ;; NB: the variables named "layout" are in fact of type WRAPPER
   (multiple-value-bind (classoid old-layout)
       (multiple-value-bind (class constructor)
           (acond ((cdr (dd-alternate-metaclass info))
@@ -1692,20 +1648,21 @@ or they must be declared locally notinline at each call site.~@:>"
               fd-stream
               sb-impl::string-input-stream sb-impl::string-output-stream
               sb-impl::fill-pointer-output-stream)
-             (list (layout-classoid (svref inherits (1- (length inherits))))
-                   (layout-classoid (svref inherits (- (length inherits) 2)))))
+             (list (wrapper-classoid (svref inherits (1- (length inherits))))
+                   (wrapper-classoid (svref inherits (- (length inherits) 2)))))
             (t
-             (list (layout-classoid
+             (list (wrapper-classoid
                     (svref inherits (1- (length inherits))))))))
+    (unless (dd-alternate-metaclass info)
+      (setq flags +structure-layout-flag+))
+    #-sb-xc-host
+    (dovector (ancestor inherits)
+      (setq flags (logior (logand (logior +stream-layout-flag+
+                                          +file-stream-layout-flag+
+                                          +string-stream-layout-flag+)
+                                  (wrapper-flags ancestor))
+                          flags)))
     (let* ((old-layout (or compiler-layout old-layout))
-           (flags
-            (logior (if (dd-alternate-metaclass info) 0 +structure-layout-flag+)
-                    (if (find #.(find-layout 'stream) inherits)
-                        +stream-layout-flag+ 0)
-                    (if (find #.(find-layout 'file-stream) inherits)
-                        +file-stream-layout-flag+ 0)
-                    (if (find #.(find-layout 'string-stream) inherits)
-                        +string-stream-layout-flag+ 0)))
            (new-layout
             (when (or (not old-layout) *type-system-initialized*)
                (make-layout (hash-layout-name (dd-name info))
@@ -1722,31 +1679,31 @@ or they must be declared locally notinline at each call site.~@:>"
         ;; The assignment of INFO here can almost be deleted,
         ;; except for a few magical types that don't d.t.r.t. in cold-init:
         ;;  STRUCTURE-OBJECT, CONDITION, ALIEN-VALUE, INTERPRETED-FUNCTION
-        (setf (layout-info old-layout) info)
+        (setf (wrapper-info old-layout) info)
         (values classoid old-layout nil))
        (;; This clause corresponds to an assertion in REDEFINE-LAYOUT-WARNING
         ;; of classic CMU CL. I moved it out to here because it was only
         ;; exercised in this code path anyway. -- WHN 19990510
-        (not (eq (layout-classoid new-layout) (layout-classoid old-layout)))
+        (not (eq (wrapper-classoid new-layout) (wrapper-classoid old-layout)))
         (error "shouldn't happen: weird state of OLD-LAYOUT?"))
        ((warn-if-altered-layout  old-context
                                  old-layout
                                  new-context
-                                 (layout-length new-layout)
-                                 (layout-inherits new-layout)
-                                 (layout-depthoid new-layout)
-                                 (layout-bitmap new-layout))
+                                 (wrapper-length new-layout)
+                                 (wrapper-inherits new-layout)
+                                 (wrapper-depthoid new-layout)
+                                 (wrapper-bitmap new-layout))
         (values classoid new-layout old-layout))
        (t
-        (let ((old-info (layout-info old-layout)))
+        (let ((old-info (wrapper-info old-layout)))
           (if old-info
              (cond ((redefine-structure-warning classoid old-info info)
                     (values classoid new-layout old-layout))
                    (t
-                    (setf (layout-info old-layout) info)
+                    (setf (wrapper-info old-layout) info)
                     (values classoid old-layout nil)))
              (progn
-               (setf (layout-info old-layout) info)
+               (setf (wrapper-info old-layout) info)
                (values classoid old-layout nil)))))))))
 
 ;;; Return a list of pairs (name . index). Used for :TYPE'd
@@ -1779,26 +1736,11 @@ or they must be declared locally notinline at each call site.~@:>"
 ;;;
 ;;; This is split into two functions:
 ;;;   * INSTANCE-CONSTRUCTOR-FORM has to deal with raw slots
-;;;     (there are two variations on this)
 ;;;   * TYPED-CONSTRUCTOR-FORM deal with LIST & VECTOR
 ;;;     which might have "name" symbols stuck in at various weird places.
 (defun instance-constructor-form (dd values &aux (dd-slots (dd-slots dd)))
-   ;; The difference between the two implementations here is that on all
-   ;; platforms we don't have the appropriate RAW-INSTANCE-INIT VOPS, which
-   ;; must be able to deal with immediate values as well -- unlike
-   ;; RAW-INSTANCE-SET VOPs, which never end up seeing immediate values. With
-   ;; some additional cleverness we might manage without them and just a single
-   ;; implementation here, though -- figure out a way to ensure that on those
-   ;; platforms we always still get a non-immediate TN in every case...
-   ;;
-   ;; Until someone does that, this means that instances with raw slots can be
-   ;; DX allocated only on platforms with those additional VOPs.
   (aver (= (length dd-slots) (length values)))
-  ;; FIXME: why does SB-C::VOP-EXISTSP fail the defined-in-time post-check
-  ;; if employed here in lieu of the reader conditional?
-  (if (or #+(or ppc ppc64 x86 x86-64) t)
-    ;; Have raw-instance-init vops
-    (collect ((slot-specs) (slot-values))
+  (collect ((slot-specs) (slot-values))
       (mapc (lambda (dsd value &aux (raw-type (dsd-raw-type dsd))
                                     (spec (list* :slot raw-type (dsd-index dsd))))
               (cond ((eq value '.do-not-initialize-slot.)
@@ -1810,36 +1752,7 @@ or they must be declared locally notinline at each call site.~@:>"
                      (slot-values value))))
             dd-slots values)
       `(%make-structure-instance-macro ,dd ',(slot-specs) ,@(slot-values)))
-    ;; Don't have raw-instance-init vops
-    (collect ((slot-specs) (slot-values) (raw-slots) (raw-values))
-      ;; Partition into non-raw and raw
-      (mapc (lambda (dsd value &aux (raw-type (dsd-raw-type dsd))
-                                    (spec (list* :slot raw-type (dsd-index dsd))))
-              (cond ((eq value '.do-not-initialize-slot.)
-                     (when (eq raw-type t)
-                       (rplaca spec :unbound)
-                       (slot-specs spec)))
-                    ((eq raw-type t)
-                     (slot-specs spec)
-                     (slot-values value))
-                    (t
-                     (raw-slots dsd)
-                     (raw-values value))))
-            dd-slots values)
-      (let ((instance-form
-             `(%make-structure-instance-macro ,dd
-                                              ',(slot-specs) ,@(slot-values))))
-        (if (raw-slots)
-            (let ((temp (make-symbol "INSTANCE")))
-              `(let ((,temp ,instance-form))
-                 ;; Transform to %RAW-INSTANCE-SET/foo, not SETF,
-                 ;; in case any slots are readonly.
-                 ,@(mapcar (lambda (dsd value)
-                             (slot-access-transform
-                              :setf (list temp value) (cons dd dsd)))
-                           (raw-slots) (raw-values))
-                 ,temp))
-            instance-form)))))
+  )
 
 ;;; A "typed" constructor prefers to use a single call to LIST or VECTOR
 ;;; if possible, but can't always do that for VECTOR because it might not
@@ -2185,44 +2098,38 @@ or they must be declared locally notinline at each call site.~@:>"
   (declare (symbol constructor)) ; NIL for none
   (declare (type (member structure funcallable-structure) dd-type))
 
-  (let* ((dd (make-dd-with-alternate-metaclass
+  (let ((dd (make-dd-with-alternate-metaclass
               :class-name class-name
               :slot-names slot-names
               :superclass-name superclass-name
               :metaclass-name metaclass-name
               :metaclass-constructor metaclass-constructor
-              :dd-type dd-type))
-         (delayed-layout-form `(%delayed-get-compiler-layout ,class-name))
-         (raw-maker-form
-          (ecase dd-type
-           (structure `(%make-structure-instance-macro ,dd nil))
-          (funcallable-structure
-           `(let ((object
-                           ;; TRULY-THE should not be needed. But it is, to avoid
-                           ;; a type check on the next SETF. Why???
-                           (truly-the funcallable-instance
-                            (%make-funcallable-instance ,(dd-length dd)))))
-                      (setf (%fun-layout object) ,delayed-layout-form)
-                      object)))))
+              :dd-type dd-type)))
     `(progn
-         (eval-when (:compile-toplevel :load-toplevel :execute)
+       (eval-when (:compile-toplevel :load-toplevel :execute)
            (%compiler-defstruct ',dd ',(!inherits-for-structure dd))
            (when (eq (info :type :kind ',class-name) :defined)
              (setf (info :type :kind ',class-name) :instance))
            ,@(when (eq metaclass-name 'static-classoid)
                `((declaim (freeze-type ,class-name)))))
-         ,@(accessor-definitions dd)
-         ,@(when constructor
-             `((defun ,constructor (,@slot-names &aux (object ,raw-maker-form))
+       ,@(accessor-definitions dd)
+       ,@(when constructor
+           (multiple-value-bind (allocate set-layout)
+               (ecase dd-type
+                 (structure
+                  (values `(%make-structure-instance-macro ,dd nil) nil))
+                 (funcallable-structure
+                  (values `(truly-the ,class-name
+                                      (%make-funcallable-instance ,(dd-length dd)))
+                          `((macrolet ((the-layout ()
+                                         (info :type :compiler-layout ',class-name)))
+                              (setf (%fun-wrapper object) (the-layout)))))))
+             `((defun ,constructor (,@slot-names &aux (object ,allocate))
+                 ,@set-layout
                  ,@(mapcar (lambda (dsd)
                              `(setf (,(dsd-accessor-name dsd) object) ,(dsd-name dsd)))
                            (dd-slots dd))
-                 object)))
-
-         ;; Usually we AVER instead of ASSERT, but AVER isn't defined yet.
-         ;; A naive reading of 'build-order' suggests it is,
-         ;; but due to def!struct delay voodoo, it isn't.
-         (assert (null (symbol-value '*defstruct-hooks*))))))
+                 object)))))))
 
 ;;;; finalizing bootstrapping
 
@@ -2241,8 +2148,7 @@ or they must be declared locally notinline at each call site.~@:>"
 
 (defun find-defstruct-description (name &optional (errorp t))
   (let* ((classoid (find-classoid name errorp))
-         (info (and classoid
-                    (wrapper-%info (classoid-wrapper classoid)))))
+         (info (and classoid (wrapper-%info (classoid-wrapper classoid)))))
     (cond ((defstruct-description-p info)
            info)
           (errorp
@@ -2261,13 +2167,13 @@ or they must be declared locally notinline at each call site.~@:>"
 
 #+sb-xc-host
 (defun %instance-ref (instance index)
-  (let* ((layout (%instance-layout instance))
-         (map (layout-index->accessor-map layout)))
+  (let* ((wrapper (%instance-wrapper instance))
+         (map (wrapper-index->accessor-map wrapper)))
     (when (zerop (length map)) ; construct it on demand
-      (let ((slots (dd-slots (layout-info layout))))
+      (let ((slots (dd-slots (wrapper-%info wrapper))))
         (setf map (make-array (1+ (reduce #'max slots :key #'dsd-index))
                               :initial-element nil)
-              (layout-index->accessor-map layout) map)
+              (wrapper-index->accessor-map wrapper) map)
         (dolist (dsd slots)
           (setf (aref map (dsd-index dsd)) (dsd-accessor-name dsd)))))
     (funcall (aref map index) instance)))
@@ -2315,7 +2221,7 @@ or they must be declared locally notinline at each call site.~@:>"
                                      (val (funcall acc object ind)))
                                 (list `(,acc ,object ,ind)
                                       (if (quote-p val) `',val val)))))
-                          (dd-slots (layout-dd (%instance-layout object))))))
+                          (dd-slots (wrapper-dd (%instance-wrapper object))))))
         #-sb-xc-host
         (values `(,(if (symbolp type) 'new-instance 'allocate-instance) ,type)
                 (loop for slot in (sb-mop:class-slots (class-of object))
@@ -2358,7 +2264,7 @@ or they must be declared locally notinline at each call site.~@:>"
                  (pop inits)
                  (return nil)))))
     (multiple-value-bind (creation-form init-form)
-        (handler-case (sb-xc:make-load-form constant (make-null-lexenv))
+        (handler-case (make-load-form constant (make-null-lexenv))
           (error (condition) (sb-c:compiler-error condition)))
       (cond ((and (listp creation-form)
                   (typep constant 'structure-object)
@@ -2366,7 +2272,7 @@ or they must be declared locally notinline at each call site.~@:>"
                   (eq (second creation-form) (type-of constant))
                   (typep init-form '(cons (eql setf)))
                   (canonical-p (cdr init-form)
-                               (dd-slots (layout-dd (%instance-layout constant)))
+                               (dd-slots (wrapper-dd (%instance-wrapper constant)))
                                constant))
              (values nil 'sb-fasl::fop-struct))
             (t

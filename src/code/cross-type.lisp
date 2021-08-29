@@ -137,7 +137,7 @@
             #+sb-simd-pack-256 simd-pack-256-type)
         (values nil t))
        (character-set-type
-        ;; provided that SB-XC:CHAR-CODE doesn't fail, the answer is certain
+        ;; provided that CHAR-CODE doesn't fail, the answer is certain
         (values (test-character-type type) t))
        (classoid ; = {built-in,structure,condition,standard,static}-classoid
         (let ((name (classoid-name type)))
@@ -161,7 +161,7 @@
                               ;; and it's in our object hierarchy
                               (cl:subtypep name 'structure!object))
                          (values (cl:typep obj name) t)
-                       (unimplemented)))))))
+                         (unimplemented)))))))
        (fun-type
         (if (fun-designator-type-p type)
              (values (typep obj '(or symbol function)) t)
@@ -172,7 +172,7 @@
              (if (and (functionp obj) (eq caller 'sb-xc:typep))
                  (error "TYPEP called with function type")
                  (values (functionp obj) t))))
-       (alien-type-type (if (null obj) (values nil t) (unimplemented)))
+       (alien-type-type (if (symbolp obj) (values nil t) (unimplemented)))
        ;; Test UNKNOWN before falling into the HAIRY case
        (unknown-type
         (let ((spec (unknown-type-specifier type)))
@@ -241,6 +241,10 @@
                 ;; Keep in sync with KEYWORDP test in src/code/target-type
                 (cond ((eq predicate 'keywordp)
                        (test-keywordp))
+                      ;; These are needed in order to compile the predicates
+                      ;; for the initial pprint dispatch table.
+                      ((and (eq obj nil) (member predicate '(fboundp macro-function)))
+                       (values nil t))
                       ((acceptable-cross-typep-pred predicate caller)
                        (values (funcall predicate obj) t))
                       (t
@@ -345,13 +349,13 @@
             ;; Beyond this, there seems to be no portable correspondence.
             (error "can't map host Lisp CHARACTER ~S to target Lisp" x))))
     (sb-c::opaque-box (find-classoid 'structure-object))
-   (instance
-    (let ((type (type-of x)))
-      (if (eq type 'sb-format::fmt-control-proxy)
-          ;; These are functions, but they're weird. We don't want any IR1 transform
-          ;; on FORMAT to kick in and try to convert to FUNCALL on the thing.
-          (specifier-type '(or string function))
-          (find-classoid type))))
+    (instance
+     (let ((type (type-of x)))
+       (if (eq type 'sb-format::fmt-control-proxy)
+           ;; These are functions, but they're weird. We don't want any IR1 transform
+           ;; on FORMAT to kick in and try to convert to FUNCALL on the thing.
+           (specifier-type '(or string function))
+           (find-classoid type))))
     (t
      ;; There might be more cases which we could handle with
      ;; sufficient effort; since all we *need* to handle are enough

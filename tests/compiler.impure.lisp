@@ -1175,7 +1175,8 @@
   (assert (every #'=
                  '(-1.0 0.0 0.0 0.0 0.0 -1.0 0.0 0.0 0.0 0.0 -1.0 0.0 0.0 0.0 0.0 1.0)
                  (rotate-around
-                  (make-array 3 :element-type 'single-float) (coerce pi 'single-float))))
+                  (make-array 3 :element-type 'single-float :initial-element 0f0)
+                  (coerce pi 'single-float))))
   ;; Same bug manifests in COMPLEX-ATANH as well.
   (assert (= (atanh #C(-0.7d0 1.1d0)) #C(-0.28715567731069275d0 0.9394245539093365d0))))
 
@@ -3094,4 +3095,20 @@
 (with-test (:name :local-call-context)
   (ctu:file-compile
    "(lambda (&optional b) (declare (type integer b)) b)"
+   :load t))
+
+(defstruct entry-info-type-struct)
+
+(defvar *entry-info-type-struct* (make-entry-info-type-struct))
+
+(defmethod make-load-form ((struct entry-info-type-struct) &optional env)
+  (declare (ignore env))
+  '*entry-info-type-struct*)
+
+(declaim (ftype (function () (member #.*entry-info-type-struct*)) entry-info-type-func))
+
+
+(with-test (:name :dump-entry-info-type)
+  (ctu:file-compile
+   "(lambda () (entry-info-type-func))"
    :load t))

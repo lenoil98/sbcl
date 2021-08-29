@@ -11,6 +11,9 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
+(with-test (:name :random-describe)
+  (describe sb-impl::*empty-extended-char-table* (make-broadcast-stream)))
+
 (with-test (:name (:reader symbol :escape))
   (assert (equal (symbol-name '#:|fd\sA|) "fdsA")))
 
@@ -335,7 +338,7 @@
       (set-syntax-from-char #\! #\! rt)
       (assert (eq '!! (maybe-bang))))))
 
-(with-test (:name :read-in-package-syntax)
+(with-test (:name :read-in-package-syntax :skipped-on :sb-devel)
   (assert (equal '(sb-c::a (sb-kernel::x sb-kernel::y) sb-c::b)
                  (read-from-string "sb-c::(a sb-kernel::(x y) b)")))
   (assert (equal '(cl-user::yes-this-is-sbcl)
@@ -415,9 +418,14 @@
                 (sb-int:simple-reader-error () :win))
               :win)))
 
+(with-test (:name :sharp-star-default-fill :skipped-on :sbcl)
+  ;; can't assert anything about bits beyond the supplied ones
+  (let ((bv (opaque-identity #*11)))
+    (assert (= (sb-kernel:%vector-raw-bits bv 0) 3))))
+
 ;;; The WITH-FAST-READ-BYTE macro accidentally left the package lock
 ;;; of FAST-READ-BYTE disabled during its body.
-(with-test (:name :fast-read-byte-package-lock)
+(with-test (:name :fast-read-byte-package-lock :skipped-on :sb-devel)
   (let ((fun
          ;; Suppress the compiler output to avoid noise when running the
          ;; test. (There are a warning and an error about the package

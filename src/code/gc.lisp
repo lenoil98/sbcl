@@ -80,7 +80,7 @@ and submit it as a patch."
 
 ;;;; GC hooks
 
-(!define-load-time-global *after-gc-hooks* nil
+(define-load-time-global *after-gc-hooks* nil
   "Called after each garbage collection, except for garbage collections
 triggered during thread exits. In a multithreaded environment these hooks may
 run in any thread.")
@@ -374,7 +374,7 @@ Note: currently changes to this value are lost when saving core."
   (extern-alien "bytes_consed_between_gcs" os-vm-size-t))
 
 (defun (setf bytes-consed-between-gcs) (val)
-  (declare (type index val))
+  (declare (type (and fixnum unsigned-byte) val))
   (setf (extern-alien "bytes_consed_between_gcs" os-vm-size-t)
         val))
 

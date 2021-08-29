@@ -190,6 +190,9 @@
               (hash (word-mix (length x) widetag)))
          (declare (word hash))
          (dotimes (i n-data-words (logand hash most-positive-fixnum))
+           ;; FIXME: the last word of {1,2,4}-bit-per-element vectors
+           ;; needs to be masked. At worst, this fails to coalesce
+           ;; similar vectors, so it's not fatal.
            (setq hash (word-mix hash (%vector-raw-bits x i))))))
       (character (char-code x))
       (t 0))))
@@ -448,8 +451,8 @@
                     ((not (similar-check-table x file))
                      (dump-list x file t)
                      (similar-save-object x file))))
-             (layout
-              (dump-layout x file)
+             (wrapper
+              (dump-wrapper x file)
               (eq-save-object x file))
              #+sb-xc-host
              (ctype
@@ -464,7 +467,7 @@
                               (t (bug "Bogus debug name marker")))))
              (instance
               (let ((c (gethash x (sb-c::eql-constants sb-c::*ir1-namespace*))))
-                (cond ((and c (neq (sb-c::leaf-%source-name c) 'sb-c::.anonymous.))
+                (cond ((and c (sb-c::leaf-has-source-name-p c))
                        (dump-load-time-symbol-global-value c file))
                       (t
                        (dump-structure x file)
@@ -529,7 +532,9 @@
              (dump-non-immediate-object x file)))
         ((fixnump x) (dump-integer x file))
         ((characterp x)
-         (dump-fop 'fop-character file (sb-xc:char-code x)))
+         (dump-fop 'fop-character file (char-code x)))
+        ((packagep x)
+         (dump-push (dump-package x file) file))
         #-sb-xc-host
         ((system-area-pointer-p x)
          (dump-fop 'fop-word-pointer file)
@@ -573,6 +578,7 @@
 ;;; We peek at the object type so that we only pay the circular
 ;;; detection overhead on types of objects that might be circular.
 (defun dump-object (x file)
+  #+(and metaspace sb-xc-host) (when (cl:typep x 'sb-vm:layout) (error "can't dump sb-vm:layout"))
   (if (compound-object-p x)
       (let ((*circularities-detected* ())
             (circ (fasl-output-circularity-table file)))
@@ -913,9 +919,11 @@
   #-sb-xc-host (declare (type (simple-unboxed-array (*)) vector))
   (let* ((length (length vector))
          (widetag (%other-pointer-widetag vector))
-         (bits-per-length (aref **saetp-bits-per-length** widetag)))
-    (aver (< bits-per-length 255))
+         (bits-per-elt (sb-vm::simple-array-widetag->bits-per-elt widetag)))
     (unless data-only
+      ;; fop-spec-vector doesn't grok trailing #\null convention.
+      (aver (and (/= widetag sb-vm:simple-base-string-widetag)
+                 (/= widetag sb-vm:simple-vector-widetag)))
       (dump-fop 'fop-spec-vector file length)
       (dump-byte widetag file))
 
@@ -930,8 +938,8 @@
     (sb-impl::buffer-output (fasl-output-stream file)
                             vector
                             0
-                            (ceiling (* length bits-per-length) sb-vm:n-byte-bits)
-                            #+sb-xc-host bits-per-length))))
+                            (ceiling (* length bits-per-elt) sb-vm:n-byte-bits)
+                            #+sb-xc-host bits-per-elt))))
 
 ;;; Dump string-ish things.
 
@@ -940,9 +948,9 @@
   (declare (type simple-string s))
   (if (or base-string-p #-sb-unicode t) ; if non-unicode, every char is 1 byte
       (dovector (c s)
-        (dump-byte (sb-xc:char-code c) fasl-output))
+        (dump-byte (char-code c) fasl-output))
       (dovector (c s) ; varint (a/k/a LEB128) is better for this than UTF-8.
-        (dump-varint (sb-xc:char-code c) fasl-output))))
+        (dump-varint (char-code c) fasl-output))))
 
 ;;; If we get here, it is assumed that the symbol isn't in the table,
 ;;; but we are responsible for putting it there when appropriate.
@@ -1054,8 +1062,14 @@
             (ecase flavor
               (:code-object (the null name))
               (:layout
-               (if (symbolp name) name (layout-classoid-name name)))
-              (:layout-id (the layout name))
+               (if (symbolp name)
+                   name
+                   (wrapper-classoid-name
+                    (cond #+metaspace
+                          ((sb-kernel::layout-p name) (layout-friend name))
+                          (t name)))))
+              (:layout-id
+               (the wrapper name))
               ((:assembly-routine :assembly-routine* :asm-routine-nil-offset
                :symbol-tls-index
                ;; Only #+immobile-space can use the following two flavors.
@@ -1104,10 +1118,15 @@
         (let ((entry (aref constants i)))
           (etypecase entry
             (constant
-             (let ((name (sb-c::leaf-%source-name entry)))
-               (if (eq name 'sb-c::.anonymous.)
-                   (dump-object (sb-c::constant-value entry) fasl-output)
-                   (dump-load-time-symbol-global-value entry fasl-output))))
+             (if (and (sb-c::leaf-has-source-name-p entry)
+                      ;; We can't really reference constants defined
+                      ;; by name at load time in the same block
+                      ;; compilation unit, so dump it anonymously when
+                      ;; such a situation arises.
+                      (not (member (sb-c::leaf-source-name entry)
+                                   sb-c::*hairy-defconstants*)))
+                 (dump-load-time-symbol-global-value entry fasl-output)
+                 (dump-object (sb-c::constant-value entry) fasl-output)))
             (cons
              (ecase (car entry)
                (:constant ; anything that has not been wrapped in a #<CONSTANT>
@@ -1219,7 +1238,7 @@
             (dolist (entry entries)
               ;; Process in reverse order of ENTRIES.
               ;; See also MAKE-CORE-COMPONENT which does the same thing.
-              (decf wordindex 4)
+              (decf wordindex sb-vm:code-slots-per-simple-fun)
               (setf (aref constants (+ wordindex sb-vm:simple-fun-name-slot))
                     `(:constant ,(sb-c::entry-info-name entry))
                     (aref constants (+ wordindex sb-vm:simple-fun-arglist-slot))
@@ -1241,10 +1260,7 @@
         ;; to functions in top-level forms.
         #+sb-xc-host
         (let ((name (sb-c::entry-info-name entry)))
-          ;; At the moment, we rely on the fopcompiler to do linking
-          ;; for DEFUNs that are not block compiled.
-          (when (and (eq (sb-c::block-compile sb-c::*compilation*) t)
-                     (sb-c::legal-fun-name-p name))
+          (when (sb-c::legal-fun-name-p name)
             (dump-object name file)
             (dump-push entry-handle file)
             (dump-fop 'fop-fset file)))
@@ -1318,12 +1334,12 @@
            struct))
   (note-potential-circularity struct file)
   (do* ((length (%instance-length struct))
-        (layout (%instance-layout struct))
-        (bitmap (layout-bitmap layout))
+        (wrapper (%instance-wrapper struct))
+        (bitmap (wrapper-bitmap wrapper))
         (circ (fasl-output-circularity-table file))
         (index sb-vm:instance-data-start (1+ index)))
       ((>= index length)
-       (dump-non-immediate-object layout file)
+       (dump-non-immediate-object wrapper file)
        (dump-fop 'fop-struct file length))
     (let* ((obj (if (logbitp index bitmap)
                     (%instance-ref struct index)
@@ -1340,14 +1356,14 @@
                              (t obj))
                        file))))
 
-(defun dump-layout (obj file)
-  (when (layout-invalid obj)
+(defun dump-wrapper (obj file &aux (flags (wrapper-flags obj)))
+  (when (wrapper-invalid obj)
     (compiler-error "attempt to dump reference to obsolete class: ~S"
-                    (layout-classoid obj)))
+                    (wrapper-classoid obj)))
   ;; STANDARD-OBJECT could in theory be dumpable, but nothing else,
   ;; because all its subclasses can evolve to have new layouts.
-  (aver (not (logtest (layout-flags obj) +pcl-object-layout-flag+)))
-  (let ((name (layout-classoid-name obj)))
+  (aver (not (logtest flags +pcl-object-layout-flag+)))
+  (let ((name (wrapper-classoid-name obj)))
     ;; Q: Shouldn't we aver that NAME is the proper name for its classoid?
     (unless name
       (compiler-error "dumping anonymous layout: ~S" obj))
@@ -1357,11 +1373,11 @@
     #-sb-xc-host
     (let ((fop (known-layout-fop name)))
       (when fop
-        (return-from dump-layout (dump-byte fop file))))
+        (return-from dump-wrapper (dump-byte fop file))))
     (dump-object name file))
-  (sub-dump-object (layout-bitmap obj) file)
-  (sub-dump-object (layout-inherits obj) file)
+  (sub-dump-object (wrapper-bitmap obj) file)
+  (sub-dump-object (wrapper-inherits obj) file)
   (dump-fop 'fop-layout file
-            (1+ (layout-depthoid obj)) ; non-stack args can't be negative
-            (logand (layout-flags obj) sb-kernel::layout-flags-mask)
-            (layout-length obj)))
+            (1+ (wrapper-depthoid obj)) ; non-stack args can't be negative
+            (logand flags sb-kernel::layout-flags-mask)
+            (wrapper-length obj)))

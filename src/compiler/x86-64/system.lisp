@@ -77,10 +77,8 @@
   (:conditional :e)
   (:generator 1
     (inst cmp :dword
-          (ea (+ (ash (+ (get-dsd-index layout sb-kernel::id-word0)
-                         instance-slots-offset)
-                      word-shift)
-                 (ash (- (layout-depthoid test) 2) 2)
+          (ea (+ (id-bits-offset)
+                 (ash (- (wrapper-depthoid test) 2) 2)
                  (- instance-pointer-lowtag))
               x)
           ;; Small layout-ids can only occur for layouts made in genesis.
@@ -99,7 +97,7 @@
 ;; ~17 instructions vs. 35
 (define-vop ()
     (:policy :fast-safe)
-    (:translate layout-of)
+    (:translate wrapper-of)
     (:args (object :scs (descriptor-reg)))
     (:temporary (:sc unsigned-reg :offset rax-offset) rax)
     (:results (result :scs (descriptor-reg)))
@@ -137,7 +135,8 @@
       (inst jmp  done)
       NULL
       (inst mov  result (make-fixup 'null :layout))
-      DONE))
+      DONE
+      #+metaspace (inst mov result (ea +5 result)))) ; layout->wrapper
 (define-vop ()
     (:policy :fast-safe)
     (:translate %instanceoid-layout)
@@ -162,8 +161,8 @@
   (:results (result :scs (unsigned-reg)))
   (:result-types positive-fixnum)
   (:generator 1 (load-type result object other-pointer-lowtag)))
-(define-vop (fun-subtype)
-  (:translate fun-subtype)
+(define-vop ()
+  (:translate %fun-pointer-widetag)
   (:policy :fast-safe)
   (:args (function :scs (descriptor-reg)))
   (:results (result :scs (unsigned-reg)))
@@ -182,52 +181,59 @@
 
 ;;; This operation is racy with GC and therefore slightly dangerous, especially
 ;;; on objects in immobile space which reserve byte 3 of the header for GC.
-(define-vop (set-header-data)
+(define-vop ()
   (:translate set-header-data)
   (:policy :fast-safe)
-  (:args (x :scs (descriptor-reg) :target res :to (:result 0))
+  (:args (x :scs (descriptor-reg) :to :eval)
          (data :scs (any-reg) :target temp))
   (:arg-types * positive-fixnum)
-  (:results (res :scs (descriptor-reg)))
-  (:temporary (:sc unsigned-reg :from (:argument 1) :to (:result 0)) temp)
+  (:temporary (:sc unsigned-reg :from (:argument 1)) temp)
   (:generator 6
     (move temp data)
     (inst shl temp (- n-widetag-bits n-fixnum-tag-bits))
     ;; merge in the widetag. We should really preserve bit 63 as well
     ;; which could be a GC mark bit, but it's not concurrent at the moment.
     (inst mov :byte temp (ea (- other-pointer-lowtag) x))
-    (storew temp x 0 other-pointer-lowtag)
+    (storew temp x 0 other-pointer-lowtag)))
+(define-vop (logior-header-bits)
+  (:translate logior-header-bits)
+  (:policy :fast-safe)
+  (:args (x :scs (descriptor-reg))
+         (bits :scs (unsigned-reg immediate)))
+  (:arg-types * positive-fixnum)
+  (:results (res :scs (descriptor-reg)))
+  (:generator 1
+    (if (sc-is bits immediate)
+        (let ((bits (tn-value bits)))
+          (cond ((typep bits '(unsigned-byte 8))
+                 (inst or :byte (ea (- 1 other-pointer-lowtag) x) bits))
+                ((not (logtest bits #xff))
+                 (inst or :byte (ea (- 2 other-pointer-lowtag) x) (ash bits -8)))
+                (t
+                 (inst or :word (ea (- 1 other-pointer-lowtag) x) bits))))
+        (inst or :word (ea (- 1 other-pointer-lowtag) x) bits))
     (move res x)))
-
-;;; These next 3 vops are for manipulating and reading the flag bits of
-;;; arrays headers, or more generally any OTHER-POINTER object.
-(define-vop (set-header-bits)
-  (:translate set-header-bits)
+(define-vop ()
+  (:translate assign-vector-flags)
   (:policy :fast-safe)
   (:args (x :scs (descriptor-reg)))
-  (:arg-types t (:constant t))
   (:info bits)
-  (:generator 1
-    (if (typep bits '(unsigned-byte 8))
-        (inst or :byte (ea (- 1 other-pointer-lowtag) x) bits)
-        (inst or :dword (ea (- other-pointer-lowtag) x) (ash bits n-widetag-bits)))))
-(define-vop (unset-header-bits)
-  (:translate unset-header-bits)
+  (:arg-types t (:constant (unsigned-byte 8)))
+  (:generator 1 (inst mov :byte (ea (- 1 other-pointer-lowtag) x) bits)))
+(define-vop ()
+  (:translate reset-header-bits)
   (:policy :fast-safe)
   (:args (x :scs (descriptor-reg)))
-  (:arg-types t (:constant t))
+  (:arg-types t (:constant (unsigned-byte 8)))
   (:info bits)
   (:generator 1
-    (if (typep bits '(unsigned-byte 8))
-        (inst and :byte (ea (- 1 other-pointer-lowtag) x) (logandc1 bits #xff))
-        (inst and :dword (ea (- other-pointer-lowtag) x)
-              (lognot (ash bits n-widetag-bits))))))
+    (inst and :byte (ea (- 1 other-pointer-lowtag) x) (logandc1 bits #xff))))
 (define-vop (test-header-bit)
   (:translate test-header-bit)
   (:policy :fast-safe)
   (:args (array :scs (descriptor-reg)))
-  (:arg-types t (:constant t))
   (:info mask)
+  (:arg-types t (:constant t))
   (:conditional :ne)
   (:generator 1
     ;; Assert that the mask is in header-data byte index 0
@@ -327,6 +333,8 @@
   ;; If RES has list-pointer-lowtag, take its CDR. If not, use it as-is.
   ;; This CMOV safely reads from memory when it does not move, because if
   ;; there is an info-vector in the slot, it has at least one element.
+  ;; Use bit index 3 of the lowtag to distinguish list from vector.
+  ;; A vector will have a 1 in that bit.
   ;; This would compile to almost the same code without a VOP,
   ;; but using a jmp around a mov instead.
   (aver (= (logior list-pointer-lowtag #b1000) other-pointer-lowtag))
@@ -348,13 +356,25 @@
   (:results (res :scs (descriptor-reg)))
   (:temporary (:sc unsigned-reg) temp)
   (:generator 1
+    #-ubsan
+    (progn
     (loadw res x symbol-info-slot other-pointer-lowtag)
     ;; Instruction pun: (CAR x) is the same as (VECTOR-LENGTH x)
     ;; so if the info slot holds a vector, this gets a fixnum- it's not a plist.
     (loadw res res cons-car-slot list-pointer-lowtag)
     (inst mov temp nil-value)
     (inst test :byte res fixnum-tag-mask)
-    (inst cmov :e res temp)))
+    (inst cmov :e res temp))
+    ;; This way doesn't assume that CAR and VECTOR-LENGTH are the same memory access.
+    ;; (And it's not even clear that using CMOV is preferable)
+    #+ubsan
+    (let ((out (gen-label)))
+      (loadw temp x symbol-info-slot other-pointer-lowtag)
+      (inst mov res nil-value)
+      (inst test :byte temp #b1000) ; if temp-reg-tn is a vector, return NIL
+      (inst jmp :ne out)
+      (loadw res temp cons-car-slot list-pointer-lowtag)
+      (emit-label out))))
 
 ;;;; other miscellaneous VOPs
 

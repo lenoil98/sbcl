@@ -105,7 +105,7 @@
 
 (defknown (%sxhash-simple-substring) (simple-string index index) hash-code
   (foldable flushable))
-(defknown (compute-symbol-hash) (simple-string index) hash-code
+(defknown sb-impl::compute-symbol-hash (simple-string index) hash-code
   (foldable flushable))
 
 (defknown (symbol-hash ensure-symbol-hash) (symbol) hash-code
@@ -158,21 +158,25 @@
 (defknown (function-header-word) (function) sb-vm:word (flushable))
 (defknown (instance-header-word) (instance) sb-vm:word (flushable))
 
-;;; This unconventional setter returns its first arg, not the newval.
 (defknown set-header-data
-    (t (unsigned-byte #.(- sb-vm:n-word-bits sb-vm:n-widetag-bits))) t)
-;;; Perform a bitwise OR or AND-not of the existing header data with
-;;; the new bits and return no value.
-(defknown (set-header-bits unset-header-bits)
-  (t (unsigned-byte #.(- sb-vm:n-word-bits sb-vm:n-widetag-bits))) (values)
-  ())
+    (t (unsigned-byte #.(- sb-vm:n-word-bits sb-vm:n-widetag-bits))) (values))
+;;; Like SET-HEADER-DATA, but instead of writing the entire header,
+;;; LOGIOR of the specified value into the "data" portion of the word.
+;;; Returns the first argument, *not* the modified header data.
+(defknown logior-header-bits (t (unsigned-byte 16)) t
+    (#+x86-64 always-translatable))
+;;; ASSIGN-VECTOR-FLAGSS assign all and only the flags byte.
+;;; RESET- performs LOGANDC2 and returns no value.
+(defknown (assign-vector-flags reset-header-bits)
+  (t (unsigned-byte 8)) (values)
+  (#+x86-64 always-translatable))
 (defknown (test-header-bit)
   (t (unsigned-byte #.(- sb-vm:n-word-bits sb-vm:n-widetag-bits))) (boolean)
   (flushable))
 
 (defknown %array-dimension (array index) index
   (flushable))
-(defknown %set-array-dimension (array index index) index
+(defknown %set-array-dimension (array index index) (values)
   ())
 (defknown %array-rank (array) array-rank
   (flushable))
@@ -192,20 +196,23 @@
   (flushable always-translatable))
 (defknown (%copy-instance %copy-instance-slots) (instance instance) instance
   () :result-arg 0)
-(defknown %instance-layout (instance) layout
-  (foldable flushable))
+(defknown %instance-layout (instance) sb-vm:layout (foldable flushable))
+(defknown %instance-wrapper (instance) wrapper (foldable flushable))
 ;;; %FUN-LAYOUT is to %INSTANCE-LAYOUT as FUN-POINTER-LOWTAG is to INSTANCE-POINTER-LOWTAG
 (defknown %fun-layout (#-compact-instance-header funcallable-instance
                        #+compact-instance-header function)
-  layout
+  sb-vm:layout (foldable flushable))
+(defknown %fun-wrapper (#-compact-instance-header funcallable-instance
+                        #+compact-instance-header function)
+  wrapper
   (foldable flushable))
-(defknown %set-instance-layout (instance layout) layout
-  ())
-(defknown %set-fun-layout (funcallable-instance layout) layout
-  ())
+(defknown %set-instance-layout (instance sb-vm:layout) (values) ())
+;;; %SET-FUN-LAYOUT should only called on FUNCALLABLE-INSTANCE
+;;; (but %set-funcallable-instance-layout is too long a name)
+(defknown %set-fun-layout (funcallable-instance sb-vm:layout) (values) ())
 ;;; Layout getter that accepts any object, and if it has INSTANCE- or FUN-
 ;;; POINTER-LOWTAG returns the layout, otherwise some agreed-upon layout.
-(defknown %instanceoid-layout (t) layout (flushable))
+(defknown %instanceoid-layout (t) sb-vm:layout (flushable))
 (defknown layout-eq ((or instance function) t (mod 16)) boolean (flushable))
 ;;; Caution: This is not exactly the same as instance_length() in C.
 ;;; The C one is the same as SB-VM::INSTANCE-LENGTH.
@@ -215,10 +222,8 @@
   (flushable always-translatable))
 (defknown (%instance-ref-eq) (instance index t) boolean
   (flushable always-translatable))
-(defknown %instance-set (instance index t) t
-  (always-translatable)
-  :derive-type #'result-type-last-arg)
-(defknown update-object-layout (t) layout)
+(defknown %instance-set (instance index t) (values) (always-translatable))
+(defknown update-object-layout (t) sb-vm:layout)
 
 #+(or arm64 ppc ppc64 riscv x86 x86-64)
 (defknown %raw-instance-cas/word (instance index sb-vm:word sb-vm:word)
@@ -226,26 +231,19 @@
 #+riscv
 (defknown %raw-instance-cas/signed-word (instance index sb-vm:signed-word sb-vm:signed-word)
   sb-vm:signed-word ())
+(defknown %raw-instance-xchg/word (instance index sb-vm:word) sb-vm:word ())
 
 #.`(progn
      ,@(map 'list
             (lambda (rsd)
-              (let* ((reader (sb-kernel::raw-slot-data-accessor-name rsd))
-                     (name (copy-seq (string reader)))
-                     (writer (intern (replace name "-SET/"
-                                              :start1 (search "-REF/" name))))
+              (let* ((reader (sb-kernel::raw-slot-data-reader-name rsd))
+                     (writer (sb-kernel::raw-slot-data-writer-name rsd))
                      (type (sb-kernel::raw-slot-data-raw-type rsd)))
                 `(progn
                    (defknown ,reader (instance index) ,type
                      (flushable always-translatable))
-                   (defknown ,writer (instance index ,type) ,type
-                     (always-translatable) :derive-type #'result-type-last-arg)
-                   ;; Interpreter stubs, harmless but unnecessary on host
-                   #-sb-xc-host
-                   (progn (defun ,reader (instance index)
-                            (,reader instance index))
-                          (defun ,writer (instance index new-value)
-                            (,writer instance index new-value))))))
+                   (defknown ,writer (instance index ,type) (values)
+                     (always-translatable)))))
             sb-kernel::*raw-slot-data*))
 
 #+compare-and-swap-vops
@@ -266,7 +264,17 @@
 ;;; and WORDS words long. Note: it is your responsibility to ensure that the
 ;;; relation between LENGTH and WORDS is correct.
 ;;; The extra bit beyond N_WIDETAG_BITS is for the vector weakness flag.
-(defknown allocate-vector ((unsigned-byte 9) index
+;;; Note that in almost all situations the first argument is a constant.
+;;; There are only 3 places that it can be non-constant, and not at all
+;;; after self-build is complete. The three non-constant places are from:
+;;;  - ALLOCATE-VECTOR-WITH-WIDETAG in src/code/array
+;;;  - ALLOCATE-VECTOR (which is basically a stub) in src/code/array
+;;;  - FOP-SPEC-VECTOR which calls allocate-vector
+;;; Apart from those, user code that does not have a compile-time-determined
+;;; vector type will usuallly end up calling allocate-vector-with-widetag
+;;; via %MAKE-ARRAY.
+(defknown allocate-vector (#+ubsan boolean
+                           (unsigned-byte 9) index
                            ;; The number of words is later converted
                            ;; to bytes, make sure it fits.
                            (and index
@@ -402,8 +410,10 @@
   system-area-pointer (flushable))
 (defknown (current-sp current-fp) () system-area-pointer (flushable))
 (defknown current-fp-fixnum () fixnum (flushable))
+;; STACK-REF is pretty nearly just SAP-REF-LISPOBJ except that
+;; it takes a word index, not a byte displacement from the SAP.
 (defknown stack-ref (system-area-pointer index) t (flushable))
-(defknown %set-stack-ref (system-area-pointer index t) t ())
+(defknown %set-stack-ref (system-area-pointer index t) (values) ())
 (defknown lra-code-header (t) t (movable flushable))
 ;; FUN-CODE-HEADER returns NIL for assembly routines that have a simple-fun header
 ;; with 0 as the data value. We should probably ensure that assembly routines
@@ -433,62 +443,90 @@
 ;;;; bignum operations
 
 (defknown %allocate-bignum (bignum-length) bignum
-  (flushable))
+  (flushable #-bignum-assertions always-translatable))
 
 (defknown %bignum-length (bignum) bignum-length
-  (foldable flushable))
+  (foldable flushable always-translatable))
 
-(defknown %bignum-set-length (bignum bignum-length) bignum
-  ())
+;;; Change the length of bignum to be newlen. Newlen must be the same or
+;;; smaller than the old length, and any elements beyond newlen must be zeroed.
+(defknown %bignum-set-length (bignum bignum-length) (values)
+  (always-translatable))
 
 (defknown %bignum-ref (bignum bignum-index) bignum-element-type
-  (flushable))
+  (flushable #-bignum-assertions always-translatable))
 #+(or x86 x86-64)
 (defknown %bignum-ref-with-offset (bignum fixnum (signed-byte 24))
   bignum-element-type (flushable always-translatable))
 
-(defknown %bignum-set (bignum bignum-index bignum-element-type)
-  bignum-element-type
-  ())
+(defknown (%bignum-set #+bignum-assertions %%bignum-set) (bignum bignum-index bignum-element-type)
+  (values)
+  (#-bignum-assertions always-translatable))
 
+;;; Return T if digit is positive, or NIL if negative.
 (defknown %digit-0-or-plusp (bignum-element-type) boolean
-  (foldable flushable movable))
+  (foldable flushable movable always-translatable))
 
+;;; %ADD-WITH-CARRY returns a bignum digit and a carry resulting from adding
+;;; together a, b, and an incoming carry.
+;;; %SUBTRACT-WITH-BOROW returns a bignum digit and a borrow resulting from
+;;; subtracting b from a, and subtracting a possible incoming borrow.
 (defknown (%add-with-carry %subtract-with-borrow)
           (bignum-element-type bignum-element-type (mod 2))
   (values bignum-element-type (mod 2))
-  (foldable flushable movable))
+  (foldable flushable movable always-translatable))
 
+;;; This multiplies x-digit and y-digit, producing high and low digits
+;;; manifesting the result. Then it adds the low digit, res-digit, and
+;;; carry-in-digit. Any carries (note, you still have to add two digits
+;;; at a time possibly producing two carries) from adding these three
+;;; digits get added to the high digit from the multiply, producing the
+;;; next carry digit.  Res-digit is optional since two uses of this
+;;; primitive multiplies a single digit bignum by a multiple digit
+;;; bignum, and in this situation there is no need for a result buffer
+;;; accumulating partial results which is where the res-digit comes
+;;; from.
 (defknown %multiply-and-add
           (bignum-element-type bignum-element-type bignum-element-type
                                &optional bignum-element-type)
   (values bignum-element-type bignum-element-type)
-  (foldable flushable movable))
+  (foldable flushable movable always-translatable))
 
+;;; Multiply two digit-size numbers, returning a 2*digit-size result
+;;; split into two digit-size quantities.
 (defknown %multiply (bignum-element-type bignum-element-type)
   (values bignum-element-type bignum-element-type)
-  (foldable flushable movable))
+  (foldable flushable movable always-translatable))
 
 (defknown %lognot (bignum-element-type) bignum-element-type
-  (foldable flushable movable))
+  (foldable flushable movable always-translatable))
 
 (defknown (%logand %logior %logxor) (bignum-element-type bignum-element-type)
   bignum-element-type
   (foldable flushable movable))
 
 (defknown %fixnum-to-digit (fixnum) bignum-element-type
-  (foldable flushable movable))
+  (foldable flushable movable #-(or arm arm64) always-translatable))
 
+;;; This takes three digits and returns the FLOOR'ed result of
+;;; dividing the first two as a 2*digit-size integer by the third.
 (defknown %bigfloor (bignum-element-type bignum-element-type bignum-element-type)
   (values bignum-element-type bignum-element-type)
-  (foldable flushable movable))
+  (foldable flushable movable always-translatable))
 
+;;; Convert the input, a BIGNUM-ELEMENT-TYPE, to a signed word.
+;;; FIXME: considering that both the input and output have N-WORD-BITS significant bits,
+;;; this is really a bad name for the operation.
 (defknown %fixnum-digit-with-correct-sign (bignum-element-type) sb-vm:signed-word
-  (foldable flushable movable))
+  (foldable flushable movable always-translatable))
 
+;;; %ASHR- take a digit-size quantity and shift it to the left,
+;;; returning a digit-size quantity.
+;;; %ASHR- Do an arithmetic shift right of data even though bignum-element-type is
+;;; unsigned.
 (defknown (%ashl %ashr %digit-logical-shift-right)
           (bignum-element-type (mod #.sb-vm:n-word-bits)) bignum-element-type
-  (foldable flushable movable))
+  (foldable flushable movable always-translatable))
 
 ;;;; bit-bashing routines
 
@@ -532,13 +570,13 @@
 ;;; Extract the INDEXth element from the header of CODE-OBJ. Can be
 ;;; set with SETF.
 (defknown code-header-ref (code-component index) t (flushable))
-(defknown code-header-set (code-component index t) t ())
+(defknown code-header-set (code-component index t) (values) ())
 ;;; Extract a 4-byte element relative to the end of CODE-OBJ.
 ;;; The index should be strictly negative and a multiple of 4.
 (defknown code-trailer-ref (code-component fixnum) (unsigned-byte 32)
   (flushable #-(or sparc ppc64) always-translatable))
 
-(defknown fun-subtype (function) (member . #.sb-vm::+function-widetags+)
+(defknown %fun-pointer-widetag (function) (member . #.sb-vm::+function-widetags+)
   (flushable))
 
 (defknown make-fdefn (t) fdefn (flushable movable))

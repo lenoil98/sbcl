@@ -74,8 +74,7 @@
          (locally (declare (optimize (sb-c::type-check 0)))
            (setf sb-c::*current-path* (make-unbound-marker)))
          (if pathname
-             (let* ((info (sb-c::make-file-source-info
-                           pathname (stream-external-format stream)))
+             (let* ((info (sb-c::make-file-stream-source-info stream))
                     (sb-c::*source-info* info))
                (locally (declare (optimize (sb-c::type-check 0)))
                  (setf sb-c::*current-path* (make-unbound-marker)))
@@ -108,32 +107,28 @@
              (invalid-fasl-expected condition)
              (invalid-fasl-fhsss condition)))))
 
-
-;;; The following comment preceded the pre 1.0.12.36 definition of
-;;; LOAD; it may no longer be accurate:
-
-;; FIXME: Daniel Barlow's ilsb.tar ILISP-for-SBCL patches contain an
-;; implementation of "DEFUN SOURCE-FILE" which claims, in a comment,
-;; that CMU CL does not correctly record source file information when
-;; LOADing a non-compiled file. Check whether this bug exists in SBCL
-;; and fix it if so.
-
-(defun call-with-load-bindings (function stream)
-           (let* (;; FIXME: we should probably document the circumstances
-                  ;; where *LOAD-PATHNAME* and *LOAD-TRUENAME* aren't
-                  ;; pathnames during LOAD.  ANSI makes no exceptions here.
-                  (*load-pathname* (handler-case (pathname stream)
-                                     ;; FIXME: it should probably be a type
-                                     ;; error to try to get a pathname for a
-                                     ;; stream that doesn't have one, but I
-                                     ;; don't know if we guarantee that.
-                                     (error () nil)))
-                  (*load-truename* (when *load-pathname*
-                                     (handler-case (truename stream)
-                                       (file-error () nil))))
-                  ;; Bindings used internally.
-                  (*load-depth* (1+ *load-depth*)))
-             (funcall function)))
+(defun call-with-load-bindings (function stream arg pathname-designator)
+  (let* (;; FIXME: we should probably document the circumstances
+         ;; where *LOAD-PATHNAME* and *LOAD-TRUENAME* aren't
+         ;; pathnames during LOAD.  ANSI makes no exceptions here.
+         (*load-pathname* (handler-case (pathname pathname-designator)
+                            ;; FIXME: it should probably be a type
+                            ;; error to try to get a pathname for a
+                            ;; stream that doesn't have one, but I
+                            ;; don't know if we guarantee that.
+                            (error () nil)))
+         ;; FIXME: this ANSI-specified nonsense should have been an accessor call
+         ;; because eager binding might force dozens of syscalls to occur.
+         ;; And you wonder why I/O is slow.  What a joke. Making this a symbol-macro
+         ;; that calls a function would be technically incompatible, but we could
+         ;; make it an unbound symbol and trap the access, stuffing in a value
+         ;; just-in-time. But BOUNDP would also need to hacked to return T.
+         (*load-truename* (when *load-pathname*
+                            (handler-case (truename stream)
+                              (file-error () nil))))
+         ;; Bindings used internally.
+         (*load-depth* (1+ *load-depth*)))
+    (funcall function stream arg)))
 
 ;;; Returns T if the stream is a binary input stream with a FASL header.
 (defun fasl-header-p (stream &key errorp)
@@ -150,7 +145,10 @@
       (when p ; Can't do it non-destructively on non-seekable streams.
         (unwind-protect
              (let* ((header *fasl-header-string-start-string*)
-                    (buffer (make-array (length header) :element-type '(unsigned-byte 8)))
+                    ;; MISMATCH is called no matter how few octets are read in,
+                    ;; so start with BUFFER completely 0-initialized.
+                    (buffer (make-array (length header) :element-type '(unsigned-byte 8)
+                                                        :initial-element 0))
                     (n 0))
                (flet ((scan ()
                         (maybe-skip-shebang-line stream)
@@ -177,34 +175,46 @@
                            (if-does-not-exist t) (external-format :default))
   "Load the file given by FILESPEC into the Lisp environment, returning
    T on success."
-  (flet ((load-stream (stream faslp)
-           (when (and (fd-stream-p stream)
+  (labels ((load-stream (stream faslp)
+             (if (and (fd-stream-p stream)
                       (eq (sb-impl::fd-stream-fd-type stream) :directory))
-             (error 'simple-file-error
-                    :pathname (pathname stream)
-                    :format-control
-                    "Can't LOAD a directory: ~s."
-                    :format-arguments (list (pathname stream))))
-           (dx-flet ((thunk ()
-                            (let (;; Bindings required by ANSI.
-                                  (*readtable* *readtable*)
-                                  (*package* (sane-package))
-                                  ;; KLUDGE: I can't find in the ANSI spec where it says
-                                  ;; that DECLAIM/PROCLAIM of optimization policy should
-                                  ;; have file scope. CMU CL did this, and it seems
-                                  ;; reasonable, but it might not be right; after all,
-                                  ;; things like (PROCLAIM '(TYPE ..)) don't have file
-                                  ;; scope, and I can't find anything under PROCLAIM or
-                                  ;; COMPILE-FILE or LOAD or OPTIMIZE which justifies this
-                                  ;; behavior. Hmm. -- WHN 2001-04-06
-                                  (sb-c::*policy* sb-c::*policy*)
-                                  (sb-c::*handled-conditions* sb-c::*handled-conditions*))
-                              (if faslp
-                                  (load-as-fasl stream verbose print)
-                                  (sb-c:with-compiler-error-resignalling
-                                    (load-as-source stream :verbose verbose
-                                                           :print print))))))
-             (call-with-load-bindings #'thunk stream))))
+                 (error 'simple-file-error
+                        :pathname (pathname stream)
+                        :format-control "Can't LOAD a directory: ~s."
+                        :format-arguments (list (pathname stream)))
+                 (call-with-load-bindings
+                  #'load-stream-1 stream
+                  faslp
+                  ;; If you prefer *LOAD-PATHNAME* to reflect what the user specified prior
+                  ;; to merging, then CALL-WITH-LOAD-BINDINGS is passed PATHSPEC,
+                  ;; otherwise it is passed STREAM.
+                  (cond ((and (not sb-c::*merge-pathnames*)
+                              (typep pathspec '(or string pathname)))
+                         pathspec)
+                        (t stream)))))
+           (load-stream-1 (stream faslp)
+             (let (;; Bindings required by ANSI.
+                   (*readtable* *readtable*)
+                   (*package* (sane-package))
+                   ;; KLUDGE: I can't find in the ANSI spec where it says
+                   ;; that DECLAIM/PROCLAIM of optimization policy should
+                   ;; have file scope. CMU CL did this, and it seems
+                   ;; reasonable, but it might not be right; after all,
+                   ;; things like (PROCLAIM '(TYPE ..)) don't have file
+                   ;; scope, and I can't find anything under PROCLAIM or
+                   ;; COMPILE-FILE or LOAD or OPTIMIZE which justifies this
+                   ;; behavior. Hmm. -- WHN 2001-04-06
+                   (sb-c::*policy* sb-c::*policy*)
+                   (sb-c::*handled-conditions* sb-c::*handled-conditions*))
+               (if faslp
+                   (load-as-fasl stream verbose print)
+                   ;; FIXME: if *EVALUATOR-MODE* is :INTERPRET,
+                   ;; then this should have nothing whatsoever to do with
+                   ;; compiler-error-resignaling. That's an artifact
+                   ;; of using the compiler to perform interpretation.
+                   (sb-c:with-compiler-error-resignalling
+                       (load-as-source stream :verbose verbose :print print))))))
+    (declare (truly-dynamic-extent #'load-stream-1))
 
     ;; Case 1: stream.
     (when (streamp pathspec)
@@ -320,7 +330,8 @@
     (dotimes (i count)
       (destructuring-bind (name . offset) (svref vector i)
         (let ((next-offset (if (< (1+ i) count) (cdr (svref vector (1+ i))) size)))
-          (aver (> next-offset offset))
+          ;; Must be in ascending order, but one address can have more than one name.
+          (aver (>= next-offset offset))
           ;; store inclusive bounds on PC offset range and the function index
           (setf (gethash name ht) (list* offset (1- next-offset) (1+ i))))))))
 

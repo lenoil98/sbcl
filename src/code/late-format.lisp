@@ -264,7 +264,7 @@
                                        (if (and (not colon) (stringp (car input)))
                                            (string-left-trim
                                             ;; #\Tab is a nonstandard char
-                                            `(#-sb-xc-host ,(sb-xc:code-char tab-char-code)
+                                            `(#-sb-xc-host ,(code-char tab-char-code)
                                               #\space #\newline)
                                             (pop input))
                                            ""))))
@@ -284,7 +284,7 @@
                         (when (or (plusp n) (emit-placeholder-p))
                           (let ((char (case char
                                         (#\% #\Newline)
-                                        (#\| (sb-xc:code-char form-feed-char-code))
+                                        #-sb-xc-host (#\| (code-char form-feed-char-code))
                                         (t char))))
                             (emit-string (make-string n :initial-element char))))
                         (return)))))
@@ -503,7 +503,7 @@
                ,directives))))
 
 (defun %set-format-directive-expander (char fn)
-  (let ((code (sb-xc:char-code (char-upcase char))))
+  (let ((code (char-code (char-upcase char))))
     (setf (aref *format-directive-expanders* code) fn))
   char)
 
@@ -1581,3 +1581,7 @@
 
   (sb-c:define-source-transform write-to-string (object &rest keys)
     (expand 'write-to-string object keys)))
+
+#-sb-xc-host
+(defun !late-format-init ()
+  (setq sb-format::**tokenize-control-string-cache-vector** nil))

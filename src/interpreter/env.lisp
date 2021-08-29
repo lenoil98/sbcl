@@ -346,7 +346,8 @@
 (defmacro with-environment-vars ((symbols end) env &body body)
   `(awhen (env-symbols ,env)
      (let ((,symbols (truly-the simple-vector (if (listp it) (cdr it) it)))
-           (,end (locally (declare (optimize (safety 0))) (car it))))
+           (,end #+ubsan (if (listp it) (car it) (sb-c::vector-length it))
+                 #-ubsan (locally (declare (optimize (safety 0))) (car it))))
        (declare (index-or-minus-1 ,end))
        ,@body)))
 (eval-when (:compile-toplevel)
@@ -547,7 +548,7 @@
       (values (proto-fn-%frame proto-fn) (proto-fn-cookie proto-fn))
       (digest-lambda env proto-fn)))
 
-(defun %fun-type (fun)
+(defun %fun-ftype (fun)
   (let ((proto-fn (fun-proto-fn fun)))
     (or (proto-fn-type proto-fn)
         (setf (proto-fn-type proto-fn)
@@ -893,7 +894,7 @@
   ;; then insert assertions for all variables bound by this scope.
   (when (and (policy env (>= safety 1))
              (find-if #'cdr symbols :end n-var-bindings))
-    (let ((checks (make-array n-var-bindings)))
+    (let ((checks (make-array n-var-bindings :initial-element 0)))
       (dotimes (i n-var-bindings (setf (binding-typechecks decl-scope) checks))
         (awhen (cdr (svref symbols i))
           (setf (svref checks i) (type-checker it))))))
@@ -1143,7 +1144,9 @@
                          (specialize binding))
                         ((eq reason 'compile)
                          ;; access interpreter's lexical vars
-                         (macroize sym `(svref ,payload ,i)))
+                         ;; Prevent SETF on the variable from getting
+                         ;; "Destructive function (SETF SVREF) called on constant data"
+                         (macroize sym `(svref (load-time-value ,payload) ,i)))
                         (t
                          (let ((leaf (make-lambda-var
                                       :%source-name sym

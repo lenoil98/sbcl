@@ -18,49 +18,20 @@
                  (+ nil-value (static-symbol-offset symbol) offset)
                  (make-fixup symbol :immobile-symbol offset)))))
 
-(defun gen-cell-set (ea value result &optional vop pseudo-atomic)
-  (when pseudo-atomic
-    ;; (SETF %FUNCALLABLE-INSTANCE-FUN) and (SETF %FUNCALLABLE-INSTANCE-INFO)
-    ;; pass in pseudo-atomic = T.
-    (pseudo-atomic ()
-     (inst push (ea-base ea))
-     (invoke-asm-routine 'call 'touch-gc-card vop)
-     (gen-cell-set ea value result))
-    (return-from gen-cell-set))
-  (when (sc-is value immediate)
-    (let ((bits (encode-value-if-immediate value)))
-      (cond ((not result)
-             ;; Try to move imm-to-mem if BITS fits
-             (acond ((or (and (fixup-p bits)
-                              ;; immobile-object fixups must fit in 32 bits
-                              (eq (fixup-flavor bits) :immobile-symbol)
-                              bits)
-                         (plausible-signed-imm32-operand-p bits))
-                     (inst mov :qword ea it))
-                    (t
-                     (inst mov temp-reg-tn bits)
-                     (inst mov ea temp-reg-tn)))
-             (return-from gen-cell-set))
-            ;; Move the immediate value into RESULT provided that doing so
-            ;; doesn't clobber EA. If it would, use TEMP-REG-TN instead.
-            ;; TODO: if RESULT is unused, and the immediate fits in an
-            ;; imm32 operand, then perform imm-to-mem move, but as the comment
-            ;; observes, there's no easy way to spot an unused TN.
-            ((or (location= (ea-base ea) result)
-                 (awhen (ea-index ea) (location= it result)))
-             (inst mov temp-reg-tn bits)
-             (setq value temp-reg-tn))
-            (t
-             ;; Can move into RESULT, then into EA
-             (inst mov result bits)
-             (inst mov ea result)
-             (return-from gen-cell-set)))))
-  (inst mov :qword ea value) ; specify the size for when VALUE is an integer
-  (when result
-    ;; Ideally we would skip this move if RESULT is unused hereafter,
-    ;; but unfortunately (NOT (TN-READS RESULT)) isn't equivalent
-    ;; to there being no reads from the TN at all.
-    (move result value)))
+(defun gen-cell-set (ea value)
+  (if (sc-is value immediate)
+      (let ((bits (encode-value-if-immediate value)))
+        ;; Try to move imm-to-mem if BITS fits
+        (acond ((or (and (fixup-p bits)
+                         ;; immobile-object fixups must fit in 32 bits
+                         (eq (fixup-flavor bits) :immobile-symbol)
+                         bits)
+                    (plausible-signed-imm32-operand-p bits))
+                (inst mov :qword ea it))
+               (t
+                (inst mov temp-reg-tn bits)
+                (inst mov ea temp-reg-tn))))
+      (inst mov :qword ea value)))
 
 ;;; CELL-REF and CELL-SET are used to define VOPs like CAR, where the
 ;;; offset to be read or written is a property of the VOP used.
@@ -79,7 +50,7 @@
   (:variant-vars offset lowtag)
   (:policy :fast-safe)
   (:generator 4
-    (gen-cell-set (object-slot-ea object offset lowtag) value nil)))
+    (gen-cell-set (object-slot-ea object offset lowtag) value)))
 
 ;;; X86 special
 (define-vop (cell-xadd)
@@ -185,3 +156,89 @@
           ;; Bit index is 0-based. Subtract 8 since we're using the EA
           ;; to select byte 1 of the header word.
           (ash 1 (- stable-hash-required-flag 8)))))
+
+(defmacro compute-splat-bits (value)
+  ;; :SAFE-DEFAULT means any unspecific value that is safely a default.
+  ;; Heap allocation uses 0 since that costs nothing.
+  ;; Stack allocation pick no-tls-value-marker even though it differs from the heap.
+  ;; If the user wanted a specific value, it could have been explicitly given.
+  `(if (typep ,value 'sb-vm:word)
+       ,value
+       (case ,value
+         (:unbound (unbound-marker-bits))
+         ((nil) (bug "Should not see SPLAT NIL"))
+         (t #+ubsan no-tls-value-marker-widetag
+            #-ubsan 0))))
+
+;;; This logic was formerly in ALLOCATE-VECTOR-ON-STACK.
+;;; Choosing amongst 3 vops gets potentially better register allocation
+;;; by not wasting registers in the cases that don't use them.
+(define-vop (splat-word)
+  (:policy :fast-safe)
+  (:translate splat)
+  (:args (vector :scs (descriptor-reg)))
+  (:info words value)
+  (:arg-types * (:constant (eql 1)) (:constant t))
+  (:results (result :scs (descriptor-reg)))
+  (:generator 1
+   (progn words) ; don't put it in :ignore, which gets inherited
+   (inst mov :qword
+         (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag) vector)
+         (compute-splat-bits value))
+   (move result vector)))
+
+(define-vop (splat-small splat-word)
+  (:arg-types * (:constant (integer 2 10)) (:constant t))
+  (:temporary (:sc complex-double-reg) zero)
+  (:generator 5
+   (let ((bits (compute-splat-bits value)))
+     (if (= bits 0)
+         (inst xorpd zero zero)
+         (inst movdqa zero
+               (register-inline-constant :oword (logior (ash bits 64) bits)))))
+   (let ((data-addr (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)
+                        vector)))
+     (multiple-value-bind (double single) (truncate words 2)
+       (dotimes (i double)
+         (inst movapd data-addr zero)
+         (setf data-addr (ea (+ (ea-disp data-addr) (* n-word-bytes 2))
+                             (ea-base data-addr))))
+       (unless (zerop single)
+         (inst movaps data-addr zero))))
+   (move result vector)))
+
+(define-vop (splat-any splat-word)
+  ;; vector has to conflict with everything so that a tagged pointer
+  ;; corresponding to RDI always exists
+  (:args (vector :scs (descriptor-reg) :to (:result 0))
+         (words :scs (unsigned-reg immediate) :target rcx))
+  (:info value)
+  (:arg-types * positive-fixnum (:constant t))
+  (:temporary (:sc any-reg :offset rdi-offset :from (:argument 0)
+               :to (:result 0)) rdi)
+  (:temporary (:sc any-reg :offset rcx-offset :from (:argument 1)
+               :to (:result 0)) rcx)
+  (:temporary (:sc any-reg :offset rax-offset :from :eval
+               :to (:result 0)) rax)
+  (:results (result :scs (descriptor-reg)))
+  (:generator 10
+   (inst lea rdi (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)
+                        vector))
+   (let ((bits (compute-splat-bits value)))
+     (cond ((and (= bits 0)
+                 (constant-tn-p words)
+                 (typep (tn-value words) '(unsigned-byte 7)))
+            (zeroize rax)
+            (inst lea :dword rcx (ea (tn-value words) rax))) ; smaller encoding
+           (t
+            ;; words could be in RAX, so read it first, then zeroize
+            (inst mov rcx (or (and (constant-tn-p words) (tn-value words)) words))
+            (if (= bits 0) (zeroize rax) (inst mov rax bits)))))
+   (inst rep)
+   (inst stos :qword)
+   (move result vector)))
+
+(dolist (name '(splat-word splat-small splat-any))
+  ;; It wants a function, not a symbol
+  (setf (sb-c::vop-info-optimizer (template-or-lose name))
+        (lambda (vop) (sb-c::elide-zero-fill vop))))

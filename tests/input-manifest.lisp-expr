@@ -9,17 +9,12 @@
  ("case.pure.lisp" "tests/case-test.lisp")
  ("chill.test.sh"
   "src/cold/chill.lisp"
-  "src/cold/shebang.lisp"
   "package-data-list.lisp-expr")
  ("clos.impure.lisp"
   "contrib/sb-cltl2.fasl"
   "tests/package-ctor-bug.lisp"
   "tests/bug-503095.lisp"
   "tests/bug-503095-2.lisp")
- ("compiler.pure.lisp"
-  "tests/data/wonky1.lisp"
-  "tests/data/wonky2.lisp"
-  "tests/data/wonky3.lisp")
  ("compiler.impure.lisp"
   "tests/bad-mlf-test.lisp"
   "tests/bug204-test.lisp"
@@ -43,6 +38,12 @@
  ("elfcore.test.sh" "src/runtime/shrinkwrap-sbcl")
  ("exit-hang.impure.lisp" "tests/fcb-threads.so")
  ("fcb-threads.impure.lisp" "tests/fcb-threads.so")
+ ("filecompile.impure.lisp"
+  "tests/data/wonky1.lisp"
+  "tests/data/wonky2.lisp"
+  "tests/data/wonky3.lisp"
+  "tests/data/wonky4.lisp"
+  "src/code/primordial-extensions.lisp")
  ("init.test.sh"
   "contrib/sb-introspect.fasl"
   "tests/custom-sysinit.lisp"
@@ -52,7 +53,8 @@
   "tests/parallel-fasl-load-test.lisp"
   "tests/data/wonky1.lisp"
   "tests/data/wonky2.lisp"
-  "tests/data/wonky3.lisp")
+  "tests/data/wonky3.lisp"
+  "tests/data/wonky4.lisp")
  ("load.pure.lisp"
   "tests/data/wonky1.lisp")
  ("octets.pure.lisp"
@@ -60,8 +62,10 @@
   "tests/data/compile-file-pos-utf16be.lisp")
  ("redblack.pure.lisp" "tests/bbtree-test-util.lisp")
  ("run-program.impure.lisp" "contrib/sb-posix.fasl")
+ ("sb-graph.impure.lisp" "contrib/sb-graph.fasl" "contrib/uiop.fasl")
  ("signals.impure.lisp" "contrib/sb-posix.fasl")
  ("stream.impure.lisp" "contrib/sb-posix.fasl")
+ ("sprof.impure.lisp" "../contrib/sb-sprof/test.lisp" "../contrib/sb-sprof/graph.lisp")
  ("threads.impure.lisp"
   "tests/alloca.so"
   "tests/threads-foreign.so")

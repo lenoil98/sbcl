@@ -79,6 +79,8 @@
                )))
     (let*
         ((spaces (append `((read-only ,ro-space-size)
+                           #+(and win32 x86-64)
+                           (seh-data ,(symbol-value '+backend-page-bytes+) win64-seh-data-addr)
                            (linkage-table ,small-space-size)
                            #+sb-safepoint
                            ;; Must be just before NIL.
@@ -193,6 +195,7 @@
         *current-unwind-protect-block*)
 
     #+immobile-space *immobile-freelist* ; not per-thread (yet...)
+    #+metaspace *metaspace-tracts*
 
     ;; stack pointers
     #-sb-thread *binding-stack-start* ; a thread slot if #+sb-thread
@@ -259,6 +262,48 @@
 
 (defparameter *runtime-asm-routines* nil)
 (defparameter *linkage-space-predefined-entries* nil)
+
+;;; Floating-point related constants, both format descriptions and FPU
+;;; control register descriptions.  These don't exactly match up with
+;;; what the machine manuals say because the Common Lisp standard
+;;; defines floating-point values somewhat differently than the IEEE
+;;; standard does.
+
+;;; We can currently manipulate only IEEE single and double precision.
+;;; Machine-specific formats (such as x86 80-bit and PPC double-double)
+;;; are unsupported.
+
+#+ieee-floating-point
+(progn
+(defconstant float-sign-shift 31)
+
+;;; The exponent bias is the amount up by which the true exponent is
+;;; incremented for storage purposes.
+;;; (Wikipedia entry for single-float: "an exponent value of 127 represents the actual zero")
+;;; 126 works for us because we actually want an exponent of -1 and not 0
+;;; when using DECODE-FLOAT. -1 is correct because the implied 1 bit in a normalized
+;;; float is the _left_ of of the binary point, so the powers of 2 for the first represented
+;;; bit is 2^-1. Similarly for double-float.
+(defconstant single-float-bias 126)
+(defconstant-eqx single-float-exponent-byte (byte 8 23) #'equalp)
+(defconstant-eqx single-float-significand-byte (byte 23 0) #'equalp)
+(defconstant single-float-normal-exponent-min 1)
+(defconstant single-float-normal-exponent-max 254)
+(defconstant single-float-hidden-bit (ash 1 23))
+
+(defconstant double-float-bias 1022)
+(defconstant-eqx double-float-exponent-byte (byte 11 20) #'equalp)
+(defconstant-eqx double-float-significand-byte (byte 20 0) #'equalp)
+(defconstant double-float-normal-exponent-min 1)
+(defconstant double-float-normal-exponent-max #x7FE)
+(defconstant double-float-hidden-bit (ash 1 20))
+
+(defconstant single-float-digits
+  (+ (byte-size single-float-significand-byte) 1))
+
+(defconstant double-float-digits
+  (+ (byte-size double-float-significand-byte) 32 1))
+)
 
 (push '("SB-VM" +c-callable-fdefns+ +common-static-symbols+)
       *!removable-symbols*)

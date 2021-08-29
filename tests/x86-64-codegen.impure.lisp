@@ -148,14 +148,15 @@
   (let* ((lines
           (split-string
            (with-output-to-string (s)
-            (let ((sb-disassem:*disassem-location-column-width* 0)
-                  (sb-kernel::*print-layout-id* nil))
+            (let ((sb-disassem:*disassem-location-column-width* 0))
               (disassemble '(lambda (x) (the sb-assem:label x))
                            :stream s)))
            #\newline))
          (index
           (position "OBJECT-NOT-TYPE-ERROR" lines :test 'search)))
-    (assert (search "; #<SB-KERNEL:LAYOUT for SB-ASSEM:LABEL" (nth (+ index 2) lines)))))
+    (let ((line (nth (+ index 2) lines)))
+      (assert (search "; #<SB-KERNEL:WRAPPER " line))
+      (assert (search " SB-ASSEM:LABEL" line)))))
 
 #+immobile-code
 (with-test (:name :reference-assembly-tramp)
@@ -223,7 +224,7 @@
         (expect "#<FDEFN G>" lines)
         (expect "#<FUNCTION H>" lines)))))
 
-(with-test (:name :c-call)
+(with-test (:name :c-call :skipped-on (and :win32 :x86-64))
   (let* ((lines (split-string
                  (with-output-to-string (s)
                    (let ((sb-disassem:*disassem-location-column-width* 0))
@@ -717,15 +718,15 @@ sb-vm::(define-vop (cl-user::test)
   ;; component.
   (let ((names
           (mapcar (lambda (x)
-                    (sb-kernel:classoid-name (sb-kernel:layout-classoid x)))
-                  (ctu:find-code-constants #'sb-kernel:%%typep :type 'sb-kernel:layout))))
+                    (sb-kernel:classoid-name (sb-kernel:wrapper-classoid x)))
+                  (ctu:find-code-constants #'sb-kernel:%%typep :type 'sb-kernel:wrapper))))
     (assert (null (set-difference names
                                   '(sb-kernel:ctype
                                     sb-kernel:unknown-type
                                     sb-kernel:fun-designator-type
                                     sb-c::abstract-lexenv
                                     sb-kernel::classoid-cell
-                                    sb-kernel:layout
+                                    sb-kernel:wrapper
                                     sb-kernel:classoid
                                     sb-kernel:built-in-classoid
                                     #-immobile-space null))))))
@@ -744,7 +745,7 @@ sb-vm::(define-vop (cl-user::test)
      (loop for line in (split-string (with-output-to-string (string)
                                        (disassemble f :stream string))
                                      #\newline)
-             thereis (and (search "LAYOUT for" line)
+             thereis (and (search "WRAPPER for" line)
                           (search "CMP DWORD PTR" line)))))
 
 (with-test (:name :thread-local-unbound)
@@ -803,7 +804,7 @@ sb-vm::(define-vop (cl-user::test)
 #+compact-instance-header
 (with-test (:name :gf-self-contained-trampoline)
   (let ((l (sb-kernel:find-layout 'standard-generic-function)))
-    (assert (/= (sb-kernel:layout-bitmap l) sb-kernel:+layout-all-tagged+))))
+    (assert (/= (sb-kernel:wrapper-bitmap l) sb-kernel:+layout-all-tagged+))))
 
 (with-test (:name :known-array-rank)
   (flet ((try (type)
@@ -949,3 +950,97 @@ sb-vm::(define-vop (cl-user::test)
                            (typecase x (fixnum 'a) (bignum 'b) (t 'c))))))
     (assert (= (length (disassembly-lines f1))
                (length (disassembly-lines f2))))))
+
+(with-test (:name :boundp+symbol-value
+            :skipped-on (not :sb-thread))
+  ;; The vop combiner produces exactly one reference to SB-C::*COMPILATION*.
+  ;; Previously there would have been one from BOUNDP and one from SYMBOL-VALUE.
+  (let ((lines (disassembly-lines
+                '(lambda ()
+                  (if (boundp 'sb-c::*compilation*) sb-c::*compilation*) '(hi)))))
+    (dolist (line lines)
+      (assert (not (search "ERROR" line))))
+    (assert (= (loop for line in lines
+                     count (search "*COMPILATION*" line))
+               1)))
+  ;; Non-constant symbol works too now
+  (let ((lines (disassembly-lines
+                '(lambda (x) (if (boundp (truly-the symbol x)) x '(hi))))))
+    (dolist (line lines)
+      (assert (not (search "ERROR" line))))))
+
+;;; We were missing the fndb info that fill-pointer-error doesn't return
+;;; (not exactly "missing", but in the wrong package)
+(with-test (:name :fill-pointer-no-return-multiple)
+  (let ((lines (disassembly-lines '(lambda (x) (fill-pointer x)))))
+    (dolist (line lines)
+      (assert (not (search "RETURN-MULTIPLE" line))))))
+
+(with-test (:name :elide-zero-fill)
+  (let* ((f (compile nil '(lambda () (make-array 100 :initial-element 0))))
+         (lines (disassembly-lines f)))
+    (dolist (line lines)
+      (assert (not (search "REPE STOSQ" line))))))
+
+;;; Word-sized stores (or larger, like double-float on 32-bit) would cons a new lisp object
+(with-test (:name :sap-set-does-not-cons)
+  (loop for (type accessor telltale) in
+        '((sb-vm:word sb-sys:sap-ref-word "ALLOC-UNSIGNED-BIGNUM")
+          (double-float sb-sys:sap-ref-double "CONS"))
+        do (let* ((positive-test
+                   (compile nil `(lambda (sap) (,accessor sap 0))))
+                  (negative-test
+                   (compile nil `(lambda (sap obj) (setf (,accessor sap 0) obj)))))
+             ;; Positive test ensures we know the right telltale for the type
+             ;; in case the allocation logic changes
+             (assert (loop for line in (disassembly-lines positive-test)
+                           thereis (search telltale line)))
+             (assert (not (loop for line in (disassembly-lines negative-test)
+                                thereis (search telltale line)))))))
+
+(with-test (:name :bash-copiers-byte-or-larger)
+  (dolist (f '(sb-kernel::ub8-bash-copy
+               sb-kernel::ub16-bash-copy
+               sb-kernel::ub32-bash-copy
+               sb-kernel::ub64-bash-copy))
+    ;; Should not call anything
+    (assert (not (ctu:find-code-constants (symbol-function f))))))
+
+(defstruct bitsy
+  (fix 0 :type fixnum)
+  (sw 0 :type sb-vm:signed-word))
+
+(defun s62 (x) (logtest (ash 1 62) (bitsy-fix x)))
+(compile 's62)
+(with-test (:name :lp-1939897)
+  (assert (not (s62 (make-bitsy :fix (ash 1 61))))))
+
+(defmacro try-logbitp-walking-bit-test
+    (slot-name initarg nbits most-negative-value)
+  `(let ((functions (make-array ,nbits)))
+     (flet ((bit-num-to-value (b)
+              (if (= b ,(1- nbits)) ,most-negative-value (ash 1 b))))
+       (loop for bit-index from 0 below ,nbits
+          do (setf (aref functions bit-index)
+                   (compile nil `(lambda (obj)
+                                  (values (logtest ,(bit-num-to-value bit-index)
+                                           (,',slot-name obj))
+                                   (logbitp ,bit-index (,',slot-name obj)))))))
+       (loop for set-bit-index from 0 below ,nbits
+          do (let ((struct (make-bitsy ,initarg
+                                       (bit-num-to-value set-bit-index))))
+               (loop for test-bit-index from 0 below ,nbits
+                  do (multiple-value-bind (value1 value2)
+                         (funcall (aref functions test-bit-index) struct)
+                       ;; The expressions should agree at each bit
+                       (assert (eq value1 value2))
+                       ;; And should give the right answer
+                       (if (= test-bit-index set-bit-index)
+                           (assert value1)
+                           (assert (not value1))))))))))
+
+(with-test (:name :logbitp-vs-logtest-exhaustive-test)
+  (try-logbitp-walking-bit-test bitsy-fix :fix 63
+                                most-negative-fixnum)
+  (try-logbitp-walking-bit-test bitsy-sw  :sw  64
+                                (sb-c::mask-signed-field 64 (ash 1 63))))

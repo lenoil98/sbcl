@@ -44,26 +44,7 @@
          (index :scs (unsigned-reg))
          (value :scs (descriptor-reg)))
   (:arg-types simple-array-nil positive-fixnum *)
-  (:results (result :scs (descriptor-reg)))
-  (:result-types *)
-  (:ignore index value result)
-  (:vop-var vop)
-  (:save-p :compute-only)
-  (:generator 1
-    (error-call vop 'nil-array-accessed-error object)))
-
-(define-vop (data-vector-set/simple-array-nil)
-  (:translate data-vector-set)
-  (:policy :fast-safe)
-  (:args (object :scs (descriptor-reg))
-         (index :scs (unsigned-reg))
-         (value :scs (descriptor-reg)))
-  (:info offset)
-  (:arg-types simple-array-nil positive-fixnum *
-              (:constant (integer 0 0)))
-  (:results (result :scs (descriptor-reg)))
-  (:result-types *)
-  (:ignore index value result offset)
+  (:ignore index value)
   (:vop-var vop)
   (:save-p :compute-only)
   (:generator 1
@@ -90,7 +71,7 @@
   (cond ((sc-is thing immediate)
          (let ((obj (tn-value thing)))
            (typecase obj
-             (layout nil)
+             (wrapper nil)
              ;; non-static symbols can be referenced as error-break args
              ;; because they appear in the code constants.
              ;; static symbols can't be referenced as error-break args
@@ -135,17 +116,14 @@
   (def "FAILED-AVER"             sb-impl::%failed-aver        nil form))
 
 
-(defun emit-internal-error (kind code values &key trap-emitter
-                                                  (compact-error-trap t))
-  (let ((trap-number (if (and (eq kind error-trap)
-                              compact-error-trap)
+(defun emit-internal-error (kind code values &key trap-emitter)
+  (let ((trap-number (if (eq kind error-trap)
                          (+ kind code)
                          kind)))
     (if trap-emitter
         (funcall trap-emitter trap-number)
         (inst byte trap-number)))
-  (unless (and (eq kind error-trap)
-               compact-error-trap)
+  (unless (eq kind error-trap)
     (inst byte code))
   (encode-internal-error-args values))
 
@@ -161,7 +139,7 @@
               (make-sc+offset immediate-sc-number (tn-value where)))
              (t
               (make-sc+offset (if (and (sc-is where immediate)
-                                       (typep (tn-value where) '(or symbol layout)))
+                                       (typep (tn-value where) '(or symbol wrapper)))
                                   constant-sc-number
                                   (sc-number (tn-sc where)))
                               (or (tn-offset where) 0))))

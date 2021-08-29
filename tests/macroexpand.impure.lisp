@@ -28,8 +28,6 @@
 (assert (equal (let ((glob nil)) (push 'foo glob) glob) '(foo)))
 (assert (null glob))
 
-
-
 ;;; CLHS 3.1.2.1.1 specifies that symbol macro expansion must also
 ;;; go through *MACROEXPAND-HOOK*. (2007-09-22, -TCR.)
 
@@ -40,11 +38,23 @@
 ;;; as :compile, but now we support running the test suite with any
 ;;; *evaluator-mode*, so must explicitly COMPILE the macroexpand hook.
 ;;; Notice that the lambda expressions being compiled are closures.
-;;; This is allowed by sb-interpreter but not sb-eval.
+;;; This is allowed by sb-interpreter. sb-eval gets an error
+;;; "Unhandled INTERPRETER-ENVIRONMENT-TOO-COMPLEX-ERROR:
+;;;  Lexical environment of #<INTERPRETED-FUNCTION NIL {1001850EBB}>
+;;   is too complex to compile."
+
+;;; Like CHECKED-COMPILE, this disallows unexpected warnings.
+;;; But unlike CHECKED-COMPILE, it allows the argument to be a function.
+(defun compilefun (fun)
+  (multiple-value-bind (result warnp errorp)
+      (compile nil fun)
+    (assert (not warnp))
+    (assert (not errorp))
+    result))
 
 (let* ((expanded-p nil)
        (*macroexpand-hook*
-        (compile nil #'(lambda (fn form env)
+        (compilefun  #'(lambda (fn form env)
                          (when (eq form '.foo.)
                            (setq expanded-p t))
                          (funcall fn form env)))))
@@ -57,7 +67,7 @@
 (let ((sb-ext:*evaluator-mode* :interpret))
   (let* ((expanded-p nil)
          (*macroexpand-hook*
-          (compile nil #'(lambda (fn form env)
+          (compilefun  #'(lambda (fn form env)
                            (when (eq form '.foo.)
                              (setq expanded-p t))
                            (funcall fn form env)))))
@@ -66,7 +76,7 @@
 
 (let* ((expanded-p nil)
        (*macroexpand-hook*
-        (compile nil #'(lambda (fn form env)
+        (compilefun  #'(lambda (fn form env)
                          (when (eq form '/foo/)
                            (setq expanded-p t))
                          (funcall fn form env)))))
@@ -221,12 +231,14 @@
 (defmacro capture-env (&environment e &rest r)
   (declare (ignore r))
   e)
-(with-test (:name :macroexpand-of-setf-structure-access)
-  (assert (equal (macroexpand-1 '(setf (foo-a x) 3))
-                 `(sb-kernel:%instance-set (the foo x)
-                                           ,sb-vm:instance-data-start
-                                           (sb-kernel:the* (fixnum :context (:struct foo . a)) 3))))
-
+(with-test (:name :macroexpand-setf-instance-ref.1)
+  (assert (equal-mod-gensyms
+           (macroexpand-1 '(setf (foo-a x) 3))
+           `(let ((#1=instance (the foo x))
+                  (#2=val (sb-kernel:the* (fixnum :context (:struct foo . a)) 3)))
+              (sb-kernel:%instance-set #1# #.sb-vm:instance-data-start #2#)
+              #2#))))
+(with-test (:name :macroexpand-setf-instance-ref.2)
   ;; Lexical definition of (SETF FOO-A) inhibits source-transform.
   ;; This is not required behavior - SETF of structure slots
   ;; do not necessarily go through a function named (SETF your-slot),
@@ -384,21 +396,8 @@
     (assert (equal (funcall f 'o) '(o p)))
     (assert (eql (funcall f 42) -1))))
 
-;;; There was a minor glitch in the typecase->case optimizer causing
-;;; duplicate layouts to appear, but the correct clause was picked
-;;; by good fortune. Assert that there are no duplicates now.
-#+#.(cl:if (cl:gethash 'sb-c:multiway-branch-if-eq sb-c::*backend-template-names*)
-         '(:and)
-         '(:or))
-(with-test (:name :sealed-struct-typecase-map)
-  (let (all-layouts)
-    (sb-int:dovector (bin (subseq (sb-impl::build-sealed-struct-typecase-map
-                                   '((sb-kernel:ansi-stream synonym-stream
-                                      sb-sys:fd-stream broadcast-stream
-                                      two-way-stream concatenated-stream echo-stream)
-                                     (broadcast-stream)))
-                                  1))
-      (dolist (cell bin)
-        (let ((layout (car cell)))
-          (assert (not (member layout all-layouts)))
-          (push layout all-layouts))))))
+(defmacro macro-with-dotted-list (&rest args)
+  args)
+(with-test (:name :macro-with-dotted-list)
+  (let ((expansion (macroexpand '(macro-with-dotted-list . 1))))
+    (assert (equal expansion 1))))

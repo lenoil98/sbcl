@@ -480,7 +480,9 @@
               (found-allow-p nil))
 
           (temps #-stack-grows-downward-not-upward
-                 `(,n-index (1- ,n-count))
+                 `(,n-index (+ ,n-count ,(if (vop-existsp :translate %more-keyword-pair)
+                                             0
+                                             -1)))
                  #+stack-grows-downward-not-upward
                  `(,n-index (- (1- ,n-count)))
                  #-stack-grows-downward-not-upward n-value-temp
@@ -536,7 +538,9 @@
                        (setq ,n-lose ,n-key))))
 
             (body
-             `(when (oddp ,n-count)
+             `(when (oddp ,(if (vop-existsp :translate %more-keyword-pair)
+                               n-index
+                               n-count))
                 (%odd-key-args-error)))
 
             (body
@@ -544,12 +548,19 @@
              `(locally
                 (declare (optimize (safety 0)))
                 (loop
-                  (when (minusp ,n-index) (return))
-                  (setf ,n-value-temp (%more-arg ,n-context ,n-index))
-                  (decf ,n-index)
-                  (setq ,n-key (%more-arg ,n-context ,n-index))
-                  (decf ,n-index)
-                  (case ,n-key ,@(tests))))
+                 ,@(cond ((vop-existsp :translate %more-keyword-pair)
+                          `((when (zerop ,n-index) (return))
+                            (decf ,n-index 2)
+                            (multiple-value-bind (key value)
+                                (%more-keyword-pair ,n-context ,n-index)
+                              (setf ,n-value-temp value ,n-key key))))
+                         (t
+                          `((when (minusp ,n-index) (return))
+                            (setf ,n-value-temp (%more-arg ,n-context ,n-index))
+                            (decf ,n-index)
+                            (setq ,n-key (%more-arg ,n-context ,n-index))
+                            (decf ,n-index))))
+                 (case ,n-key ,@(tests))))
              #+stack-grows-downward-not-upward
              `(locally (declare (optimize (safety 0)))
                 (loop
@@ -1239,6 +1250,7 @@
                 (lexenv-flushable *lexenv*)
                 lexenv-lambda
                 *lexenv*)))
+         (*inlining* (not *transforming*))
          (clambda (ir1-convert-lambda body
                                       :source-name source-name
                                       :debug-name debug-name
@@ -1253,40 +1265,38 @@
 ;;; previous references.
 (defun get-defined-fun (name &optional (lambda-list nil lp))
   (proclaim-as-fun-name name)
-  (when #+sb-xc-host (not *compile-time-eval*)
-        #-sb-xc-host (boundp '*ir1-namespace*)
-    (let ((found (find-free-fun name "shouldn't happen! (defined-fun)"))
-          (free-funs (free-funs *ir1-namespace*)))
-      (note-name-defined name :function)
-      (cond ((not (defined-fun-p found))
-             ;; This assertion is wrong in block compilation mode, for
-             ;; instance
-             ;;
-             ;; (defun foo (x) (bar x))
-             ;; (declaim (inline bar))
-             ;; (defun bar (x) x)
-             (aver (or (block-compile *compilation*)
-                       (not (info :function :inlinep name))))
-             (let* ((where-from (leaf-where-from found))
-                    (res (make-defined-fun
-                          :%source-name name
-                          :where-from (if (eq where-from :declared)
-                                          :declared
-                                          :defined-here)
-                          :type (if (eq :declared where-from)
-                                    (leaf-type found)
-                                    (or (and lp
-                                             (ignore-errors
-                                              (ftype-from-lambda-list lambda-list)))
-                                        (specifier-type 'function))))))
-               (substitute-leaf res found)
-               (setf (gethash name free-funs) res)))
-            ;; If FREE-FUNS has a previously converted definition
-            ;; for this name, then blow it away and try again.
-            ((defined-fun-functionals found)
-             (remhash name free-funs)
-             (get-defined-fun name lambda-list))
-            (t found)))))
+  (let ((found (find-free-fun name "shouldn't happen! (defined-fun)"))
+        (free-funs (free-funs *ir1-namespace*)))
+    (note-name-defined name :function)
+    (cond ((not (defined-fun-p found))
+           ;; This assertion is wrong in block compilation mode, for
+           ;; instance
+           ;;
+           ;; (defun foo (x) (bar x))
+           ;; (declaim (inline bar))
+           ;; (defun bar (x) x)
+           (aver (or (block-compile *compilation*)
+                     (not (info :function :inlinep name))))
+           (let* ((where-from (leaf-where-from found))
+                  (res (make-defined-fun
+                        :%source-name name
+                        :where-from (if (eq where-from :declared)
+                                        :declared
+                                        :defined-here)
+                        :type (if (eq :declared where-from)
+                                  (leaf-type found)
+                                  (or (and lp
+                                           (ignore-errors
+                                            (ftype-from-lambda-list lambda-list)))
+                                      (specifier-type 'function))))))
+             (substitute-leaf res found)
+             (setf (gethash name free-funs) res)))
+          ;; If FREE-FUNS has a previously converted definition
+          ;; for this name, then blow it away and try again.
+          ((defined-fun-functionals found)
+           (remhash name free-funs)
+           (get-defined-fun name lambda-list))
+          (t found))))
 
 ;;; Check a new global function definition for consistency with
 ;;; previous declaration or definition, and assert argument/result
@@ -1490,27 +1500,3 @@ is potentially harmful to any already-compiled callers using (SAFETY 0)."
             (specifier-type 'function))))
 
   (values))
-
-;; Similar to above, detect duplicate definitions within a file,
-;; but the package lock check is unnecessary - it's handled elsewhere.
-;;
-;; Additionally, this is a STYLE-WARNING, not a WARNING, because there is
-;; meaningful behavior that can be ascribed to some redefinitions, e.g.
-;;  (defmacro foo () first-definition)
-;;  (defun f () (use-it (foo )))
-;;  (defmacro foo () other-definition)
-;; will use the first definition when compiling F, but make the second available
-;; in the loaded fasl. In this usage it would have made sense to wrap the
-;; respective definitions with EVAL-WHEN for different situations,
-;; but as long as the compile-time behavior is deterministic, it's just bad style
-;; and not flat-out wrong, though there is indeed some waste in the fasl.
-;;
-;; KIND is the globaldb KIND of this NAME
-(defun %compiler-defmacro (kind name)
-  (let ((name-key `(,kind ,name)))
-    (when (boundp '*lexenv*)
-      (aver (producing-fasl-file))
-      ;; a slight OAOO issue here wrt %COMPILER-DEFUN
-      (if (member name-key (fun-names-in-this-file *compilation*) :test #'equal)
-          (compiler-style-warn 'same-file-redefinition-warning :name name)
-          (push name-key (fun-names-in-this-file *compilation*))))))

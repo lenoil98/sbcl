@@ -126,6 +126,10 @@ debugger.")
 (define-optimization-quality insert-array-bounds-checks
     (if (= safety 0) 0 3)
   ("no" "yes" "yes" "yes"))
+(define-optimization-quality aref-trapping
+    #-ubsan (if (= safety 3) 3 0) ; equiv. to safety unless expressed otherwise
+    #+ubsan 2 ; default to yes
+  ("no" "yes" "yes" "yes"))
 
 (define-optimization-quality store-xref-data
     (if (= space 3)

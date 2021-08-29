@@ -61,6 +61,22 @@
   (:generator 3
     (inst neg res x)))
 
+(define-modular-fun %negate-mod64 (x) %negate :untagged nil 64)
+(define-vop (%negate-mod64)
+  (:translate %negate-mod64)
+  (:policy :fast-safe)
+  (:args (x :scs (unsigned-reg) :target r))
+  (:arg-types unsigned-num)
+  (:results (r :scs (unsigned-reg)))
+  (:result-types unsigned-num)
+  (:generator 3
+    (inst neg r x)))
+
+(define-modular-fun %negate-modfx (x) %negate :tagged t #.(- n-word-bits
+                                                             n-fixnum-tag-bits))
+(define-vop (%negate-modfx fast-negate/fixnum)
+  (:translate %negate-modfx))
+
 (define-vop (fast-lognot/fixnum fixnum-unop)
   (:args (x :scs (any-reg)))
   (:arg-types tagged-num)
@@ -330,20 +346,6 @@
 
 ;;; Shifting
 
-(define-vop (fast-ash-left-c/fixnum=>fixnum)
-  (:translate ash)
-  (:policy :fast-safe)
-  (:args (number :scs (any-reg) :target result))
-  (:info amount)
-  (:arg-types tagged-num (:constant unsigned-byte))
-  (:results (result :scs (any-reg)))
-  (:result-types tagged-num)
-  (:note "inline ASH")
-  (:generator 1
-    (if (< amount 64)
-        (inst lsl result number amount)
-        (inst mov result 0))))
-
 (define-vop (fast-ash-right-c/fixnum=>fixnum)
   (:translate ash)
   (:policy :fast-safe)
@@ -440,34 +442,48 @@
   (:translate ash)
   (:variant :unsigned))
 
-(macrolet ((def (name sc-type type result-type cost)
-             `(define-vop (,name)
-                (:note "inline ASH")
-                (:translate ash)
-                (:args (number :scs (,sc-type))
-                       (amount :scs (signed-reg unsigned-reg)))
-                ;; For modular variants
-                (:variant-vars cut)
-                (:arg-types ,type positive-fixnum)
-                (:results (result :scs (,result-type)))
-                (:result-types ,type)
-                (:policy :fast-safe)
-                (:generator ,cost
-                  (cond (cut
-                         (inst cmp amount n-word-bits)
-                         (cond ((location= amount result)
-                                (inst csel tmp-tn number zr-tn :lt)
-                                (inst lsl result tmp-tn amount))
-                               (t
-                                (inst csel result number zr-tn :lt)
-                                (inst lsl result result amount))))
-                        (t
-                         (inst lsl result number amount)))))))
+(macrolet ((def (name name-c sc-type type result-type cost)
+             `(progn
+                (define-vop (,name)
+                  (:note "inline ASH")
+                  (:translate ash)
+                  (:args (number :scs (,sc-type))
+                         (amount :scs (signed-reg unsigned-reg)))
+                  ;; For modular variants
+                  (:variant-vars cut)
+                  (:arg-types ,type positive-fixnum)
+                  (:results (result :scs (,result-type)))
+                  (:result-types ,type)
+                  (:policy :fast-safe)
+                  (:generator ,cost
+                    (cond (cut
+                           (inst cmp amount n-word-bits)
+                           (cond ((location= amount result)
+                                  (inst csel tmp-tn number zr-tn :lt)
+                                  (inst lsl result tmp-tn amount))
+                                 (t
+                                  (inst csel result number zr-tn :lt)
+                                  (inst lsl result result amount))))
+                          (t
+                           (inst lsl result number amount)))))
+                (define-vop (,name-c)
+                  (:note "inline ASH")
+                  (:translate ash)
+                  (:args (number :scs (,sc-type)))
+                  (:info amount)
+                  (:arg-types ,type (:constant unsigned-byte))
+                  (:results (result :scs (,result-type)))
+                  (:result-types ,type)
+                  (:policy :fast-safe)
+                  (:generator ,(1- cost)
+                              (if (< amount 64)
+                                  (inst lsl result number amount)
+                                  (inst mov result 0)))))))
   ;; FIXME: There's the opportunity for a sneaky optimization here, I
   ;; think: a FAST-ASH-LEFT-C/FIXNUM=>SIGNED vop.  -- CSR, 2003-09-03
-  (def fast-ash-left/fixnum=>fixnum any-reg tagged-num any-reg 2)
-  (def fast-ash-left/signed=>signed signed-reg signed-num signed-reg 3)
-  (def fast-ash-left/unsigned=>unsigned unsigned-reg unsigned-num unsigned-reg 3))
+  (def fast-ash-left/fixnum=>fixnum fast-ash-left-c/fixnum=>fixnum any-reg tagged-num any-reg 2)
+  (def fast-ash-left/signed=>signed fast-ash-left-c/signed=>signed signed-reg signed-num signed-reg 3)
+  (def fast-ash-left/unsigned=>unsigned fast-ash-left-c/unsigned=>unsigned unsigned-reg unsigned-num unsigned-reg 3))
 
 (define-vop (fast-%ash/right/unsigned)
   (:translate %ash/right)
@@ -525,6 +541,10 @@
 (define-vop (fast-ash-left-mod64/unsigned=>unsigned
              fast-ash-left/unsigned=>unsigned)
   (:variant t)
+  (:translate ash-left-mod64))
+
+(define-vop (fast-ash-left-mod64-c/unsigned=>unsigned
+             fast-ash-left-c/unsigned=>unsigned)
   (:translate ash-left-mod64))
 
 (define-vop (fast-ash-left-mod64-c/unsigned=>unsigned
@@ -619,6 +639,14 @@
 (defun %%ldb (integer size posn)
   (%ldb size posn integer))
 
+(deftransform %%ldb ((integer size posn) (unsigned-byte * (constant-arg (integer #.n-word-bits))) *
+                     :important nil)
+  0)
+
+(deftransform %%ldb ((integer size posn) ((integer * -1) * (constant-arg (integer #.n-word-bits))) *
+                     :important nil)
+  1)
+
 (defun %%dpb (newbyte size posn integer)
   (%dpb newbyte size posn integer))
 
@@ -632,7 +660,15 @@
   (:result-types unsigned-num)
   (:policy :fast-safe)
   (:generator 2
-    (inst ubfm res x (1+ posn) (+ posn size))))
+    (cond ((<= (+ posn size) n-fixnum-bits)
+           (inst ubfm res x (1+ posn) (+ posn size)))
+          ((= size 1)
+           (inst lsr res x n-fixnum-bits))
+          (t
+           ;; Can't constrain two constant args to avoid this VOP and
+           ;; go to the signed variant, so do it manually.
+           (inst asr res x (1+ posn))
+           (inst and res res (ash most-positive-word (- size sb-vm:n-word-bits)))))))
 
 (define-vop (ldb-c)
   (:translate %%ldb)
@@ -644,7 +680,10 @@
   (:result-types unsigned-num)
   (:policy :fast-safe)
   (:generator 3
-    (inst ubfm res x posn (+ posn size -1))))
+    (if (and (>= (+ posn size) n-word-bits)
+             (= size 1))
+        (inst lsr res x (1- n-word-bits))
+        (inst ubfm res x posn (+ posn size -1)))))
 
 (define-vop (dpb-c/fixnum)
   (:translate %%dpb)
@@ -892,7 +931,7 @@
                                         /unsigned -c/unsigned)
                         for cost in '(4 3 6 5 6 5)
                         for arg-types in '(nil
-                                           (fixnum
+                                           (tagged-num
                                             (:constant
                                              (satisfies fixnum-encode-logical-immediate)))
                                            nil

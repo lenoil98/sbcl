@@ -50,10 +50,11 @@
 
 #+sb-assembling
 (defun return-single-word-bignum (dest alloc-tn source)
-  (instrument-alloc 16 nil)
-  (let ((header (logior (ash 1 n-widetag-bits) bignum-widetag)))
+  (let ((header (logior (ash 1 n-widetag-bits) bignum-widetag))
+        (nbytes #+bignum-assertions 32 #-bignum-assertions 16))
+    (instrument-alloc bignum-widetag nbytes nil)
     (pseudo-atomic ()
-      (allocation nil 16 0 nil nil alloc-tn)
+      (allocation bignum-widetag nbytes 0 nil nil alloc-tn)
       (storew* header alloc-tn 0 0 t)
       (storew source alloc-tn bignum-digits-offset 0)
       (if (eq dest alloc-tn)
@@ -300,30 +301,35 @@
                  (inst jmp :ge POSITIVE)
                  (inst not rdx)
                  POSITIVE))
-           (unless (memq :popcnt *backend-subfeatures*)
-             (test-cpu-feature cpu-has-popcnt)
-             (inst jmp :z slow))
+           (when (memq :popcnt *backend-subfeatures*) ; always use POPCNT
            ;; Intel's implementation of POPCNT on some models treats it as
            ;; a 2-operand ALU op in the manner of ADD,SUB,etc which means that
            ;; it falsely appears to need data from the destination register.
            ;; The workaround is to clear the destination.
            ;; See http://stackoverflow.com/questions/25078285
-           (unless (location= result arg)
+             (unless (location= result arg)
              ;; We only break the spurious dep. chain if result isn't the same
              ;; register as arg. (If they're location=, don't trash the arg!)
-             (inst xor result result))
+               (inst xor :dword result result))
+             (inst popcnt result arg)
+             (return-from ,name))
+
+           ;; Conditionally use POPCNT
+           (test-cpu-feature cpu-has-popcnt)
+           (inst jmp :z slow)
+           (unless (location= result arg)
+             (inst xor :dword result result))
            (inst popcnt result arg)
            (inst jmp done)
          slow
-           (unless (memq :popcnt *backend-subfeatures*)
-             (move rdx arg)
-             (invoke-asm-routine 'call 'logcount vop)
-             (move result rdx))
+           (move rdx arg)
+           (invoke-asm-routine 'call 'logcount vop)
+           (move result rdx)
          done))))
   (def-it unsigned-byte-64-count 14 unsigned-reg unsigned-num)
   (def-it signed-byte-64-count 15 signed-reg signed-num :signed t)
   (def-it positive-fixnum-count 12 any-reg positive-fixnum)
-  (def-it positive-fixnum-count 13 any-reg fixnum :signed t))
+  (def-it signed-fixnum-count 13 any-reg fixnum :signed t))
 
 ;;; General case of EQL
 
@@ -442,8 +448,22 @@
   (inst mov rcx (ea (- other-pointer-lowtag) rdi))
   (inst shl rcx 1)
   (inst shr rcx (1+ n-widetag-bits))
-  (inst jmp :z epilogue) ; zero payload length, can this happen?
+  #+bignum-assertions
+  (progn (inst mov temp-reg-tn rcx)
+         (inst or temp-reg-tn 1))
   compare-loop
+  #+bignum-assertions
+  (let ((ok1 (gen-label)) (ok2 (gen-label)))
+    (inst dec rcx)
+    (inst bt (ea (- n-word-bytes other-pointer-lowtag) rsi temp-reg-tn 8) rcx)
+    (inst jmp :nc ok1)
+    (inst break halt-trap)
+    (emit-label ok1)
+    (inst bt (ea (- n-word-bytes other-pointer-lowtag) rdi temp-reg-tn 8) rcx)
+    (inst jmp :nc ok2)
+    (inst break halt-trap)
+    (emit-label ok2)
+    (inst inc rcx))
   (inst mov rax (ea (- other-pointer-lowtag) rsi rcx 8))
   (inst cmp rax (ea (- other-pointer-lowtag) rdi rcx 8))
   (inst jmp :ne epilogue)
@@ -522,8 +542,6 @@
   (inst cmp rcx (ea (- other-pointer-lowtag) y))
   (inst jmp :ne done)
   (inst shr rcx n-widetag-bits)
-  ;; can you have 0 payload words? Probably not, but let's be safe here.
-  (inst jmp :z done)
   loop
   (inst mov rax (ea (- other-pointer-lowtag) x rcx 8))
   (inst cmp rax (ea (- other-pointer-lowtag) y rcx 8))

@@ -68,10 +68,8 @@
   (:temporary (:sc unsigned-reg) this-id test-id)
   (:generator 4
     (let ((label (register-inline-constant :layout-id test-layout))
-          (offset (+ (ash (+ (get-dsd-index layout sb-kernel::id-word0)
-                             instance-slots-offset)
-                          word-shift)
-                     (ash (- (layout-depthoid test-layout) 2) 2)
+          (offset (+ (id-bits-offset)
+                     (ash (- (wrapper-depthoid test-layout) 2) 2)
                      (- instance-pointer-lowtag))))
       (inst lw test-id sb-vm::code-tn label)
       (inst lw this-id x offset)
@@ -88,8 +86,8 @@
   (:generator 6
     (load-type result object (- other-pointer-lowtag))))
 
-(define-vop (fun-subtype)
-  (:translate fun-subtype)
+(define-vop ()
+  (:translate %fun-pointer-widetag)
   (:policy :fast-safe)
   (:args (function :scs (descriptor-reg)))
   (:results (result :scs (unsigned-reg)))
@@ -111,10 +109,9 @@
 (define-vop (set-header-data)
   (:translate set-header-data)
   (:policy :fast-safe)
-  (:args (x :scs (descriptor-reg) :target res)
+  (:args (x :scs (descriptor-reg))
          (data :scs (any-reg immediate zero)))
   (:arg-types * positive-fixnum)
-  (:results (res :scs (descriptor-reg)))
   (:temporary (:scs (non-descriptor-reg)) t1 t2)
   (:generator 6
     (loadw t1 x 0 other-pointer-lowtag)
@@ -131,8 +128,7 @@
                 (inst li t2 val)
                 (inst or t1 t2)))))
       (zero))
-    (storew t1 x 0 other-pointer-lowtag)
-    (move res x)))
+    (storew t1 x 0 other-pointer-lowtag)))
 
 (define-vop (pointer-hash)
   (:translate pointer-hash)

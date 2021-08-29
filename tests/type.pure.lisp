@@ -19,12 +19,10 @@
   (loop for wrapper being each hash-value
         of (sb-kernel:classoid-subclasses (sb-kernel:find-classoid 't))
         do (flet ((check-bit (bit ancestor-type)
-                    (let* ((layout #+metaspace (sb-kernel::wrapper-friend wrapper)
-                                   #-metaspace wrapper)
-                           (ancestor (sb-kernel:find-layout ancestor-type)))
-                      (when (or (eq layout ancestor)
-                                (find ancestor (sb-kernel:layout-inherits layout)))
-                        (assert (logtest bit (sb-kernel:layout-flags layout)))))))
+                    (let ((ancestor (sb-kernel:find-layout ancestor-type)))
+                      (when (or (eq wrapper ancestor)
+                                (find ancestor (sb-kernel:wrapper-inherits wrapper)))
+                        (assert (logtest bit (sb-kernel:wrapper-flags wrapper)))))))
               (check-bit sb-kernel:+stream-layout-flag+ 'stream)
               (check-bit sb-kernel:+string-stream-layout-flag+ 'string-stream)
               (check-bit sb-kernel:+file-stream-layout-flag+ 'file-stream))))
@@ -553,7 +551,9 @@
 
 ;; lp#1333731
 (with-test (:name (adjust-array :changes type-of))
-  (let ((a (make-array 10 :adjustable t)))
+  ;; I think adjusting an array to enlarge it must read all the old data,
+  ;; which would be undefined behavior if you hadn't initialized the array.
+  (let ((a (make-array 10 :adjustable t :initial-element 0)))
     (assert (equal (type-of a) '(vector t 10)))
     (adjust-array a 20)
     (assert (equal (type-of a) '(vector t 20)))))
@@ -676,6 +676,17 @@
   (assert (eq (make-numeric-type :class 'integer :low '(4) :high '(5))
               *empty-type*)))
 
+(with-test (:name :prettier-union-types :skipped-on (not :sb-unicode))
+  ;; (OR STRING BIGNUM) used to unparse as
+  ;; (OR (VECTOR CHARACTER) BASE-STRING (INTEGER * -4611686018427387905)
+  ;;     (INTEGER 4611686018427387904)) etc
+  (dolist (other '(float real bignum))
+    (let* ((spec `(or string ,other))
+           (parse (sb-kernel:specifier-type spec))
+           (unparse (sb-kernel:type-specifier parse)))
+      (assert (or (equal unparse `(or string ,other))
+                  (equal unparse `(or ,other string)))))))
+
 (with-test (:name :unparse-string)
   (assert (equal (type-specifier (specifier-type '(string 10)))
                  '(#+sb-unicode string #-sb-unicode base-string 10)))
@@ -720,6 +731,8 @@
                                           ,(sb-kernel:find-layout what))))))
 
 (with-test (:name :type-of-empty-instance)
+  (assert (eq (type-of (eval '(sb-kernel:%make-funcallable-instance 6)))
+              'sb-kernel:funcallable-instance))
   (assert (eq (type-of (eval '(sb-kernel:%make-instance 12)))
               'sb-kernel:instance)))
 

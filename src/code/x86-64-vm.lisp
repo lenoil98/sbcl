@@ -116,6 +116,18 @@
            (sb-kernel::decode-internal-error-args (sap+ pc 1) trap-number)))))
 
 
+#+immobile-space
+(defun alloc-immobile-fdefn ()
+  (or #+nil ; Avoid creating new objects in the text segment for now
+      (and (= (alien-funcall (extern-alien "lisp_code_in_elf" (function int))) 1)
+           (alloc-immobile-code (* fdefn-size n-word-bytes)
+                                  (logior (ash undefined-fdefn-header 16)
+                                          fdefn-widetag) ; word 0
+                                  0 other-pointer-lowtag nil)) ; word 1, lowtag, errorp
+      (alloc-immobile-fixedobj fdefn-size
+                               (logior (ash undefined-fdefn-header 16)
+                                       fdefn-widetag)))) ; word 0
+
 #+immobile-code
 (progn
 (defconstant trampoline-entry-offset n-word-bytes)
@@ -137,7 +149,7 @@
       ;; in arch_write_linkage_table_entry() and arch_do_displaced_inst().
       (setf (sap-ref-32 sap 0) #x058B48 ; REX MOV [RIP-n]
             (signed-sap-ref-32 sap 3) (- ea (+ (sap-int sap) 7))) ; disp
-      (let ((i (if (/= (fun-subtype fun) funcallable-instance-widetag)
+      (let ((i (if (/= (%fun-pointer-widetag fun) funcallable-instance-widetag)
                    7
                    (let ((disp8 (- (ash funcallable-instance-function-slot
                                         word-shift)
@@ -157,12 +169,11 @@
 ;;; Return T if FUN can't be called without loading RAX with its descriptor.
 ;;; This is true of any funcallable instance which is not a GF, and closures.
 (defun fun-requires-simplifying-trampoline-p (fun)
-  (let ((kind (fun-subtype fun)))
-    (or (and (eql kind sb-vm:funcallable-instance-widetag)
-             ;; if the FIN has no raw words then it has no internal trampoline
-             (eql (layout-bitmap (%fun-layout fun))
-                  +layout-all-tagged+))
-        (eql kind sb-vm:closure-widetag))))
+  (case (%fun-pointer-widetag fun)
+    (#.sb-vm:closure-widetag t)
+    (#.sb-vm:funcallable-instance-widetag
+     ;; if the FIN has no raw words then it has no internal trampoline
+     (sb-kernel::bitmap-all-taggedp (%fun-layout fun)))))
 
 ;; TODO: put a trampoline in all fins and allocate them anywhere.
 ;; Revision e7cd2bd40f5b9988 caused some FINs to go in dynamic space
@@ -196,9 +207,9 @@
                                       (logior (ash 5 n-widetag-bits)
                                               funcallable-instance-widetag)))))
     ;; Assert that raw bytes will not cause GC invariant lossage
-    (aver (/= (layout-bitmap layout) +layout-all-tagged+))
+    (aver (not (sb-kernel::bitmap-all-taggedp layout)))
     ;; Set layout prior to writing raw slots
-    (setf (%fun-layout gf) layout)
+    (setf (%fun-wrapper gf) layout)
     ;; just being pedantic - liveness is preserved by the stack reference.
     (with-pinned-objects (gf)
       (let* ((addr (logandc2 (get-lisp-obj-address gf) lowtag-mask))
@@ -210,18 +221,6 @@
               (sap-ref-32 sap (+ insts-offs 7)) #x00FD60FF))) ; JMP [RAX-3]
     (%set-funcallable-instance-info gf 0 slot-vector)
     gf))
-
-#+immobile-space
-(defun alloc-immobile-fdefn ()
-  (or #+nil ; Avoid creating new objects in the text segment for now
-      (and (= (alien-funcall (extern-alien "lisp_code_in_elf" (function int))) 1)
-           (alloc-immobile-code (* fdefn-size n-word-bytes)
-                                  (logior (ash undefined-fdefn-header 16)
-                                          fdefn-widetag) ; word 0
-                                  0 other-pointer-lowtag nil)) ; word 1, lowtag, errorp
-      (alloc-immobile-fixedobj fdefn-size
-                               (logior (ash undefined-fdefn-header 16)
-                                       fdefn-widetag)))) ; word 0
 
 (defun fdefn-has-static-callers (fdefn)
   (declare (type fdefn fdefn))
@@ -322,7 +321,7 @@
   #+immobile-code
   (let* ((fdefns-start (+ code-constants-offset
                           (* code-slots-per-simple-fun (code-n-entries code))))
-         (fdefns-count (code-n-named-calls code))
+         (fdefns-count (the index (code-n-named-calls code)))
          (replacements (make-array fdefns-count :initial-element nil))
          (ambiguous (make-array fdefns-count :initial-element 0 :element-type 'bit))
          (any-replacements)

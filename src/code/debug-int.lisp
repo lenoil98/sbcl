@@ -12,6 +12,15 @@
 
 (in-package "SB-DI")
 
+(defstruct (sb-c::core-debug-source (:pure t)
+                                    (:copier nil)
+                                    (:include debug-source))
+  ;; Compilation to memory stores each toplevel form given to %COMPILE.
+  ;; That form can generate multiple functions, and those functions can
+  ;; be in one or more code components. They all point at the same form.
+  form
+  (function nil :read-only t))
+
 ;;; FIXME: There are an awful lot of package prefixes in this code.
 ;;; Couldn't we have SB-DI use the SB-C and SB-VM packages?
 
@@ -612,13 +621,14 @@
 ;;; to malloc() in that regard.
 
 (defun code-header-from-pc (pc)
-  (declare (system-area-pointer pc))
   (with-code-pages-pinned (:dynamic)
     (let ((base-ptr
            (sb-alien:alien-funcall
             (sb-alien:extern-alien "component_ptr_from_pc"
                                    (function sb-alien:unsigned system-area-pointer))
-            pc)))
+            (etypecase pc
+              (system-area-pointer pc)
+              (sb-vm:word (int-sap pc))))))
       (unless (= base-ptr 0)
         (%make-lisp-obj (logior base-ptr sb-vm:other-pointer-lowtag))))))
 
@@ -847,7 +857,7 @@
 ;;; Note: Sometimes LRA is actually a fixnum. This happens when lisp
 ;;; calls into C. In this case, the code object is stored on the stack
 ;;; after the LRA, and the LRA is the word offset.
-#-(or x86 x86-64)
+#-(or x86 x86-64 arm64)
 (defun compute-calling-frame (caller lra up-frame &optional savedp)
   (declare (type system-area-pointer caller)
            (ignore savedp))
@@ -899,7 +909,42 @@
                                                         escaped)
                                  (if up-frame (1+ (frame-number up-frame)) 0)
                                  escaped))))))
-
+#+arm64
+(defun compute-calling-frame (caller lra up-frame &optional savedp)
+  (declare (type system-area-pointer caller)
+           (ignore savedp))
+  (when (control-stack-pointer-valid-p caller)
+    (multiple-value-bind (code pc-offset escaped)
+        (if lra
+            (let* ((lr (int-sap (ash lra n-fixnum-tag-bits)))
+                   (code (code-header-from-pc lr)))
+              (values code
+                      (if code
+                          (sap- lr (code-instructions code))
+                          0)))
+            (find-escaped-frame caller))
+      (if (and (code-component-p code)
+               (eq (%code-debug-info code) :bpt-lra))
+          (let ((real-lra (code-header-ref code real-lra-slot)))
+            (compute-calling-frame caller real-lra up-frame))
+          (let ((d-fun (case code
+                         (:undefined-function
+                          (make-bogus-debug-fun
+                           "undefined function"))
+                         (:foreign-function
+                          (make-bogus-debug-fun
+                           (foreign-function-backtrace-name
+                            (int-sap (get-lisp-obj-address lra)))))
+                         ((nil)
+                          (make-bogus-debug-fun
+                           "bogus stack frame"))
+                         (t
+                          (debug-fun-from-pc code pc-offset)))))
+            (make-compiled-frame caller up-frame d-fun
+                                 (code-location-from-pc d-fun pc-offset
+                                                        escaped)
+                                 (if up-frame (1+ (frame-number up-frame)) 0)
+                                 escaped))))))
 #+(or x86 x86-64)
 (defun compute-calling-frame (caller ra up-frame &optional savedp)
   (declare (type system-area-pointer caller ra))
@@ -1105,12 +1150,12 @@ register."
 ;;; Find the code object corresponding to the object represented by
 ;;; bits and return it. We assume bogus functions correspond to the
 ;;; undefined-function.
-#+(or x86 x86-64)
+#+(or x86 x86-64 arm64)
 (defun code-object-from-context (context)
   (declare (type (sb-alien:alien (* os-context-t)) context))
   (code-header-from-pc (context-pc context)))
 
-#-(or x86 x86-64)
+#-(or x86 x86-64 arm64)
 (defun code-object-from-context (context)
   (declare (type (sb-alien:alien (* os-context-t)) context))
   ;; The GC constraint on the program counter on precisely-scavenged
@@ -1253,7 +1298,7 @@ register."
         (fp (frame-pointer frame)))
     (labels ((catch-ref (slot)
                (sap-ref-lispobj catch (* slot n-word-bytes)))
-             #-(or x86 x86-64)
+             #-(or x86 x86-64 arm64)
              (catch-entry-offset ()
                (let* ((lra (catch-ref catch-block-entry-pc-slot))
                       (component (catch-ref catch-block-code-slot))
@@ -1263,7 +1308,7 @@ register."
                  (* (- (1+ (get-header-data lra))
                        (code-header-words component))
                     n-word-bytes)))
-             #+(or x86 x86-64)
+             #+(or x86 x86-64 arm64)
              (catch-entry-offset ()
                (let* ((ra (sap-ref-sap
                            catch (* catch-block-entry-pc-slot
@@ -2471,7 +2516,7 @@ register."
 ;;; COMPILED-DEBUG-VAR case, access the current value to determine if
 ;;; it is an indirect value cell. This occurs when the variable is
 ;;; both closed over and set.
-(defun %set-debug-var-value (debug-var frame new-value)
+(defun (setf debug-var-value) (new-value debug-var frame)
   (aver (typep frame 'compiled-frame))
   (let ((old-value (access-compiled-debug-var-slot debug-var frame)))
     (if (indirect-value-cell-p old-value)
@@ -2642,7 +2687,8 @@ register."
                #-(or x86 x86-64)
                (the long-float (realpart value)))))
       (#.sb-vm:control-stack-sc-number
-       (setf (stack-ref fp (sb-c:sc+offset-offset sc+offset)) value))
+       (%set-stack-ref fp (sb-c:sc+offset-offset sc+offset) value)
+       value) ; I doubt that the return value matters, but who knows ...
       (#.sb-vm:character-stack-sc-number
        (with-nfp (nfp)
          (setf (sap-ref-word nfp (number-stack-offset 0))
@@ -3244,11 +3290,12 @@ register."
 ;;; is SETF'able.
 (defun breakpoint-info (breakpoint)
   (breakpoint-%info breakpoint))
-(defun %set-breakpoint-info (breakpoint value)
+(defun (setf breakpoint-info) (value breakpoint)
   (setf (breakpoint-%info breakpoint) value)
   (let ((other (breakpoint-unknown-return-partner breakpoint)))
     (when other
-      (setf (breakpoint-%info other) value))))
+      (setf (breakpoint-%info other) value)))
+  value)
 
 ;;;; BREAKPOINT-ACTIVE-P and DELETE-BREAKPOINT
 
@@ -3484,7 +3531,10 @@ register."
 ;;; state of the program, not merely a return PC location.
 ;;; (I tried changing this to DEFUN-CACHED, which failed a regression test)
 (defun make-bpt-lra (real-lra)
-  (declare (type #-(or x86 x86-64) lra #+(or x86 x86-64) system-area-pointer real-lra))
+  (declare (type #-(or x86 x86-64 arm64) lra #+(or x86 x86-64 arm64) system-area-pointer real-lra))
+  real-lra
+  #+arm64 (error "Breakpoints do not work on ARM64")
+  #-arm64
   (macrolet ((symbol-addr (name)
                `(find-dynamic-foreign-symbol-address ,name))
              (trap-offset ()
@@ -3495,25 +3545,25 @@ register."
            (length (the index (- (symbol-addr "fun_end_breakpoint_end")
                                  src-start)))
            (code-object
-            (sb-c:allocate-code-object
-             nil 0
-             ;; For non-x86: a single boxed constant holds the true LRA.
-             ;; For x86[-64]: one boxed constant holds the code object to which
-             ;; to return, and one holds the displacement into that object.
-             ;; Ensure required boxed header alignment.
-             (align-up (+ sb-vm:code-constants-offset 1 #+(or x86-64 x86) 1)
-                       sb-c::code-boxed-words-align)
-             (+ length
-                sb-vm:n-word-bytes ; Jump Table prefix word
-                ;; Alignment padding, LRA header
-                #-(or x86 x86-64) (* 2 sb-vm:n-word-bytes)
-                ;; 2 extra raw bytes represent CODE-N-ENTRIES (which is zero)
-                2))))
+             (sb-c:allocate-code-object
+              nil 0
+              ;; For non-x86: a single boxed constant holds the true LRA.
+              ;; For x86[-64]: one boxed constant holds the code object to which
+              ;; to return, and one holds the displacement into that object.
+              ;; Ensure required boxed header alignment.
+              (align-up (+ sb-vm:code-constants-offset 1 #+(or x86-64 x86) 1)
+                        sb-c::code-boxed-words-align)
+              (+ length
+                 sb-vm:n-word-bytes   ; Jump Table prefix word
+                 ;; Alignment padding, LRA header
+                 #-(or x86 x86-64) (* 2 sb-vm:n-word-bytes)
+                 ;; 2 extra raw bytes represent CODE-N-ENTRIES (which is zero)
+                 2))))
       (setf (%code-debug-info code-object) :bpt-lra)
       (with-pinned-objects (code-object)
-        #+(or x86 x86-64)
-        (let ((instructions ; Don't touch the jump table prefix word
-               (sap+ (code-instructions code-object) sb-vm:n-word-bytes)))
+        #+(or x86 x86-64 arm64)
+        (let ((instructions   ; Don't touch the jump table prefix word
+                (sap+ (code-instructions code-object) sb-vm:n-word-bytes)))
           (multiple-value-bind (offset code) (compute-lra-data-from-pc real-lra)
             (setf (code-header-ref code-object real-lra-slot) code
                   (code-header-ref code-object (1+ real-lra-slot)) offset)
@@ -3524,10 +3574,10 @@ register."
             ;; TRAP-OFFSET is the distance from CODE-INSTRUCTIONS to the trapping
             ;; opcode, for which we have to account for the jump table prefix word.
             (values instructions code-object (+ (trap-offset) sb-vm:n-word-bytes))))
-        #-(or x86 x86-64)
+        #-(or x86 x86-64 arm64)
         (let* ((lra-header-addr
-                ;; Skip over the jump table prefix, and align properly for LRA header
-                (sap+ (code-instructions code-object) (* 2 sb-vm:n-word-bytes)))
+                 ;; Skip over the jump table prefix, and align properly for LRA header
+                 (sap+ (code-instructions code-object) (* 2 sb-vm:n-word-bytes)))
                ;; Compute the LRA->code backpointer in words
                (delta (ash (sap- lra-header-addr
                                  (int-sap (logandc2 (get-lisp-obj-address code-object)

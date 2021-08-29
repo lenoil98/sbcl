@@ -28,6 +28,8 @@ struct thread_state_word {
 #endif
 };
 
+typedef lispobj size_histogram[N_WORD_BITS];
+
 #include "genesis/thread.h"
 #include "genesis/thread-instance.h"
 #include "genesis/fdefn.h"
@@ -62,6 +64,13 @@ struct extra_thread_data
 {
     // Lisp needs to be able to access this array. KEEP IT AS THE FIRST FIELD!
     os_context_t* sigcontexts[MAX_INTERRUPTS];
+#ifdef LISP_FEATURE_GC_METRICS
+    long on_cpu_time;
+    long avg_gc_wait;
+    long worst_gc_wait;
+    long n_gc_wait;
+    long sum_gc_wait;
+#endif
 
     // Data from here down are never looked at from Lisp.
     struct interrupt_data interrupt_data;

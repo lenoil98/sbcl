@@ -293,8 +293,10 @@
                                 #-sb-xc-host
                                 (declare (muffle-conditions array-initial-element-mismatch))
                               (make-sequence result-type
-                                             (min ,@(loop for arg in seq-args
-                                                          collect `(length ,arg)))))
+                                             ,(if (cdr seq-args)
+                                                  `(min ,@(loop for arg in seq-args
+                                                                collect `(length ,arg)))
+                                                  `(length ,(car seq-args)))))
                             fun ,@seq-args))))
             (t
              (let* ((all-seqs (cons seq seqs))
@@ -764,10 +766,20 @@
                  '(char-code item)
                  'item)))))))
 
+(deftransform quickfill ((seq item) (vector t) * :node node)
+  ;; The QUICKFILL function has no START,END lexical vars, but if
+  ;; the transform hits the bashable non-simple or non-bashable case,
+  ;; it will invoke WITH-ARRAY-DATA using these variables.
+  `(let ((start 0) (end nil))
+     (declare (ignorable start end))
+     ,(fill-transform 'quickfill node seq item nil nil)))
 (deftransform fill ((seq item &key (start 0) (end nil))
                     (vector t &key (:start t) (:end t))
                     *
                     :node node)
+  (fill-transform 'fill node seq item start end))
+(defun fill-transform (fun-name node seq item start end)
+  (declare (ignorable end))
   (let* ((type (lvar-type seq))
          (element-ctype (array-type-upgraded-element-type type))
          (element-type (type-specifier element-ctype))
@@ -779,20 +791,32 @@
           #+x86-64
           ((and (type= element-ctype *universal-type*)
                 (csubtypep (lvar-type seq) (specifier-type '(simple-array * (*))))
+                ;; FIXME: why can't this work with arbitrary START and END?
+                ;; VECTOR-FILL/T certainly seems to take them.
                 (or (not start)
                     (and (constant-lvar-p start)
                          (eql (lvar-value start) 0)))
-                (not end))
-           '(vector-fill/t seq item 0 (length seq)))
+                (or (not end)
+                    ;; QUICKFILL always fills the whole vector, but I anticipate
+                    ;; supplying END to avoid a call to VECTOR-LENGTH
+                    (eq fun-name 'quickfill)))
+           ;; VECTOR-LENGTH entails one fewer transform than LENGTH
+           ;; and it too can derive a constant length if known.
+           '(vector-fill/t seq item 0 (vector-length seq)))
           ((and saetp (sb-vm:valid-bit-bash-saetp-p saetp))
            (multiple-value-bind (basher bash-value) (find-basher saetp item node)
              (values
               ;; KLUDGE: WITH-ARRAY data in its full glory is going to mess up
               ;; dynamic-extent for MAKE-ARRAY :INITIAL-ELEMENT initialization.
-              (if (csubtypep (lvar-type seq) (specifier-type '(simple-array * (*))))
+              (cond
+                ((eq fun-name 'quickfill)
+                 ;; array is simple, and out-of-bounds can't happen
+                 `(,basher ,bash-value seq 0 (vector-length seq)))
+                ;; FIXME: isn't this (NOT (CONSERVATIVE-ARRAY-TYPE-COMPLEXP (lvar-type seq))) ?
+                ((csubtypep (lvar-type seq) (specifier-type '(simple-array * (*))))
                   `(block nil
                      (tagbody
-                        (let* ((len (length seq))
+                        (let* ((len (vector-length seq))
                                (end (cond (end
                                            (when (> end len)
                                              (go bad-index))
@@ -808,7 +832,8 @@
                                                      start))
                                            (- end start))))
                       bad-index
-                        (sequence-bounding-indices-bad-error seq start end)))
+                        (sequence-bounding-indices-bad-error seq start end))))
+                (t
                   `(with-array-data ((data seq)
                                      (start start)
                                      (end end)
@@ -817,8 +842,9 @@
                      (declare (type index start end))
                      (declare (optimize (safety 0) (speed 3)))
                      (,basher ,bash-value data start (- end start))
-                     seq))
+                     seq)))
               `((declare (type ,element-type item))))))
+          ;; OK, it's not a "bashable" array type.
           ((policy node (> speed space))
            (values
             `(with-array-data ((data seq)
@@ -995,67 +1021,85 @@
 ;;; you tweak it, make sure that you compare the disassembly, if not the
 ;;; performance of, the functions implementing string streams
 ;;; (e.g. SB-IMPL::BASE-STRING-SOUT).
-(eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
-  (defun !make-replace-transform (saetp sequence-type1 sequence-type2)
-    `(deftransform replace ((seq1 seq2 &key (start1 0) (start2 0) end1 end2)
-                            (,sequence-type1 ,sequence-type2 &rest t)
-                            ,sequence-type1
-                            :node node)
-       `(let* ((len1 (length seq1))
-               (len2 (length seq2))
-               (end1 (or end1 len1))
-               (end2 (or end2 len2))
-               (replace-len (min (- end1 start1) (- end2 start2))))
-          ,(unless (policy node (= insert-array-bounds-checks 0))
-             `(progn
-                (unless (<= 0 start1 end1 len1)
-                  (sequence-bounding-indices-bad-error seq1 start1 end1))
-                (unless (<= 0 start2 end2 len2)
-                  (sequence-bounding-indices-bad-error seq2 start2 end2))))
-          ,',(cond
-               ((and saetp (sb-vm:valid-bit-bash-saetp-p saetp))
-                (let* ((n-element-bits (sb-vm:saetp-n-bits saetp))
-                       (bash-function (intern (format nil "UB~D-BASH-COPY"
-                                                      n-element-bits)
-                                              (find-package "SB-KERNEL"))))
-                  `(funcall (function ,bash-function) seq2 start2
-                    seq1 start1 replace-len)))
-               (t
-                `(if (and
-                      ;; If the sequence types are different, SEQ1 and
-                      ;; SEQ2 must be distinct arrays.
-                      ,(eql sequence-type1 sequence-type2)
-                      (eq seq1 seq2) (> start1 start2))
-                     (do ((i (truly-the (or (eql -1) index) (+ start1 replace-len -1))
-                             (1- i))
-                          (j (truly-the (or (eql -1) index) (+ start2 replace-len -1))
-                             (1- j)))
-                         ((< i start1))
-                       (declare (optimize (insert-array-bounds-checks 0)))
-                       (setf (aref seq1 i) (aref seq2 j)))
-                     (do ((i start1 (1+ i))
-                          (j start2 (1+ j))
-                          (end (+ start1 replace-len)))
-                         ((>= i end))
-                       (declare (optimize (insert-array-bounds-checks 0)))
-                       (setf (aref seq1 i) (aref seq2 j))))))
-          seq1))))
+(defun transform-replace-bashable (bash-function node)
+  ;; This is a little circuitous - we transform REPLACE into BASH-COPY
+  ;; and then possibly transform BASH-COPY into an unrolled loop.
+  ;; There ought to be a way to see if the BASH-COPY transform applies.
+  `(let* ((len1 (length seq1))
+          (len2 (length seq2))
+          (end1 (or end1 len1))
+          (end2 (or end2 len2))
+          (replace-len (min (- end1 start1) (- end2 start2))))
+     ,@(when (policy node (/= insert-array-bounds-checks 0))
+         '((unless (<= 0 start1 end1 len1)
+             (sequence-bounding-indices-bad-error seq1 start1 end1))
+           (unless (<= 0 start2 end2 len2)
+             (sequence-bounding-indices-bad-error seq2 start2 end2))))
+     (,bash-function seq2 start2 seq1 start1 replace-len)
+     seq1))
+(defun transform-replace (same-types-p node)
+  `(let* ((len1 (length seq1))
+          (len2 (length seq2))
+          (end1 (or end1 len1))
+          (end2 (or end2 len2))
+          (replace-len (min (- end1 start1) (- end2 start2))))
+     ,@(when (policy node (/= insert-array-bounds-checks 0))
+         '((unless (<= 0 start1 end1 len1)
+             (sequence-bounding-indices-bad-error seq1 start1 end1))
+           (unless (<= 0 start2 end2 len2)
+             (sequence-bounding-indices-bad-error seq2 start2 end2))))
+     ,(flet ((down ()
+               '(do ((i (truly-the (or (eql -1) index) (+ start1 replace-len -1)) (1- i))
+                     (j (truly-the (or (eql -1) index) (+ start2 replace-len -1)) (1- j)))
+                 ((< i start1))
+                 (setf (aref seq1 i) (data-vector-ref seq2 j))))
+             (up ()
+               '(do ((i start1 (1+ i))
+                     (j start2 (1+ j))
+                     (end (+ start1 replace-len)))
+                 ((>= i end))
+                 (setf (aref seq1 i) (data-vector-ref seq2 j)))))
+        ;; "If sequence-1 and sequence-2 are the same object and the region being modified
+        ;;  overlaps the region being copied from, then it is as if the entire source region
+        ;;  were copied to another place and only then copied back into the target region.
+        ;;  However, if sequence-1 and sequence-2 are not the same, but the region being modified
+        ;;  overlaps the region being copied from (perhaps because of shared list structure or
+        ;;  displaced arrays), then after the replace operation the subsequence of sequence-1
+        ;;  being modified will have unpredictable contents."
+        (if same-types-p ; source and destination sequences could be EQ
+            `(if (and (eq seq1 seq2) (> start1 start2)) ,(down) ,(up))
+            (up)))
+     seq1))
 
-(macrolet
-    ((define-replace-transforms ()
-       (loop for saetp across sb-vm:*specialized-array-element-type-properties*
-             for sequence-type = `(simple-array ,(sb-vm:saetp-specifier saetp) (*))
-             unless (= (sb-vm:saetp-typecode saetp) sb-vm:simple-array-nil-widetag)
-             collect (!make-replace-transform saetp sequence-type sequence-type)
-             into forms
-             finally (return `(progn ,@forms))))
-     (define-one-transform (sequence-type1 sequence-type2)
-       (!make-replace-transform nil sequence-type1 sequence-type2)))
-  (define-replace-transforms)
-  #+sb-unicode
-  (progn
-   (define-one-transform (simple-array base-char (*)) (simple-array character (*)))
-   (define-one-transform (simple-array character (*)) (simple-array base-char (*)))))
+(deftransform replace ((seq1 seq2 &key (start1 0) (start2 0) end1 end2)
+                       ((simple-array * (*)) (simple-array * (*)) &rest t) (simple-array * (*))
+                       :node node)
+  (let ((et (and (array-type-p (lvar-type seq1))
+                 (array-type-p (lvar-type seq2))
+                 (array-type-specialized-element-type (lvar-type seq1)))))
+    (if (and et
+             (neq et *empty-type*)
+             (neq et *wild-type*)
+             (eq (array-type-specialized-element-type (lvar-type seq2)) et))
+        (let ((saetp (find-saetp-by-ctype et)))
+          (if (sb-vm:valid-bit-bash-saetp-p saetp)
+              (transform-replace-bashable
+               (intern (format nil "UB~D-BASH-COPY" (sb-vm:saetp-n-bits saetp))
+                       #.(find-package "SB-KERNEL"))
+               node)
+              (transform-replace t node)))
+        (give-up-ir1-transform))))
+#+sb-unicode
+(progn
+(deftransform replace ((seq1 seq2 &key (start1 0) (start2 0) end1 end2)
+                       (simple-base-string simple-character-string &rest t) simple-base-string
+                       :node node)
+  (transform-replace nil node))
+(deftransform replace ((seq1 seq2 &key (start1 0) (start2 0) end1 end2)
+                       (simple-character-string simple-base-string &rest t) simple-character-string
+                       :node node)
+  (transform-replace nil node)))
+
 
 ;;; Expand simple cases of UB<SIZE>-BASH-COPY inline.  "simple" is
 ;;; defined as those cases where we are doing word-aligned copies from
@@ -1067,15 +1111,13 @@
 ;;; restrictive, but they do catch common cases, like allocating a (* 2
 ;;; N)-size buffer and blitting in the old N-size buffer in.
 
-(defun frob-bash-transform (src src-offset
-                            dst dst-offset
-                            length n-elems-per-word)
+(deftransform transform-bash-copy ((src src-offset dst dst-offset length)
+                                   * *
+                                   :defun-only t :info  n-bits-per-elem)
   (declare (ignore src dst length))
-  (let ((n-bits-per-elem (truncate sb-vm:n-word-bits n-elems-per-word)))
-    (multiple-value-bind (src-word src-elt)
-        (truncate (lvar-value src-offset) n-elems-per-word)
-      (multiple-value-bind (dst-word dst-elt)
-          (truncate (lvar-value dst-offset) n-elems-per-word)
+  (binding* ((n-elems-per-word (truncate sb-vm:n-word-bits n-bits-per-elem))
+             ((src-word src-elt) (truncate (lvar-value src-offset) n-elems-per-word))
+             ((dst-word dst-elt) (truncate (lvar-value dst-offset) n-elems-per-word)))
         ;; Avoid non-word aligned copies.
         (unless (and (zerop src-elt) (zerop dst-elt))
           (give-up-ir1-transform))
@@ -1083,56 +1125,36 @@
         ;; determining the direction of copying.
         (unless (= src-word dst-word)
           (give-up-ir1-transform))
-        `(let ((end (+ ,src-word (truncate (the index length) ,n-elems-per-word))))
+        `(let ((end (+ ,src-word (truncate (the index length) ,n-elems-per-word)))
+               (extra (mod length ,n-elems-per-word)))
            (declare (type index end))
            ;; Handle any bits at the end.
-           (when (logtest length (1- ,n-elems-per-word))
-             (let* ((extra (mod length ,n-elems-per-word))
-                    ;; FIXME: The shift amount on this ASH is
-                    ;; *always* negative, but the backend doesn't
-                    ;; have a NEGATIVE-FIXNUM primitive type, so we
-                    ;; wind up with a pile of code that tests the
-                    ;; sign of the shift count prior to shifting when
-                    ;; all we need is a simple negate and shift
-                    ;; right.  Yuck.
-                    (mask (ash most-positive-word
-                               (* (- extra ,n-elems-per-word)
-                                  ,n-bits-per-elem))))
-               (setf (%vector-raw-bits dst end)
-                     (logior
-                      (logandc2 (%vector-raw-bits dst end)
-                                (ash mask
-                                     ,(ecase *backend-byte-order*
-                                        (:little-endian 0)
-                                        (:big-endian `(* (- ,n-elems-per-word extra)
-                                                         ,n-bits-per-elem)))))
-                      (logand (%vector-raw-bits src end)
-                              (ash mask
-                                   ,(ecase *backend-byte-order*
-                                      (:little-endian 0)
-                                      (:big-endian `(* (- ,n-elems-per-word extra)
-                                                       ,n-bits-per-elem)))))))))
+           (unless (zerop extra)
+             ;; MASK selects just the bits that we want from the ending word of
+             ;; the source array. The number of bits to shift out is
+             ;;   (- n-word-bits (* extra n-bits-per-elem))
+             ;; which is equal mod n-word-bits to the expression below.
+             (let ((mask (shift-towards-start
+                          most-positive-word (* extra ,(- n-bits-per-elem)))))
+               (%set-vector-raw-bits
+                dst end (logior (logand (%vector-raw-bits src end) mask)
+                                (logandc2 (%vector-raw-bits dst end) mask)))))
            ;; Copy from the end to save a register.
-           (do ((i end (1- i)))
-               ((<= i ,src-word))
-             (setf (%vector-raw-bits dst (1- i))
-                   (%vector-raw-bits src (1- i))))
-           (values))))))
+           (do ((i (1- end) (1- i)))
+               ((< i ,src-word))
+             (%set-vector-raw-bits dst i (%vector-raw-bits src i)))
+           (values))))
 
-#.
-(let ((arglist '((src src-offset dst dst-offset length)
-                 ((simple-unboxed-array (*)) (constant-arg index)
-                  (simple-unboxed-array (*)) (constant-arg index)
-                  index)
-                 *)))
-  (loop for i = 1 then (* i 2)
-     for name = (intern (format nil "UB~D-BASH-COPY" i) "SB-KERNEL")
-     collect `(deftransform ,name ,arglist
-                (frob-bash-transform src src-offset
-                                     dst dst-offset length
-                                     ,(truncate sb-vm:n-word-bits i))) into forms
-     until (= i sb-vm:n-word-bits)
-     finally (return `(progn ,@forms))))
+;;; Detect misuse with sb-devel. "Misuse" means mismatched array element types
+#-sb-devel
+(loop for i = 1 then (* i 2)
+      do (%deftransform (intern (format nil "UB~D-BASH-COPY" i) "SB-KERNEL")
+                        nil
+                        '(function ((simple-unboxed-array (*)) (constant-arg index)
+                                    (simple-unboxed-array (*)) (constant-arg index)
+                                    index) *)
+                        (cons #'transform-bash-copy i))
+      until (= i sb-vm:n-word-bits))
 
 ;;; We expand copy loops inline in SUBSEQ and COPY-SEQ if we're copying
 ;;; arrays with elements of size >= the word size.  We do this because
@@ -1285,10 +1307,9 @@
        (let ((element-type (type-specifier (array-type-specialized-element-type type))))
          `(let* ((length (length seq))
                  (end (or end length)))
-            ,(unless (policy node (zerop insert-array-bounds-checks))
-                     '(progn
-                       (unless (<= 0 start end length)
-                         (sequence-bounding-indices-bad-error seq start end))))
+            ,@(when (policy node (/= insert-array-bounds-checks 0))
+                '((unless (<= 0 start end length)
+                    (sequence-bounding-indices-bad-error seq start end))))
             (let* ((size (- end start))
                    (result (make-array size :element-type ',element-type)))
               ,(maybe-expand-copy-loop-inline 'seq (if (constant-lvar-p start)

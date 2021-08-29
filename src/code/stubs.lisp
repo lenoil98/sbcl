@@ -13,6 +13,37 @@
 
 (in-package "SB-IMPL")
 
+(defun (cas symbol-value) (old new symbol)
+  (cas (symbol-value symbol) old new))
+(defun (cas svref) (old new vector index)
+  (cas (svref vector index) old new))
+#+(or ppc64 x86-64)
+(macrolet ((def (name)
+             `(defun (cas ,name) (old new sap index)
+                (funcall #'(cas ,name) old new sap index))))
+  (def sb-sys:sap-ref-8)
+  (def sb-sys:sap-ref-16)
+  (def sb-sys:sap-ref-32)
+  (def sb-sys:sap-ref-64)
+  (def sb-sys:signed-sap-ref-64)
+  (def sb-sys:sap-ref-sap)
+  (def sb-sys:sap-ref-lispobj))
+
+(macrolet ((def (name &rest args)
+             `(defun ,name ,args
+                (,name ,@args))))
+  (def word-logical-not x)
+  (def word-logical-and x y)
+  (def word-logical-or x y)
+  (def word-logical-xor x y)
+  (def word-logical-nor x y)
+  (def word-logical-eqv x y)
+  (def word-logical-nand x y)
+  (def word-logical-andc1 x y)
+  (def word-logical-andc2 x y)
+  (def word-logical-orc1 x y)
+  (def word-logical-orc2 x y))
+
 (macrolet ((def (name &optional (args '(x)))
              `(defun ,name ,args
                 (,@(if (listp name) `(funcall #',name) `(,name)) ,@args)))
@@ -29,7 +60,8 @@
   (def sap-int)
   (def int-sap)
   (macrolet ((def-accessor (name)
-               `(progn (def ,(symbolicate "%SET-" name) (sap offset value))
+               ;; the low-level %SET functions should not need stubs
+               `(progn (def (setf ,name) (value sap offset))
                        (def ,name (sap offset)))))
     (def-accessor sap-ref-8)
     (def-accessor sap-ref-16)
@@ -46,6 +78,8 @@
     (def-accessor sap-ref-single)
     (def-accessor sap-ref-double))
   (def %byte-blt (src src-start dst dst-start dst-end))
+  (def shift-towards-start (number count))
+  (def shift-towards-end (number count))
   (def get-header-data)
   (def set-header-data (x val))
   (def widetag-of)
@@ -58,7 +92,7 @@
   #-(or x86 x86-64) (def dynamic-space-free-pointer ())
   (def control-stack-pointer-sap ())
   (def sb-c:safe-fdefn-fun)
-  (def fun-subtype)
+  (def %fun-pointer-widetag)
   (def %closure-fun)
   (def %closure-index-ref (closure index))
   (def fdefn-name)
@@ -68,7 +102,6 @@
   (def make-array-header (type rank))
   (def code-instructions)
   #-untagged-fdefns (def code-header-ref (code-obj index))
-  #-darwin-jit (def code-header-set (code-obj index new))
   (def %vector-raw-bits (object offset))
   (def %set-vector-raw-bits (object offset value))
   (def single-float-bits)
@@ -86,20 +119,22 @@
   (def %make-instance) ; Allocate a new instance with X data slots.
   (def %instance-length) ; Given an instance, return its length.
   (def %instance-layout)
+  (def %instance-wrapper)
   (def %set-instance-layout (instance new-value))
   ; (def %instance-ref (instance index)) ; defined in 'target-defstruct'
   (def %instance-set (instance index new-value))
   ;; funcallable instances
   (def %make-funcallable-instance)
   (def %fun-layout)
+  (def %fun-wrapper)
   (def %set-fun-layout (fin new-value))
   (def %funcallable-instance-fun)
   (def (setf %funcallable-instance-fun) (fin new-value))
   (def %funcallable-instance-info (fin i))
   (def %set-funcallable-instance-info (fin i new-value))
-  #+compact-instance-header (progn (def layout-of)
+  #+compact-instance-header (progn (def wrapper-of)
                                    (def %instanceoid-layout))
-  #+64-bit (def layout-depthoid)
+
   ;; lists
   (def %rplaca (x val))
   (def %rplacd (x val))
@@ -130,7 +165,6 @@
   (def current-sp ())
   (def current-fp ())
   (def stack-ref (s n))
-  (def %set-stack-ref (s n value))
   (def fun-code-header)
   (def symbol-hash)
   (def sb-vm::symbol-extra)
@@ -151,11 +185,11 @@
 ;;; The stub for sb-c::%structure-is-a should really use layout-id in the same way
 ;;; that the vop does, however, because the all 64-bit architectures other than
 ;;; x86-64 need to use with-pinned-objects to extract a layout-id, it is cheaper not to.
-;;; I shouid add a vop for uint32 access to raw slots.
+;;; I should add a vop for uint32 access to raw slots.
 (defun sb-c::%structure-is-a (object-layout test-layout)
   (or (eq object-layout test-layout)
-      (let ((depthoid (layout-depthoid test-layout))
-            (inherits (layout-inherits object-layout)))
+      (let ((depthoid (wrapper-depthoid test-layout))
+            (inherits (wrapper-inherits object-layout)))
         (and (> (length inherits) depthoid)
              (eq (svref inherits depthoid) test-layout)))))
 

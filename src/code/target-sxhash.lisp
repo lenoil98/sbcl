@@ -27,7 +27,7 @@
   (let ((word
          ;; threads imply gencgc. use the per-thread alloc region pointer
          #+sb-thread
-         (sap-int (sb-vm::current-thread-offset-sap sb-vm::thread-alloc-region-slot))
+         (sap-int (sb-vm::current-thread-offset-sap sb-vm::thread-boxed-tlab-slot))
          #+(and (not sb-thread) cheneygc)
          (sap-int (dynamic-space-free-pointer))
          ;; dynamic-space-free-pointer increments only when a page is full.
@@ -92,9 +92,12 @@
 (defun %instance-sxhash (instance)
   ;; to avoid consing in fmix
   (declare (inline #+64-bit murmur3-fmix64 #-64-bit murmur3-fmix32))
-  ;; FIXME: this special case might be removable, but there are callers
-  ;; of sxhash on layouts due to the expansion of TYPECASE.
-  (when (typep instance 'layout)
+  ;; LAYOUT must not acquire an extra slot for the stable hash,
+  ;; because the bitmap length is derived from the instance length.
+  ;; It would probably be simple to eliminate this as a special case
+  ;; by ensuring that instances of LAYOUT commence life with a trailing
+  ;; hash slot and the SB-VM:HASH-SLOT-PRESENT-FLAG set.
+  (when (typep instance 'sb-vm:layout)
     ;; This might be wrong if the clos-hash was clobbered to 0
     (return-from %instance-sxhash (layout-clos-hash instance)))
   ;; Non-simple cases: no hash slot, and either unhashed or hashed-not-moved.
@@ -196,27 +199,22 @@
            (mix-chunk (word)
              `(setq result (word-mix ,word result)))
            (mix-remaining (word)
-             ;; N-BITS-REMAINING is between 1 inclusive and N-WORD-BITS exclusive
-             (let ((mask
-                    #+little-endian ; if all except 1 bit remain, right-shift by 1, etc
-                    `(ash most-positive-word (- n-bits-remaining sb-vm:n-word-bits))
-                    #+big-endian ; same, except left-shift (modularly)
-                    `(logand most-positive-word
-                             (ash most-positive-word
-                                  (- sb-vm:n-word-bits n-bits-remaining)))))
-               `(setq result (word-mix (logand ,word ,mask) result)))))
+             ;; In the current implementation of bit operations, they may leave random
+             ;; bits in an ignored suffix of bits, hence the need for a masking operation.
+             ;; (See examples above DEF-BIT-ARRAY-OP)
+             ;; N-BITS-REMAINING is between 1 inclusive and N-WORD-BITS exclusive.
+             ;; Produce a mask of 1s spanning the remaining bits, which would be
+             ;; (- n-word-bits n-bits-remaining) and logically AND it with word.
+             ;; The mask is equal mod N-WORD-BITS to (- n-bits-remaining).
+             ;; SHIFT-TOWARDS-START clips the shift count explicitly if the CPU doesn't.
+             `(mix-chunk (logand (shift-towards-start most-positive-word
+                                                      (- n-bits-remaining))
+                                 ,word))))
 (defun %sxhash-simple-bit-vector (x)
   (with-hash (result (length (truly-the simple-bit-vector x)))
     (multiple-value-bind (n-full-words n-bits-remaining) (floor (length x) sb-vm:n-word-bits)
       (dotimes (i n-full-words) (mix-chunk (%vector-raw-bits x i)))
       (when (plusp n-bits-remaining)
-        ;; FIXME: Do we really have to mask off bits of the final word?
-        ;; I don't think so, given that remaining bits are invariantly zero.
-        ;; Maybe this has to do with stack-allocated vectors?
-        ;; Either that, or it anticipates a change wherein we do not always
-        ;; prezero unboxed vectors unless :INITIAL-ELEMENT was specified.
-        ;; (i.e. you'd get random bytes, and so the only known good bits/bytes
-        ;; would appear where you had performed a SETF on them)
         (mix-remaining (%vector-raw-bits x n-full-words))))
     (logand result sb-xc:most-positive-fixnum)))
 (defun %sxhash-bit-vector (bit-vector)
@@ -345,7 +343,7 @@
                 (logxor 72185131
                         (sxhash (char-code x)))) ; through DEFTRANSFORM
                (funcallable-instance
-                (if (layout-for-pcl-obj-p (%fun-layout x))
+                (if (logtest (layout-flags (%fun-layout x)) +pcl-object-layout-flag+)
                     ;; We have a hash code, so might as well use it.
                     (fsc-instance-hash x)
                     ;; funcallable structure, not funcallable-standard-object
@@ -441,15 +439,16 @@
                          (let ((cplx (%raw-instance-ref/complex-double key i)))
                            ,(mix-float '(realpart cplx) $0d0)
                            ,(mix-float '(imagpart cplx) $0d0)))))))
-         (let* ((layout (%instance-layout key))
-                (result (layout-clos-hash layout)))
+         (let* ((wrapper (%instance-wrapper key))
+                (result (wrapper-clos-hash wrapper)))
            (declare (type fixnum result))
            (when (plusp depthoid)
              (let ((max-iterations depthoid)
-                   (depthoid (1- depthoid)))
+                   (depthoid (1- depthoid))
+                   (dd (wrapper-dd wrapper)))
                (declare (index max-iterations))
-               (if (/= (layout-bitmap layout) +layout-all-tagged+)
-                   (let ((slots (dd-slots (layout-dd layout))))
+               (if (/= (sb-kernel::dd-bitmap dd) +layout-all-tagged+)
+                   (let ((slots (dd-slots dd)))
                      (loop (unless slots (return))
                            (let* ((slot (pop slots))
                                   (rsd-index+1 (rsd-index+1 slot))

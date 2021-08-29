@@ -347,19 +347,19 @@
   (declare (type source-info info))
   (let ((file-info (get-toplevelish-file-info info)))
     (multiple-value-call
-        (if function #'sb-c::make-core-debug-source #'make-debug-source)
+        (if function 'sb-di::make-core-debug-source 'make-debug-source)
      :namestring (or *source-namestring*
                      (make-file-info-namestring
                       (let ((pathname
                              (case *name-context-file-path-selector*
-                               (pathname (file-info-untruename file-info))
-                               (truename (file-info-name file-info)))))
+                               (pathname (file-info-pathname file-info))
+                               (truename (file-info-truename file-info)))))
                         (if (pathnamep pathname) pathname))
                       file-info))
      :created (file-info-write-date file-info)
      (if function
          (values :form (let ((direct-file-info (source-info-file-info info)))
-                         (when (eq :lisp (file-info-name direct-file-info))
+                         (when (eq :lisp (file-info-truename direct-file-info))
                            (elt (file-info-forms direct-file-info) 0)))
                  :function function)
          (values)))))
@@ -452,7 +452,7 @@
          ;; Keep this condition in sync with PARSE-COMPILED-DEBUG-VARS
          (large-fixnums (>= (integer-length most-positive-fixnum) 62))
          more)
-    (declare (type index flags))
+    (declare (type (and sb-xc:fixnum unsigned-byte) flags))
     (when minimal
       (setq flags (logior flags compiled-debug-var-minimal-p))
       (unless (and tn (tn-offset tn))

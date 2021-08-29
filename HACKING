@@ -21,9 +21,6 @@ Modifying
 To change the code at run-time the :SB-DEVEL feature is almost always
 necessary, otherwise a lot of macros, functions, and variables do not
 survive in the final image.
-"./make-target-2.sh --load-with-sb-devel" can resave the core with
-sb-devel without recompiling the whole thing, but probably a better
-idea is to put it into customize-target-features.lisp.
 
 Patch Submissions
 =================
@@ -58,7 +55,7 @@ Patches requiring more widespread discussion and feedback should be
 sent to the sbcl-devel mailing list.
 
 If you have any questions, feel free to ask them on sbcl-devel,
-or the IRC channel #sbcl@freenode.net.
+or the IRC channel #sbcl@irc.libera.chat.
 
 Coding Style
 ============

@@ -98,10 +98,10 @@
 (defknown find-classoid (name-for-class &optional t)
   (or classoid null) ())
 (defknown classoid-of (t) classoid (flushable))
-(defknown layout-of (t) layout (flushable))
-#+64-bit (defknown layout-depthoid (layout) layout-depthoid (flushable always-translatable))
-#+(or x86 x86-64) (defknown (layout-depthoid-ge)
-                      (layout integer) boolean (flushable))
+(defknown wrapper-of (t) wrapper (flushable))
+(defknown wrapper-depthoid (wrapper) layout-depthoid (flushable))
+#+64-bit (defknown layout-depthoid (sb-vm:layout) layout-depthoid (flushable always-translatable))
+#+(or x86 x86-64) (defknown (layout-depthoid-ge) (sb-vm:layout integer) boolean (flushable))
 (defknown %structure-is-a (instance t) boolean (foldable flushable))
 (defknown copy-structure (structure-object) structure-object
   (flushable)
@@ -124,7 +124,7 @@
 (defknown (symbol-function) (symbol) function ())
 
 (defknown boundp (symbol) boolean (flushable))
-(defknown fboundp ((or symbol cons)) boolean (unsafely-flushable))
+(defknown fboundp ((or symbol cons)) (or null function) (unsafely-flushable))
 (defknown special-operator-p (symbol) t
   ;; The set of special operators never changes.
   (movable foldable flushable))
@@ -367,7 +367,18 @@
 ;;; e.g. the behavior if the first arg is a NaN is well-defined as we have it,
 ;;; but what about the second arg? We need some test cases around this.
 (defknown float-sign (float &optional float) float
-  (movable foldable unsafely-flushable))
+  (movable foldable unsafely-flushable)
+  :derive-type (lambda (call &aux (args (combination-args call))
+                                  (type (unless (cdr args) (lvar-type (first args)))))
+                 (cond ((and type (csubtypep type (specifier-type 'single-float)))
+                        (specifier-type '(member $1f0 $-1f0)))
+                       ((and type (csubtypep type (specifier-type 'double-float)))
+                        (specifier-type '(member $1d0 $-1d0)))
+                       (type
+                        (specifier-type '(member $1f0 $-1f0 $1d0 $-1d0)))
+                       (t
+                        (specifier-type 'float)))))
+
 (defknown (float-digits float-precision) (float) float-digits
   (movable foldable unsafely-flushable))
 (defknown integer-decode-float (float)
@@ -580,6 +591,19 @@
 (defknown fill ((modifying sequence) t &rest t &key
                 (:start index) (:end sequence-end)) sequence
     ()
+  :derive-type #'result-type-first-arg
+  :result-arg 0)
+;;; Like FILL but with no keyword argument parsing
+(defknown quickfill ((modifying (simple-array * 1)) t) (simple-array * 1) ()
+  :derive-type #'result-type-first-arg
+  :result-arg 0)
+;;; Special case of FILL that takes either a machine word with which to fill,
+;;; or a keyword indicating a certain behavior to compute the word.
+;;; In either case the supplied count is lispwords, not elements.
+;;; This might be a no-op depending on whether memory is prezeroized.
+(defknown sb-vm::splat ((modifying (simple-array * 1)) index (or symbol sb-vm:word))
+    (simple-array * 1)
+  (always-translatable)
   :derive-type #'result-type-first-arg
   :result-arg 0)
 
@@ -880,17 +904,15 @@
 (defknown list* (t &rest t) t (movable flushable))
 ;;; The length constraint on MAKE-LIST is such that:
 ;;; - not every byte of addressable memory can be used up.
-;;; - the number of bytes to allocate should not be a bignum,
-;;    nor can its native representation be larger than 'sword_t'
-;;; So it's half of most-positive-word divided by the cons size,
-;;; which is roughly twice as small as array-dimension-limit on 32-bit machines,
-;;; or 8x smaller on 64-bit machines.
+;;; - the number of bytes to allocate should be a fixnum
+;;; - type-checking can use use efficient bit-masking approach
+;;;   to combine the fixnum + range test into one instruction
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (defconstant make-list-limit
-    (floor (/ sb-ext:most-positive-word 2) (* 2 sb-vm:n-word-bytes))))
-(defknown make-list ((integer 0 (#.make-list-limit)) &key (:initial-element t)) list
+    (ash most-positive-fixnum (- (+ sb-vm:word-shift 1)))))
+(defknown make-list ((integer 0 #.make-list-limit) &key (:initial-element t)) list
   (movable flushable))
-(defknown %make-list ((integer 0 (#.make-list-limit)) t) list (movable flushable))
+(defknown %make-list ((integer 0 #.make-list-limit) t) list (movable flushable))
 
 (defknown sb-impl::|List| (&rest t) list (movable flushable))
 (defknown sb-impl::|List*| (t &rest t) t (movable flushable))
@@ -1160,7 +1182,10 @@
   (movable foldable flushable))
 (defknown fill-pointer (complex-vector) index
     (unsafely-flushable))
-(defknown sb-impl::fill-pointer-error (t &optional t) nil)
+;;; We could cut 1 instruction off the call sequence by not loading the arg count
+;;; register for error-handler helpers that take fixed args.
+;;; Perhaps they should all be trap instead though?
+(defknown sb-vm::fill-pointer-error (t) nil)
 
 (defknown vector-push (t (modifying complex-vector)) (or index null) ())
 (defknown vector-push-extend (t (modifying complex-vector) &optional (and index (integer 1))) index
@@ -1168,15 +1193,15 @@
 (defknown vector-pop ((modifying complex-vector)) t ())
 
 ;;; FIXME: complicated MODIFYING
-;;; Also, an important-result warning could be provided if the array
-;;; is known to be not expressly adjustable.
 (defknown adjust-array
   (array (or index list) &key (:element-type type-specifier)
          (:initial-element t) (:initial-contents t)
          (:fill-pointer (or index boolean))
          (:displaced-to (or array null))
          (:displaced-index-offset index))
-  array ())
+  ;; This is a special case in CHECK-IMPORTANT-RESULT because it is not
+  ;; necessary to use the result if the array is adjustable.
+  array (important-result))
 ;  :derive-type 'result-type-arg1) Not even close...
 
 ;;;; from the "Strings" chapter:
@@ -1652,20 +1677,28 @@
    &key
 
    ;; ANSI options
-   (:output-file (or pathname-designator
-                     null
-                     ;; FIXME: This last case is a non-ANSI hack.
-                     (member t)))
+   (:output-file pathname-designator)
    (:verbose t)
    (:print t)
    (:external-format external-format-designator)
-   (:progress t)
 
    ;; extensions
+   (:progress t)
    (:trace-file t)
    (:block-compile t)
    (:entry-points list)
    (:emit-cfasl t))
+  (values (or pathname null) boolean boolean))
+(defknown sb-c::compile-files
+    (cons &key (:output-file pathname-designator)
+               (:verbose t)
+               (:print t)
+               (:external-format external-format-designator)
+               (:progress t)
+               (:trace-file t)
+               (:block-compile t)
+               (:entry-points list)
+               (:emit-cfasl t))
   (values (or pathname null) boolean boolean))
 
 (defknown (compile-file-pathname)
@@ -1769,7 +1802,7 @@
 ;;; We can't fold this in general because of SATISFIES. There is a
 ;;; special optimizer anyway.
 (defknown %typep (t (or type-specifier ctype)) boolean (movable flushable))
-(defknown %instance-typep (t (or type-specifier ctype layout)) boolean
+(defknown %instance-typep (t (or type-specifier ctype wrapper)) boolean
   (movable flushable always-translatable))
 ;;; We should never emit a call to %typep-wrapper
 (defknown %typep-wrapper (t t (or type-specifier ctype)) t
@@ -1787,7 +1820,8 @@
 (defknown %special-unbind (&rest symbol) t)
 (defknown %listify-rest-args (t index) list (flushable))
 (defknown %more-arg-context (t t) (values t index) (flushable))
-(defknown %more-arg (t index) t)
+(defknown %more-arg (t index) t (flushable))
+(defknown %more-keyword-pair (t fixnum) (values t t) (flushable))
 #+stack-grows-downward-not-upward
 ;;; FIXME: The second argument here should really be NEGATIVE-INDEX, but doing that
 ;;; breaks the build, and I cannot seem to figure out why. --NS 2006-06-29
@@ -1813,7 +1847,7 @@
 (defknown %type-check-error (t t t) nil)
 (defknown %type-check-error/c (t t t) nil)
 
-;; FIXME: This function does not return, but due to the implementation
+;; %compile-time-type-error does not return, but due to the implementation
 ;; of FILTER-LVAR we cannot write it here.
 (defknown (%compile-time-type-error %compile-time-type-style-warn) (t t t t t t) *)
 (defknown (etypecase-failure ecase-failure) (t t) nil)
@@ -1833,9 +1867,10 @@
   (foldable unsafely-flushable always-translatable))
 (defknown data-nil-vector-ref (simple-array index) nil
   (always-translatable))
-(defknown data-vector-set (array index t) t
-  (always-translatable))
-(defknown data-vector-set-with-offset (array fixnum fixnum t) t
+;;; The lowest-level vector SET operators should not return a value.
+;;; Functions built upon them may return the input value.
+(defknown data-vector-set (array index t) (values) (always-translatable))
+(defknown data-vector-set-with-offset (array fixnum fixnum t) (values)
   (always-translatable))
 (defknown hairy-data-vector-ref (array index) t (foldable))
 (defknown hairy-data-vector-set (array index t) t ())
@@ -2006,7 +2041,7 @@
 ;;; Unfortunately it prints that noise at each call site.
 ;;; Using DEFKNOWN we can make the proclamation effective when
 ;;; running the cross-compiler but not when building it.
-;;; Alternatively we could use SB-XC:PROCLAIM, except that that
+;;; Alternatively we could use PROCLAIM, except that that
 ;;; doesn't exist soon enough, and would need conditionals guarding
 ;;; it, which is sort of the very thing this is trying to avoid.
 (defknown missing-arg () nil)
@@ -2043,6 +2078,10 @@
 (defknown sb-kernel::gc-safepoint () (values) ())
 
 ;;;; atomic ops
+;;; the CAS functions are transformed to something else rather than "translated".
+;;; either way, they should not be called.
+(defknown (cas svref) (t t simple-vector index) t (always-translatable))
+(defknown (cas symbol-value) (t t symbol) t (always-translatable))
 (defknown %compare-and-swap-svref (simple-vector index t t) t
     ())
 (defknown (%compare-and-swap-symbol-value
@@ -2061,7 +2100,7 @@
 ;;; Avoid a ton of FBOUNDP checks in the string stream constructors etc,
 ;;; by wiring in the needed functions instead of dereferencing their fdefns.
 (defknown (ill-in ill-bin ill-out ill-bout
-           sb-impl::string-inch sb-impl::string-in-misc
+           sb-impl::string-in-misc
            sb-impl::string-sout
            sb-impl::finite-base-string-ouch sb-impl::finite-base-string-out-misc
            sb-impl::fill-pointer-ouch sb-impl::fill-pointer-sout

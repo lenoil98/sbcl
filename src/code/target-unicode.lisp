@@ -11,60 +11,42 @@
 
 (in-package "SB-UNICODE")
 
-(declaim (type simple-vector **special-numerics**))
-(sb-ext:define-load-time-global **special-numerics**
-  #.(sb-cold:read-from-file "output/numerics.lisp-expr"))
+(defconstant-eqx +special-numerics+
+    #.(sb-cold:read-from-file "output/numerics.lisp-expr")
+    #'equalp)
 
-(macrolet ((unicode-property-init ()
-             (let ((confusable-sets
-                     (sb-cold:read-from-file "output/confusables.lisp-expr"))
-                   (bidi-mirroring-list
-                     (sb-cold:read-from-file "output/bidi-mirrors.lisp-expr")))
-               `(progn
-                  (sb-ext:define-load-time-global **proplist-properties** nil)
-                  (sb-ext:define-load-time-global **confusables**
-                      ',confusable-sets)
-                  (sb-ext:define-load-time-global **bidi-mirroring-glyphs**
-                      ',bidi-mirroring-list)
-                  (defun !unicode-properties-cold-init ()
-                    ;;
-                    (let ((hash (make-hash-table)) ; keys are symbols
-                          (list ',(sb-cold:read-from-file
-                                   "output/misc-properties.lisp-expr")))
-                      (setq **proplist-properties** hash)
-                      (loop for (symbol ranges) on list by #'cddr
-                            do (setf (gethash symbol hash)
-                                     (coerce ranges '(vector (unsigned-byte 32))))))
-                    ;;
-                    (let* ((data ',confusable-sets)
-                           (hash (make-hash-table :test #'eq
-                                                  #+sb-unicode :size #+sb-unicode (length data))))
-                      (loop for (source . target) in data
-                            when (and #-sb-unicode
-                                      (< source char-code-limit))
-                            do (flet ((minimize (x)
-                                        (case (length x)
-                                          (1
-                                           (elt x 0))
-                                          (2
-                                           (pack-3-codepoints (elt x 0) (elt x 1)))
-                                          (3
-                                           (pack-3-codepoints (elt x 0) (elt x 1) (elt x 2)))
-                                          (t
-                                           (logically-readonlyize
-                                            (possibly-base-stringize
-                                             (map 'string #'code-char x)))))))
+(sb-ext:define-load-time-global **proplist-properties**
+    (let* ((list '#.(sb-cold:read-from-file "output/misc-properties.lisp-expr"))
+           (hash (make-hash-table :size (length list))))
+      (loop for (symbol ranges) on list by #'cddr
+            do (setf (gethash symbol hash)
+                     (coerce ranges '(vector (unsigned-byte 32)))))
+      hash))
 
-                                 (setf (gethash (code-char source) hash)
-                                       (minimize target))))
-                      (setf **confusables** hash))
-                    ;;
-                    (let* ((list ',bidi-mirroring-list)
-                           (hash (make-hash-table :test #'eq :size (length list))))
-                      (loop for (k v) in list do
-                            (setf (gethash k hash) v))
-                      (setf **bidi-mirroring-glyphs** hash)))))))
-  (unicode-property-init))
+(sb-ext:define-load-time-global **confusables**
+    (let* ((data '#.(sb-cold:read-from-file "output/confusables.lisp-expr"))
+           (hash (make-hash-table :test #'eq #+sb-unicode :size #+sb-unicode (length data))))
+      (loop for (source . target) in data
+            when (and #-sb-unicode (< source char-code-limit))
+            do (flet ((minimize (x)
+                        (case (length x)
+                          (1
+                           (elt x 0))
+                          (2
+                           (pack-3-codepoints (elt x 0) (elt x 1)))
+                          (3
+                           (pack-3-codepoints (elt x 0) (elt x 1) (elt x 2)))
+                          (t
+                           (logically-readonlyize
+                            (possibly-base-stringize (map 'string #'code-char x)))))))
+                 (setf (gethash (code-char source) hash) (minimize target))))
+      hash))
+
+(sb-ext:define-load-time-global **bidi-mirroring-glyphs**
+    (let* ((list '#.(sb-cold:read-from-file "output/bidi-mirrors.lisp-expr"))
+           (hash (make-hash-table :test #'eq :size (length list))))
+      (loop for (k v) in list do (setf (gethash k hash) v))
+      hash))
 
 ;;; Unicode property access
 (defun ordered-ranges-member (item vector)
@@ -143,12 +125,12 @@ with underscores replaced by dashes."
       :Bn
       (svref-or-null
        #.(read-ucd-constant '*bidi-classes*)
-       (aref **character-misc-database** (1+ (misc-index character))))))
+       (aref +character-misc-database+ (1+ (misc-index character))))))
 
 (declaim (inline combining-class))
 (defun combining-class (character)
   "Returns the canonical combining class (CCC) of CHARACTER"
-  (aref **character-misc-database** (+ 2 (misc-index character))))
+  (aref +character-misc-database+ (+ 2 (misc-index character))))
 
 (defun decimal-value (character)
   "Returns the decimal digit value associated with CHARACTER or NIL if
@@ -168,7 +150,7 @@ All characters with decimal digit values have the same digit value,
 but there are characters (such as digits of number systems without a 0 value)
 that have a digit value but no decimal digit value"
   (let ((%digit (clear-flag 6
-                            (aref **character-misc-database**
+                            (aref +character-misc-database+
                                   (+ 3 (misc-index character))))))
     (if (< %digit 10) %digit nil)))
 
@@ -176,14 +158,13 @@ that have a digit value but no decimal digit value"
   "Returns the numeric value of CHARACTER or NIL if there is no such value.
 Numeric value is the most general of the Unicode numeric properties.
 The only constraint on the numeric value is that it be a rational number."
-  (or (double-vector-binary-search (char-code character)
-                                   **special-numerics**)
+  (or (double-vector-binary-search (char-code character) +special-numerics+)
       (digit-value character)))
 
 (defun mirrored-p (character)
   "Returns T if CHARACTER needs to be mirrored in bidirectional text.
 Otherwise, returns NIL."
-  (logbitp 5 (aref **character-misc-database**
+  (logbitp 5 (aref +character-misc-database+
                     (+ 5 (misc-index character)))))
 
 (defun bidi-mirroring-glyph (character)
@@ -199,14 +180,14 @@ one of the keywords :N (Narrow), :A (Ambiguous), :H (Halfwidth),
 :W (Wide), :F (Fullwidth), or :NA (Not applicable)"
   (svref-or-null #.(read-ucd-constant '*east-asian-widths*)
                  (ldb (byte 3 0)
-                      (aref **character-misc-database**
+                      (aref +character-misc-database+
                             (+ 5 (misc-index character))))))
 
 (defun script (character)
   "Returns the Script property of CHARACTER as a keyword.
 If CHARACTER does not have a known script, returns :UNKNOWN"
   (svref-or-null #.(read-ucd-constant '*scripts*)
-                 (aref **character-misc-database** (+ 6 (misc-index character)))))
+                 (aref +character-misc-database+ (+ 6 (misc-index character)))))
 
 (defun char-block (character)
   "Returns the Unicode block in which CHARACTER resides as a keyword.
@@ -227,15 +208,15 @@ This property has been officially obsoleted by the Unicode standard, and
 is only included for backwards compatibility."
   (let* ((char-code (char-code character))
          (h-code (double-vector-binary-search char-code
-                                              **unicode-1-char-name-database**)))
+                                              +unicode-1-char-name-database+)))
     (when h-code
-      (huffman-decode h-code **unicode-character-name-huffman-tree**))))
+      (huffman-decode h-code +unicode-character-name-huffman-tree+))))
 
 (defun age (character)
   "Returns the version of Unicode in which CHARACTER was assigned as a pair
 of values, both integers, representing the major and minor version respectively.
 If CHARACTER is not assigned in Unicode, returns NIL for both values."
-  (let* ((value (aref **character-misc-database** (+ 8 (misc-index character))))
+  (let* ((value (aref +character-misc-database+ (+ 8 (misc-index character))))
          (major (ash value -3))
          (minor (ldb (byte 3 0) value)))
     (if (zerop value) (values nil nil) (values major minor))))
@@ -269,7 +250,7 @@ Ideographic (:ID) class instead of Alphabetic (:AL)."
   (when (and resolve (not character)) (return-from line-break-class :nil))
   (let ((raw-class
          (svref-or-null #.(read-ucd-constant '*line-break-classes*)
-                        (aref **character-misc-database** (+ 7 (misc-index character)))))
+                        (aref +character-misc-database+ (+ 7 (misc-index character)))))
         (syllable-type (hangul-syllable-type character)))
     (when syllable-type
       (setf raw-class
@@ -367,7 +348,7 @@ disappears when accents are placed on top of it. and NIL otherwise"
 ;;; Implements UAX#15: Normalization Forms
 (declaim (inline char-decomposition-info))
 (defun char-decomposition-info (char)
-  (let ((value (aref **character-misc-database**
+  (let ((value (aref +character-misc-database+
                      (+ 4 (misc-index char)))))
     (values (clear-flag 7 value) (logbitp 7 value))))
 
@@ -376,10 +357,10 @@ disappears when accents are placed on top of it. and NIL otherwise"
   ;; Caller should have gotten length from char-decomposition-info
   (let* ((cp (char-code char))
          (cp-high (ash cp -8))
-         (decompositions **character-decompositions**)
-         (high-page (aref **character-high-pages** cp-high))
+         (decompositions +character-decompositions+)
+         (high-page (aref +character-high-pages+ cp-high))
          (index (unless (logbitp 15 high-page) ;; Hangul syllable
-                  (aref **character-low-pages**
+                  (aref +character-low-pages+
                         (+ 1 (* 2 (+ (ldb (byte 8 0) cp) (ash high-page 8))))))))
     (cond ((= length 1)
            (funcall callback (code-char (aref decompositions index))))
@@ -582,7 +563,7 @@ only characters for which it returns T are collected."
 
 (defun has-case-p (char)
   ;; Bit 6 is the Unicode case flag, as opposed to the Common Lisp one
-  (logbitp 6 (aref **character-misc-database** (+ 5 (misc-index char)))))
+  (logbitp 6 (aref +character-misc-database+ (+ 5 (misc-index char)))))
 
 (defun char-uppercase (char)
   (if (has-case-p char)

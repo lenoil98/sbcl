@@ -252,7 +252,9 @@
   (sb-int:named-let chain ((index (sb-impl::hash-table-next-free-kv tbl)))
     (when (plusp index)
       (nconc (list index)
-             (chain (aref (sb-impl::hash-table-next-vector tbl) index))))))
+             (if (< index
+                    (sb-impl::kv-vector-high-water-mark (sb-impl::hash-table-pairs tbl)))
+                 (chain (aref (sb-impl::hash-table-next-vector tbl) index)))))))
 
 (defvar *tbl* (make-hash-table :weakness :key))
 
@@ -354,8 +356,8 @@
 ;;; This affected the performance of TYPECASE.
 (with-test (:name :sxhash-on-layout)
   (dolist (x '(pathname cons array))
-    (let ((l (sb-kernel:find-layout x)))
-      (assert (= (sxhash l) (sb-kernel::layout-clos-hash l))))))
+    (let ((l (sb-kernel:wrapper-friend (sb-kernel:find-layout x))))
+      (assert (= (sxhash l) (sb-kernel:layout-clos-hash l))))))
 
 (with-test (:name :equalp-table-fixnum-equal-to-float)
   (let ((table (make-hash-table :test #'equalp)))

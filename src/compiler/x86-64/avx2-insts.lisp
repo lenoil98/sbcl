@@ -581,6 +581,31 @@
   (def vpmovzxwq #x66 #x34 #x0f38)
   (def vpmovzxdq #x66 #x35 #x0f38))
 
+(macrolet ((def (name prefix)
+             `(define-instruction ,name (segment dst src pattern)
+                ,@(avx2-inst-printer-list
+                   'ymm-ymm/mem prefix #x70
+                   :printer '(:name :tab reg ", " reg/mem ", " imm))
+                (:emitter
+                 (emit-avx2-inst segment dst src ,prefix #x70
+                                 :remaining-bytes 1)
+                 (emit-byte segment pattern)))))
+  (def vpshufd  #x66)
+  (def vpshufhw #xf3)
+  (def vpshuflw #xf2))
+
+(macrolet ((def (name prefix)
+             `(define-instruction ,name (segment dst src src2 pattern)
+                ,@(avx2-inst-printer-list
+                   'ymm-ymm/mem-imm prefix #xc6)
+                (:emitter
+                 (emit-avx2-inst segment src2 dst ,prefix #xc6
+                                 :vvvv src
+                                 :remaining-bytes 1)
+                 (emit-byte segment pattern)))))
+  (def vshufpd #x66)
+  (def vshufps nil))
+
 (macrolet
     ((def (name prefix opcode)
        `(define-instruction ,name (segment dst src src2 imm)

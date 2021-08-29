@@ -22,7 +22,7 @@
       (inst mov result base)
       (inst lea result (ea lowtag base))))
 
-(defun stack-allocation (alloc-tn size lowtag)
+(defun stack-allocation (alloc-tn size lowtag &optional known-alignedp)
   (aver (not (location= alloc-tn rsp-tn)))
   (inst sub rsp-tn size)
   ;; see comment in x86/macros.lisp implementation of this
@@ -32,18 +32,14 @@
   ;; - It's not the job of FIXED-ALLOC to realign anything.
   ;; - The real issue is that it's not obvious that the stack is
   ;;   16-byte-aligned at *all* times. Maybe it is, maybe it isn't.
-  (inst and rsp-tn #.(lognot lowtag-mask))
+  (unless known-alignedp ; can skip this AND if we're all good
+    (inst and rsp-tn #.(lognot lowtag-mask)))
   (tagify alloc-tn rsp-tn lowtag)
   (values))
 
-;;; For assemfile
-#+(and avx2 sb-xc-host)
-(defvar *avx-registers-used-p* nil)
-
-#+avx2
+#+nil ; was #+avx2
 (defun avx-registers-used-p ()
-  (or #+sb-xc-host *avx-registers-used-p*
-      (when (and #+sb-xc-host (boundp '*component-being-compiled*))
+  (or (when (and #+sb-xc-host (boundp '*component-being-compiled*))
         (let ((comp (component-info *component-being-compiled*)))
           (or (sb-c::ir2-component-avx2-used-p comp)
               (flet ((used-p (tn)
@@ -57,12 +53,21 @@
                 (used-p (sb-c::ir2-component-normal-tns comp))
                 (used-p (sb-c::ir2-component-wired-tns comp))))))))
 
+(defun alloc-unboxed-p (type)
+  (case type
+    ((unboxed-array
+      #.bignum-widetag
+      #.sap-widetag
+      #.double-float-widetag
+      #.complex-single-float-widetag
+      #.complex-double-float-widetag)
+     t)))
+
 ;;; Call an allocator trampoline and get the result in the proper register.
-;;; There are 2x2x2 choices of trampoline:
+;;; There are 2x2 choices of trampoline:
 ;;;  - invoke alloc() or alloc_list() in C
 ;;;  - place result into R11, or leave it on the stack
-;;;  - preserve YMM registers around the call, or don't
-;;; Rather than have 8 different DEFINE-ASSEMBLY-ROUTINEs, there are only 4,
+;;; Rather than have 4 different DEFINE-ASSEMBLY-ROUTINEs, there are only 2,
 ;;; and each has 2 entry points. The earlier entry adds 1 more instruction
 ;;; to set the non-cons bit (the first of the binary choices mentioned above).
 ;;; Most of the time, the inline allocation sequence wants to use the trampoline
@@ -84,25 +89,52 @@
            (inst push result-tn))
           (t
            (inst push size)))
-    (invoke-asm-routine
-     'call
-     (cond #+avx2
-           ((avx-registers-used-p)
-            (if to-r11
-                (if consp 'cons->r11.avx2 'alloc->r11.avx2)
-                (if consp 'cons->rnn.avx2 'alloc->rnn.avx2)))
-           (t
-            (if to-r11
-                (if consp 'cons->r11 'alloc->r11)
-                (if consp 'cons->rnn 'alloc->rnn))))
-     node)
+    (invoke-asm-routine 'call
+                        (if to-r11
+                            (if consp 'cons->r11 'alloc->r11)
+                            (if consp 'cons->rnn 'alloc->rnn))
+                        node)
     (unless to-r11
       (inst pop result-tn)))
   (unless (eql lowtag 0)
     (inst or :byte result-tn lowtag)))
 
 ;;; Insert allocation profiler instrumentation
-(defun instrument-alloc (size node)
+(eval-when (:compile-toplevel)
+  (aver (= thread-tot-bytes-alloc-unboxed-slot
+           (1+ thread-tot-bytes-alloc-boxed-slot))))
+
+(defun instrument-alloc (type size node)
+  (declare (ignorable type))
+  #+allocator-metrics
+  (let ((size-temp (not (typep size '(or (signed-byte 32) tn)))))
+    (cond ((tn-p type) ; from ALLOCATE-VECTOR-ON-HEAP
+           ;; Constant huge size + unknown type can't occur.
+           (aver (not size-temp))
+           (inst cmp :byte type simple-vector-widetag)
+           (inst set :ne temp-reg-tn)
+           (inst and :dword temp-reg-tn 1)
+           (inst add :qword
+                 (ea (ash thread-tot-bytes-alloc-boxed-slot word-shift)
+                     thread-base-tn temp-reg-tn 8)
+                 size))
+          (t
+           (inst add :qword
+                 (thread-slot-ea (if (alloc-unboxed-p type)
+                                     thread-tot-bytes-alloc-unboxed-slot
+                                     thread-tot-bytes-alloc-boxed-slot))
+                 (cond (size-temp (inst mov temp-reg-tn size) temp-reg-tn)
+                       (t size)))))
+    (cond ((tn-p size)
+           ;; the first 4 bins of the histogram can't be used,
+           ;; but I don't care. Math is hard.
+           (inst bsr temp-reg-tn size)
+           (inst inc :qword (ea (ash thread-obj-size-histo-slot word-shift)
+                                thread-base-tn temp-reg-tn 8)))
+          (t
+           (inst inc :qword
+                 (thread-slot-ea (+ thread-obj-size-histo-slot
+                                    (1- (integer-length size))))))))
   (when (policy node (> sb-c::instrument-consing 1))
     (let ((skip-instrumentation (gen-label)))
       (inst mov temp-reg-tn (thread-slot-ea thread-profile-data-slot))
@@ -145,26 +177,21 @@
 ;;; 2. how to allocate it: policy and how to invoke the trampoline
 ;;; 3. where to put the result
 (defun allocation (type size lowtag node dynamic-extent alloc-tn)
+  (aver (not (sb-assem::assembling-to-elsewhere-p)))
   (when dynamic-extent
     (stack-allocation alloc-tn size lowtag)
     (return-from allocation (values)))
   (aver (and (not (location= alloc-tn temp-reg-tn))
              (or (integerp size) (not (location= size temp-reg-tn)))))
 
-  (aver (not (sb-assem::assembling-to-elsewhere-p)))
   ;; Otherwise do the normal inline allocation thing
-  (let ((NOT-INLINE (gen-label))
-        (DONE (gen-label))
-        ;; thread->alloc_region.free_pointer
-        (free-pointer
-         #+sb-thread (thread-slot-ea thread-alloc-region-slot)
-         #-sb-thread (ea boxed-region))
-        ;; thread->alloc_region.end_addr
-        (end-addr
-         #+sb-thread (thread-slot-ea (1+ thread-alloc-region-slot))
-         #-sb-thread (ea (+ boxed-region n-word-bytes))))
-
-    (cond ((typep size `(integer , large-object-size))
+  (let* ((NOT-INLINE (gen-label))
+         (DONE (gen-label))
+         (free-pointer #+sb-thread (thread-slot-ea thread-boxed-tlab-slot)
+                       #-sb-thread (ea boxed-region))
+         (end-addr
+          (ea (+ n-word-bytes (ea-disp free-pointer)) (ea-base free-pointer))))
+    (cond ((typep size `(integer ,large-object-size))
            ;; large objects will never be made in a per-thread region
            (%alloc-tramp type node alloc-tn size lowtag))
           ((eql lowtag 0)
@@ -211,17 +238,19 @@
              (inst jmp DONE))))
     (values)))
 
-;;; Allocate an other-pointer object of fixed SIZE with a single word
+;;; Allocate an other-pointer object of fixed NWORDS with a single-word
 ;;; header having the specified WIDETAG value. The result is placed in
-;;; RESULT-TN.
-(defun alloc-other (result-tn widetag size node &optional stack-allocate-p
-                    &aux (bytes (pad-data-block size)))
-  (let ((header (compute-object-header size widetag)))
+;;; RESULT-TN.  NWORDS counts the header word.
+(defun alloc-other (result-tn widetag nwords node &optional stack-allocate-p
+                    &aux (bytes (pad-data-block nwords)))
+  (let ((header (compute-object-header nwords widetag)))
+    #+bignum-assertions
+    (when (= widetag bignum-widetag) (setq bytes (* bytes 2))) ; use 2x the space
     (cond (stack-allocate-p
            (allocation nil bytes other-pointer-lowtag node t result-tn)
            (storew header result-tn 0 other-pointer-lowtag))
           (t
-           (instrument-alloc bytes node)
+           (instrument-alloc widetag bytes node)
            (pseudo-atomic ()
              (allocation nil bytes 0 node nil result-tn)
              (storew* header result-tn 0 0 t)
@@ -261,7 +290,7 @@
                     (stack-allocate-p (node-stack-allocate-p node))
                     (size (* (pad-data-block cons-size) cons-cells)))
                (unless stack-allocate-p
-                 (instrument-alloc size node))
+                 (instrument-alloc 'list size node))
                (pseudo-atomic (:elide-if stack-allocate-p)
                 (allocation 'list size (if (= cons-cells 2) 0 list-pointer-lowtag)
                             node stack-allocate-p res)
@@ -339,6 +368,41 @@
       (inst mov size (ea (- (* slot n-word-bytes) lowtag) object) word)))))
 
 ;;; ALLOCATE-VECTOR
+(defun store-string-trailing-null (vector type length words)
+  ;; BASE-STRING needs to have a null terminator. The byte is inaccessible
+  ;; to lisp, so clear it now.
+  (cond ((and (sc-is type immediate)
+              (/= (tn-value type) sb-vm:simple-base-string-widetag))) ; do nothing
+        ((and (sc-is type immediate)
+              (= (tn-value type) sb-vm:simple-base-string-widetag)
+              (sc-is length immediate))
+         (inst mov :byte (ea (- (+ (ash vector-data-offset word-shift)
+                                   (tn-value length))
+                                other-pointer-lowtag)
+                             vector)
+               0))
+        ;; Zeroizing the entire final word is easier than using LENGTH now.
+        ((sc-is words immediate)
+         ;; I am not convinced that this case is reachable -
+         ;; we won't DXify a vector of unknown type.
+         (inst mov :qword
+               ;; Given N data words, write to word N-1
+               (ea (- (ash (+ (tn-value words) vector-data-offset -1)
+                           word-shift)
+                      other-pointer-lowtag)
+                   vector)
+               0))
+        (t
+         ;; This final case is ok with 0 data words - it might clobber the LENGTH
+         ;; slot, but subsequently we rewrite that slot.
+         ;; But strings always have at least 1 word, so no worries either way.
+         (inst mov :qword
+               (ea (- (ash (1- vector-data-offset) word-shift)
+                      other-pointer-lowtag)
+                   vector
+                   words (ash 1 (- word-shift n-fixnum-tag-bits)))
+               0))))
+
 (macrolet ((calc-size-in-bytes (n-words result-tn)
              `(cond ((sc-is ,n-words immediate)
                      (pad-data-block (+ (tn-value ,n-words) vector-data-offset)))
@@ -348,113 +412,178 @@
                                nil ,n-words (ash 1 (- word-shift n-fixnum-tag-bits))))
                      (inst and ,result-tn (lognot lowtag-mask))
                      ,result-tn)))
-           (put-header (vector-tn lowtag type length zeroed)
-             `(progn (storew* (if (sc-is ,type immediate) (tn-value ,type) ,type)
-                              ,vector-tn 0 ,lowtag ,zeroed)
-                     (storew* (if (sc-is ,length immediate)
-                                  (fixnumize (tn-value ,length))
-                                  ,length)
-                              ,vector-tn vector-length-slot ,lowtag ,zeroed))))
+           (put-header (vector-tn lowtag type len zeroed)
+             `(let ((len (if (sc-is ,len immediate) (fixnumize (tn-value ,len)) ,len))
+                    (type (if (sc-is ,type immediate) (tn-value ,type) ,type)))
+                (storew* type ,vector-tn 0 ,lowtag ,zeroed)
+                #+ubsan (inst mov :dword (vector-len-ea ,vector-tn ,lowtag) len)
+                #-ubsan (storew* len ,vector-tn vector-length-slot
+                                       ,lowtag ,zeroed)))
+           (want-shadow-bits ()
+             `(and poisoned
+                   (if (sc-is type immediate)
+                       (/= (tn-value type) simple-vector-widetag)
+                       :maybe)))
+           (calc-shadow-bits-size (reg)
+             `(cond ((sc-is length immediate)
+                     ;; Calculate number of dualwords (as 128 bits per dualword)
+                     ;; and multiply by 16 to get number of bytes. Also add the 2 header words.
+                     (* 16 (+ 2 (ceiling (tn-value length) 128))))
+                    (t
+                     ;; Compute (CEILING length 128) by adding 127, then truncating divide
+                     ;; by 128, and untag as part of the divide step.
+                     ;; Account for the two fixed words by adding in 128 more bits initially.
+                     (inst lea :dword ,reg (ea (fixnumize (+ 128 127)) length))
+                     (inst shr :dword ,reg 8) ; divide by 128 and untag as one operation
+                     (inst shl :dword ,reg 4) ; multiply by 16 bytes per dualword
+                     ,reg)))
+           (store-originating-pc (vector)
+             ;; Put the current program-counter into the length slot of the shadow bits
+             ;; so that we can ascribe blame to the array's creator.
+             `(let ((here (gen-label)))
+                (emit-label here)
+                (inst lea temp-reg-tn (rip-relative-ea here))
+                (inst shl temp-reg-tn 4)
+                (inst mov (ea (- 8 other-pointer-lowtag) ,vector) temp-reg-tn))))
 
   (define-vop (allocate-vector-on-heap)
+    #+ubsan (:info poisoned)
     (:args (type :scs (unsigned-reg immediate))
            (length :scs (any-reg immediate))
            (words :scs (any-reg immediate)))
     ;; Result is live from the beginning, like a temp, because we use it as such
     ;; in 'calc-size-in-bytes'
     (:results (result :scs (descriptor-reg) :from :load))
-    (:arg-types positive-fixnum positive-fixnum positive-fixnum)
+    (:arg-types #+ubsan (:constant t)
+                positive-fixnum positive-fixnum positive-fixnum)
     (:policy :fast-safe)
     (:node-var node)
     (:generator 100
+      #+ubsan
+      (when (want-shadow-bits)
+        ;; allocate a vector of "written" bits unless the vector is simple-vector-T,
+        ;; which can use unbound-marker as a poison value on reads.
+        (when (sc-is type unsigned-reg)
+          (inst cmp :byte type simple-vector-widetag)
+          (inst push 0)
+          (inst jmp :e NO-SHADOW-BITS))
+        ;; It would be possible to do this and the array proper
+        ;; in a single pseudo-atomic section, but I don't care to do that.
+        (let ((nbytes (calc-shadow-bits-size result)))
+          (pseudo-atomic ()
+            ;; Allocate the bits into RESULT
+            (allocation nil nbytes 0 node nil result)
+            (inst mov :byte (ea result) simple-bit-vector-widetag)
+            (inst mov :dword (vector-len-ea result 0)
+                  (if (sc-is length immediate) (fixnumize (tn-value length)) length))
+            (inst or :byte result other-pointer-lowtag)))
+        (store-originating-pc result)
+        (inst push result)) ; save the pointer to the shadow bits
+      NO-SHADOW-BITS
       ;; The LET generates instructions that needn't be pseudoatomic
       ;; so don't move it inside.
       (let ((size (calc-size-in-bytes words result)))
-        (instrument-alloc size node)
+        (instrument-alloc (if (sc-is type immediate)
+                              (case (tn-value type)
+                                (#.simple-vector-widetag 'simple-vector)
+                                (t 'unboxed-array))
+                              type)
+                          size node)
         (pseudo-atomic ()
          (allocation nil size 0 node nil result)
          (put-header result 0 type length t)
-         (inst or :byte result other-pointer-lowtag)))))
+         (inst or :byte result other-pointer-lowtag)))
+      #+ubsan
+      (cond ((want-shadow-bits)
+             (inst pop temp-reg-tn) ; restore shadow bits
+             (inst mov (object-slot-ea result 1 other-pointer-lowtag) temp-reg-tn))
+            (poisoned ; uninitialized SIMPLE-VECTOR
+             (store-originating-pc result)))))
 
   (define-vop (allocate-vector-on-stack)
+    #+ubsan (:info poisoned)
     (:args (type :scs (unsigned-reg immediate))
            (length :scs (any-reg immediate))
            (words :scs (any-reg immediate)))
     (:results (result :scs (descriptor-reg) :from :load))
-    (:temporary (:sc any-reg :offset rcx-offset :from :eval) rcx)
-    (:temporary (:sc any-reg :offset rax-offset :from :eval) rax)
-    (:temporary (:sc any-reg :offset rdi-offset :from :eval) rdi)
-    (:temporary (:sc complex-double-reg) zero)
-    (:arg-types positive-fixnum positive-fixnum positive-fixnum)
-    (:translate allocate-vector)
+    (:vop-var vop)
+    (:arg-types #+ubsan (:constant t)
+                positive-fixnum positive-fixnum positive-fixnum)
+    #+ubsan (:temporary (:sc any-reg :offset rax-offset) rax)
+    #+ubsan (:temporary (:sc any-reg :offset rcx-offset) rcx)
+    #+ubsan (:temporary (:sc any-reg :offset rdi-offset) rdi)
     (:policy :fast-safe)
-    (:node-var node)
-    (:generator 100
-      (let ((size (calc-size-in-bytes words result))
-            (rax-zeroed))
+    (:generator 10
+      #+ubsan
+      (when (want-shadow-bits)
+        ;; allocate a vector of "written" bits unless the vector is simple-vector-T,
+        ;; which can use unbound-marker as a poison value on reads.
+        (when (sc-is type unsigned-reg) (bug "vector-on-stack: unknown type"))
+        (zeroize rax)
+        (let ((nbytes (calc-shadow-bits-size rcx)))
+          (stack-allocation rdi nbytes 0)
+          (when (sc-is length immediate) (inst mov rcx nbytes)))
+        (inst rep)
+        (inst stos :byte) ; RAX was zeroed
+        (inst lea rax (ea other-pointer-lowtag rsp-tn))
+        (inst mov :dword (ea (- other-pointer-lowtag) rax) simple-bit-vector-widetag)
+        (inst mov :dword (vector-len-ea rax)
+              (if (sc-is length immediate) (fixnumize (tn-value length)) length))
+        (store-originating-pc rax))
+      (let ((size (calc-size-in-bytes words result)))
+        ;; Compute tagged pointer sooner than later since access off RSP
+        ;; requires an extra byte in the encoding anyway.
+        (stack-allocation result size other-pointer-lowtag
+                          ;; If already aligned RSP, don't need to do it again.
+                          #+ubsan (want-shadow-bits))
+        ;; NB: store the trailing null BEFORE storing the header,
+        ;; in case the length in words is 0, which stores into the LENGTH slot
+        ;; as if it were element -1 of data (which probably can't happen).
+        (store-string-trailing-null result type length words)
+        ;; FIXME: It would be good to check for stack overflow here.
+        (put-header result other-pointer-lowtag type length nil)
+        )
+      #+ubsan
+      (cond ((want-shadow-bits)
+             (inst mov (ea (- (ash vector-length-slot word-shift) other-pointer-lowtag)
+                           result)
+                   rax))
+            (poisoned ; uninitialized SIMPLE-VECTOR
+             (store-originating-pc result)))))
+
+  #+linux ; unimplemented for others
+  (define-vop (allocate-vector-on-stack+msan-unpoison)
+    #+ubsan (:info poisoned)
+    #+ubsan (:ignore poisoned)
+    (:args (type :scs (unsigned-reg immediate))
+           (length :scs (any-reg immediate))
+           (words :scs (any-reg immediate)))
+    (:results (result :scs (descriptor-reg) :from :load))
+    (:arg-types #+ubsan (:constant t)
+                positive-fixnum positive-fixnum positive-fixnum)
+    ;; This is a separate vop because it needs more temps.
+    (:temporary (:sc any-reg :offset rcx-offset) rcx)
+    (:temporary (:sc any-reg :offset rax-offset) rax)
+    (:temporary (:sc any-reg :offset rdi-offset) rdi)
+    (:policy :fast-safe)
+    (:generator 10
+      (let ((size (calc-size-in-bytes words result)))
         ;; Compute tagged pointer sooner than later since access off RSP
         ;; requires an extra byte in the encoding anyway.
         (stack-allocation result size other-pointer-lowtag)
-        (put-header result other-pointer-lowtag type length nil)
+        (store-string-trailing-null result type length words)
         ;; FIXME: It would be good to check for stack overflow here.
-        ;; It would also be good to skip zero-fill of specialized vectors
-        ;; perhaps in a policy-dependent way. At worst you'd see random
-        ;; bits, and CLHS says consequences are undefined.
-        (when (sb-c:msan-unpoison sb-c:*compilation*)
-          ;; Unpoison all DX vectors regardless of widetag.
-          ;; Mark the header and length as valid, not just the payload.
-          #+linux ; unimplemented for others
-          (let ((words-savep
-                 ;; 'words' might be co-located with any of the temps
-                 (or (location= words rdi) (location= words rcx) (location= words rax))))
-            (setq rax-zeroed (not (location= words rax)))
-            (when words-savep ; use 'result' to save 'words'
-              (inst mov result words))
-            (cond ((sc-is words immediate)
-                   (inst mov rcx (+ (tn-value words) vector-data-offset)))
-                  (t
-                   (inst lea rcx
-                         (ea (ash vector-data-offset n-fixnum-tag-bits) words))
-                   (inst shr rcx n-fixnum-tag-bits)))
-            (inst mov rdi msan-mem-to-shadow-xor-const)
-            (inst xor rdi rsp-tn) ; compute shadow address
-            (zeroize rax)
-            (inst rep)
-            (inst stos rax)
-            (when words-savep
-              (inst mov words result) ; restore 'words'
-              (inst lea result ; recompute the tagged pointer
-                    (ea other-pointer-lowtag rsp-tn)))))
-        (unless (sb-c::vector-initialized-p node)
-          (let ((data-addr
-                  (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)
-                      result)))
-            (block zero-fill
-              (cond ((sc-is words immediate)
-                     (let ((n (tn-value words)))
-                       (cond ((> n 8)
-                              (inst mov rcx (tn-value words)))
-                             ((= n 1)
-                              (inst mov :qword data-addr 0)
-                              (return-from zero-fill))
-                             (t
-                              (multiple-value-bind (double single) (truncate n 2)
-                                (inst xorpd zero zero)
-                                (dotimes (i double)
-                                  (inst movapd data-addr zero)
-                                  (setf data-addr
-                                        (ea (+ (ea-disp data-addr) (* n-word-bytes 2))
-                                            (ea-base data-addr))))
-                                (unless (zerop single)
-                                  (inst movaps data-addr zero))
-                                (return-from zero-fill))))))
-                    (t
-                     (move rcx words)
-                     (inst shr rcx n-fixnum-tag-bits)))
-              (inst lea rdi data-addr)
-              (unless rax-zeroed (zeroize rax))
-              (inst rep)
-              (inst stos rax))))))))
+        (put-header result other-pointer-lowtag type length nil)
+        (cond ((sc-is words immediate)
+               (inst mov rcx (+ (tn-value words) vector-data-offset)))
+              (t
+               (inst lea rcx (ea (ash vector-data-offset n-fixnum-tag-bits) words))
+               (inst shr rcx n-fixnum-tag-bits)))
+        (inst mov rdi msan-mem-to-shadow-xor-const)
+        (inst xor rdi rsp-tn) ; compute shadow address
+        (zeroize rax)
+        (inst rep)
+        (inst stos :qword)))))
 
 ;;; ALLOCATE-LIST
 (macrolet ((calc-size-in-bytes (length answer)
@@ -519,7 +648,7 @@
             (loop (gen-label))
             (no-init
              (and (sc-is element immediate) (eql (tn-value element) 0))))
-        (instrument-alloc size node)
+        (instrument-alloc 'list size node)
         (pseudo-atomic ()
          (allocation 'list size list-pointer-lowtag node nil result)
          (compute-end)
@@ -562,7 +691,7 @@
           (bytes (pad-data-block words))
           (header (logior (ash (1- words) n-widetag-bits) closure-widetag)))
      (unless stack-allocate-p
-       (instrument-alloc bytes node))
+       (instrument-alloc closure-widetag bytes node))
      (pseudo-atomic (:elide-if stack-allocate-p)
        (allocation nil bytes fun-pointer-lowtag node stack-allocate-p result)
        (storew* #-immobile-space header ; write the widetag and size
@@ -573,10 +702,14 @@
                                      (thread-slot-ea thread-function-layout-slot))
                        temp)
                 result 0 fun-pointer-lowtag (not stack-allocate-p)))
-     ;; Done with pseudo-atomic
+     ;; Finished with the pseudo-atomic instructions
      (when label
        (inst lea temp (rip-relative-ea label (ash simple-fun-insts-offset word-shift)))
-       (storew temp result closure-fun-slot fun-pointer-lowtag)))))
+       (storew temp result closure-fun-slot fun-pointer-lowtag)
+       #+metaspace
+       (let ((origin (sb-assem::asmstream-data-origin-label sb-assem:*asmstream*)))
+         (inst lea temp (rip-relative-ea origin :code))
+         (storew temp result closure-code-slot fun-pointer-lowtag))))))
 
 ;;; The compiler likes to be able to directly make value cells.
 (define-vop (make-value-cell)
@@ -606,11 +739,13 @@
   (:results (result :scs (descriptor-reg)))
   (:node-var node)
   (:generator 50
-   (let* ((instancep (typep type 'layout)) ; is this an instance type?
+   (let* ((instancep (typep type 'wrapper)) ; is this an instance type?
           (bytes (pad-data-block words)))
+    #+bignum-assertions
+    (when (eq type bignum-widetag) (setq bytes (* bytes 2))) ; use 2x the space
     (progn name) ; possibly not used
     (unless stack-allocate-p
-      (instrument-alloc bytes node))
+      (instrument-alloc type bytes node))
     (pseudo-atomic (:elide-if stack-allocate-p)
       ;; If storing a header word, defer ORing in the lowtag until after
       ;; the header is written so that displacement can be 0.
@@ -660,11 +795,13 @@
       (inst lea operand-size header                    ; (w-1 << 8) | type
             (ea (+ (ash -2 (length-field-shift type)) type) header))
       (inst and operand-size bytes (lognot lowtag-mask)))
-      (cond (stack-allocate-p
+   #+bignum-assertions
+   (when (= type bignum-widetag) (inst shl :dword bytes 1)) ; use 2x the space
+   (cond (stack-allocate-p
              (stack-allocation result bytes lowtag)
              (storew header result 0 lowtag))
-            (t
-             (instrument-alloc bytes node)
+         (t
+             (instrument-alloc type bytes node)
              (pseudo-atomic ()
               (allocation nil bytes lowtag node nil result)
               (storew header result 0 lowtag))))))

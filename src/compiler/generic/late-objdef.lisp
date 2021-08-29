@@ -41,7 +41,7 @@
   (lambda (entry)
     (cons (symbol-value (symbolicate (car entry) "-WIDETAG"))
           (cdr entry)))
-  `((bignum "unboxed" "bignum" "bignum")
+  `((bignum "bignum")
     (ratio "boxed" "ratio_or_complex" "boxed")
     (single-float ,(or #+64-bit "immediate" "unboxed"))
     (double-float "unboxed")
@@ -64,7 +64,7 @@
     ;; Like closure, but these can also have a layout pointer in the high header bytes.
     (funcallable-instance "funinstance" "lose" "short_boxed")
     ;; These have a scav and trans function, but no size function.
-    #-(or x86 x86-64) (return-pc "return_pc_header" "return_pc_header" "lose")
+    #-(or x86 x86-64 arm64) (return-pc "return_pc_header" "return_pc_header" "lose")
 
     (value-cell "boxed")
     (symbol "tiny_boxed")
@@ -110,11 +110,13 @@
     (simple-array-complex-double-float "vector_unsigned_byte_128")
 
     (simple-bit-vector "vector_bit")
-    (simple-vector "vector")
+    (simple-vector "vector_t")
 
     (simple-array-nil "vector_nil")
     (simple-base-string "base_string")
-    #+sb-unicode (simple-character-string "character_string")
+    ;; UB32 works fine for character string, unless we decide to reimplement
+    ;; using 3 octets per code point.
+    #+sb-unicode (simple-character-string "vector_unsigned_byte_32")
     #+sb-unicode (complex-character-string "array")
     (complex-base-string "array")
 
@@ -138,7 +140,7 @@
             min (ldb (byte 32 32) bits))
     ;; Union in the bits for other unboxed object types.
     (dolist (entry *scav/trans/size*)
-      (when (string= (second entry) "unboxed")
+      (when (member (second entry) '("bignum" "unboxed") :test 'string=)
         (setf bits (logior bits (ash 1 (ash (car entry) -2))))))
     (format stream "static inline int leaf_obj_widetag_p(unsigned char widetag) {~%")
     #+64-bit (format stream "  return (0x~XLU >> (widetag>>2)) & 1;" bits)

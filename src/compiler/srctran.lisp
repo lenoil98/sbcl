@@ -159,11 +159,7 @@
           ;; Use of &KEY in source xforms doesn't have all the usual semantics.
           ;; It's better to hand-roll it - cf. transforms for WRITE[-TO-STRING].
           (typep rest '(cons (eql :initial-element) (cons t null))))
-      ;; Something fishy here- If THE is removed, OPERAND-RESTRICTION-OK
-      ;; returns NIL because type inference on MAKE-LIST never happens.
-      ;; But the fndb entry for %MAKE-LIST is right, so I'm slightly bewildered.
-      `(%make-list (the (integer 0 (,(1- array-dimension-limit))) ,length)
-                   ,(second rest))
+      `(%make-list ,length ,(second rest))
       (values nil t))) ; give up
 
 (deftransform %make-list ((length item) ((constant-arg (eql 0)) t)) nil)
@@ -344,16 +340,17 @@
   (let ((type (two-arg-derive-type x y
                                    #'logand-derive-type-aux
                                    #'logand)))
-    (multiple-value-bind (typep definitely)
-        (ctypep 0 type)
-      (cond ((and (not typep) definitely)
-             t)
-            ((type= type (specifier-type '(eql 0)))
-             nil)
-            ((neq :default (combination-implementation-style node))
-             (give-up-ir1-transform))
-            (t
-             `(not (zerop (logand x y))))))))
+    (when type
+     (multiple-value-bind (typep definitely)
+         (ctypep 0 type)
+       (cond ((and (not typep) definitely)
+              t)
+             ((type= type (specifier-type '(eql 0)))
+              nil)
+             ((neq :default (combination-implementation-style node))
+              (give-up-ir1-transform))
+             (t
+              `(not (zerop (logand x y)))))))))
 
 (deftransform logbitp ((index integer))
   (let ((integer-type (lvar-type integer))
@@ -4055,7 +4052,7 @@
   (source-transform-transitive 'logxor args 0 'integer))
 (define-source-transform logand (&rest args)
   (source-transform-transitive 'logand args -1 'integer))
-#-(or arm arm64 mips x86 x86-64 riscv) ; defined in compiler/target/arith.lisp
+#-(or arm arm64 mips x86 x86-64 riscv) ; defined in compiler/{arch}/arith.lisp
 (define-source-transform logeqv (&rest args)
   (source-transform-transitive 'logeqv args -1 'integer))
 (define-source-transform gcd (&rest args)
@@ -4707,7 +4704,7 @@
                (and car-good cdr-good
                     (values (cons car cdr) t)))))))))
 
-(defoptimizer (coerce derive-type) ((value type) node)
+(defoptimizer (coerce derive-type) ((value type))
   (multiple-value-bind (type constant)
       (if (constant-lvar-p type)
           (values (lvar-value type) t)
@@ -4754,12 +4751,6 @@
               (type-union result-typeoid
                           (type-intersection (lvar-type value)
                                              (specifier-type 'rational))))))
-          ;; At zero safety the deftransform for COERCE can elide dimension
-          ;; checks for the things like (COERCE X '(SIMPLE-VECTOR 5)) -- so we
-          ;; need to simplify the type to drop the dimension information.
-          ((and (policy node (zerop safety))
-                (csubtypep result-typeoid (specifier-type '(array * (*))))
-                (simplify-vector-type result-typeoid)))
           (t
            result-typeoid))))))
 
@@ -5095,3 +5086,10 @@
            't)
           (t
            (give-up-ir1-transform)))))
+
+;;; Normally we don't create fdefns by side-effect of calling FBOUNDP,
+;;; but this transform is neutral in terms of the sum of code and data size.
+;;; So for the cost of an FDEFN that might never store a function, the code
+;;; is smaller by about the size of an fdefn; and it's faster, so do it.
+(deftransform fboundp ((name) ((constant-arg symbol)))
+  `(fdefn-fun (load-time-value (find-or-create-fdefn ',(lvar-value name)) t)))

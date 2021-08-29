@@ -360,7 +360,7 @@
            (type alignment size))
   (zerop (logand (1- size) address)))
 
-#-(or x86 x86-64)
+#-(or x86 x86-64 arm64)
 (progn
 (defconstant lra-size (words-to-bytes 1))
 (defun lra-hook (chunk stream dstate)
@@ -378,33 +378,25 @@
                                       (+ (dstate-cur-offs dstate)
                                          (1- lra-size))))
                 sb-vm:return-pc-widetag))
-    (unless (null stream)
+    (when stream
       (note "possible LRA header" dstate)))
   nil))
 
 ;;; Print the fun-header (entry-point) pseudo-instruction at the
-;;; current location in DSTATE to STREAM.
+;;; current location in DSTATE to STREAM and skip 2 words.
 (defun fun-header-hook (fun-index stream dstate)
   (declare (type (or null stream) stream)
            (type disassem-state dstate))
-  (unless (null stream)
-    (let* ((seg (dstate-segment dstate))
-           (code (seg-code seg))
-           (woffs (+ sb-vm:code-constants-offset (* fun-index sb-vm:code-slots-per-simple-fun)))
-           (name (code-header-ref code (+ woffs sb-vm:simple-fun-name-slot)))
-           (args (code-header-ref code (+ woffs sb-vm:simple-fun-arglist-slot)))
-           (info (code-header-ref code (+ woffs sb-vm:simple-fun-info-slot)))
-           (type (typecase info
-                   ((cons t simple-vector) (car info))
-                   ((not simple-vector) info))))
+  (when stream
+    (let* ((fun (%code-entry-point (seg-code (dstate-segment dstate)) fun-index))
+           (name (%simple-fun-name fun))
+           (args (%simple-fun-arglist fun)))
       ;; if the function's name conveys its args, don't show ARGS too
-      (format stream ".~A ~S~:[~:A~;~]" 'entry name
+      (format stream ".~A ~S~:[~:A~;~]"
+              'entry name
               (and (typep name '(cons (eql lambda) (cons list)))
                    (equal args (second name)))
-              args)
-      (note (lambda (stream)
-              (format stream "~:S" type)) ; use format to print NIL as ()
-            dstate)))
+              args)))
   (incf (dstate-next-offs dstate)
         (words-to-bytes sb-vm:simple-fun-insts-offset)))
 
@@ -492,7 +484,7 @@
 
 (defun handle-bogus-instruction (stream dstate prefix-len)
   (let ((alignment (dstate-alignment dstate)))
-    (unless (null stream)
+    (when stream
       (multiple-value-bind (words bytes)
           (truncate alignment sb-vm:n-word-bytes)
         (when (> words 0)
@@ -1409,7 +1401,7 @@
       (format stream "#X~2,'0x" (sap-ref-8 sap (+ offs start-offs))))))
 
 (defvar *default-dstate-hooks*
-  (list* #-(or x86 x86-64) #'lra-hook nil))
+  (list* #-(or x86 x86-64 arm64) #'lra-hook nil))
 
 ;;; Make a disassembler-state object.
 (defun make-dstate (&optional (fun-hooks *default-dstate-hooks*))
@@ -1442,7 +1434,8 @@
   (dotimes (i (code-n-entries (seg-code segment)))
     (let* ((fun (%code-entry-point (seg-code segment) i))
            (length (seg-length segment))
-           (offset (code-offs-to-segment-offs (%fun-code-offset fun) segment)))
+           (code-offs (%fun-code-offset fun))
+           (offset (code-offs-to-segment-offs code-offs segment)))
       (when (<= 0 offset length)
         ;; Up to 2 words (less a byte) of padding might be present to align the
         ;; next simple-fun. Limit on OFFSET is to avoid incorrect triggering
@@ -1455,11 +1448,12 @@
                           (incf (dstate-next-offs dstate) offset))
                  :offset 0) ; at 0 bytes into this seg, skip OFFSET bytes
                 (seg-hooks segment)))
-        (push (make-offs-hook
-               :offset offset
-               :fun (let ((i i)) ; capture the _current_ I, not the final value
-                      (lambda (stream dstate) (fun-header-hook i stream dstate))))
-              (seg-hooks segment))))))
+        (unless (minusp offset)
+          (push (make-offs-hook
+                 :offset offset
+                 :fun (let ((i i)) ; capture the _current_ I, not the final value
+                        (lambda (stream dstate) (fun-header-hook i stream dstate))))
+                (seg-hooks segment)))))))
 
 ;;; A SAP-MAKER is a no-argument function that returns a SAP.
 
@@ -1633,6 +1627,7 @@
 ;;; Assuming that CODE-OBJ is pinned, return true if ADDR is anywhere
 ;;; between the tagged pointer and the first occuring simple-fun.
 (defun points-to-code-constant-p (addr code-obj)
+  (declare (type word addr) (type code-component code-obj))
   (<= (get-lisp-obj-address code-obj)
       addr
       (get-lisp-obj-address (%code-entry-point code-obj 0))))
@@ -1727,7 +1722,8 @@
                           (offset (sb-c:sc+offset-offset sc+offset)))
                      (when (>= offset length)
                        (setf locations (adjust-array locations
-                                                     (max (* 2 length) (1+ offset)))
+                                                     (max (* 2 length) (1+ offset))
+                                                     :initial-element nil)
                              (location-group-locations group) locations))
                      (let ((already-there (aref locations offset)))
                        (cond ((null already-there)
@@ -2191,6 +2187,10 @@
                           ;; What could it do- disassemble the interpreter?
                           (error "Can't disassemble a special operator"))
                          (t (get-compiled-funs object))))
+      (when (code-component-p object)
+        (let* ((base (- (get-lisp-obj-address object) sb-vm:other-pointer-lowtag))
+               (insts (code-instructions object)))
+        (format stream "~&; Base: ~x Data: ~x~%" base (sap-int insts))))
       (disassemble-code-component thing :stream stream)))))
 
 ;;;; code to disassemble assembler segments
@@ -2389,10 +2389,10 @@
               (ecase how
                (:relative
                 ;; When CODE-TN has a lowtag (as it usually does), we add it in here.
-                ;; x86-64 does not have a code-tn, but it behaves like ppc64
+                ;; x86-64 and arm64 do not have a code-tn, but they behave like ppc64
                 ;; in that the displacement is relative to the base of the code.
                 (let ((addr (+ location
-                               #-(or x86-64 ppc64) sb-vm:other-pointer-lowtag)))
+                               #-(or x86-64 ppc64 arm64) sb-vm:other-pointer-lowtag)))
                   (values addr (ash addr (- sb-vm:word-shift)))))
                (:absolute
                 ;; Concerning object movement:
@@ -2638,21 +2638,22 @@
            (type (or null stream) stream)
            (type disassem-state dstate))
   (multiple-value-bind (errnum adjust sc+offsets lengths error-byte)
-       (funcall error-parse-fun
-                (dstate-segment-sap dstate)
-                (dstate-next-offs dstate)
-                trap-number
-                (null stream))
+      (funcall error-parse-fun
+               (dstate-segment-sap dstate)
+               (dstate-next-offs dstate)
+               trap-number
+               (null stream))
     (when stream
        (setf (dstate-cur-offs dstate)
              (dstate-next-offs dstate))
        (flet ((emit-err-arg ()
                 (let ((num (pop lengths)))
-                  (print-notes-and-newline stream dstate)
-                  (print-current-address stream dstate)
-                  (print-inst num stream dstate)
-                  (print-bytes num stream dstate)
-                  (incf (dstate-cur-offs dstate) num)))
+                  (unless (zerop num)
+                    (print-notes-and-newline stream dstate)
+                    (print-current-address stream dstate)
+                    (print-inst num stream dstate)
+                    (print-bytes num stream dstate)
+                    (incf (dstate-cur-offs dstate) num))))
               (emit-note (note)
                 (when note
                   (note (string note) dstate))))
@@ -2670,11 +2671,10 @@
 ;;; so can't easily share this code.
 ;;; But probably we should just add the conditionalization in here.
 #-arm64
-(defun snarf-error-junk (sap offset trap-number &optional length-only (compact-error-trap t))
+(defun snarf-error-junk (sap offset trap-number &optional length-only)
   (let* ((index offset)
          (error-byte t)
-         (error-number (cond ((and compact-error-trap
-                                   (>= trap-number sb-vm:error-trap))
+         (error-number (cond ((>= trap-number sb-vm:error-trap)
                               (setf error-byte nil)
                               (- trap-number sb-vm:error-trap))
                              (t

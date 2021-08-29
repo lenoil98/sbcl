@@ -305,15 +305,12 @@ placed inside the PSEUDO-ATOMIC, and presumably initializes the object."
        (:policy :fast-safe)
        (:args (object :scs (descriptor-reg))
               (index :scs (any-reg))
-              (value :scs ,scs :target result))
+              (value :scs ,scs))
        (:arg-types ,type tagged-num ,el-type)
        (:temporary (:scs (interior-reg)) lip)
-       (:results (result :scs ,scs))
-       (:result-types ,el-type)
        (:generator 2
          (inst addu lip object index)
-         (storew value lip ,offset ,lowtag)
-         (move result value)))
+         (storew value lip ,offset ,lowtag)))
      (define-vop (,(symbolicate name "-C"))
        ,@(when translate
            `((:translate ,translate)))
@@ -325,11 +322,8 @@ placed inside the PSEUDO-ATOMIC, and presumably initializes the object."
                    (:constant (load/store-index ,n-word-bytes ,(eval lowtag)
                                                 ,(eval offset)))
                    ,el-type)
-       (:results (result :scs ,scs))
-       (:result-types ,el-type)
        (:generator 1
-         (storew value object (+ ,offset index) ,lowtag)
-         (move result value)))))
+         (storew value object (+ ,offset index) ,lowtag)))))
 
 
 (defmacro define-partial-reffer (name type size signed offset lowtag scs
@@ -385,34 +379,28 @@ placed inside the PSEUDO-ATOMIC, and presumably initializes the object."
          (:policy :fast-safe)
          (:args (object :scs (descriptor-reg))
                 (index :scs (unsigned-reg))
-                (value :scs ,scs :target result))
+                (value :scs ,scs))
          (:arg-types ,type positive-fixnum ,el-type)
          (:temporary (:scs (interior-reg)) lip)
-         (:results (result :scs ,scs))
-         (:result-types ,el-type)
          (:generator 5
            (inst addu lip object index)
            ,@(when (eq size :short)
                '((inst addu lip index)))
            (inst ,(ecase size (:byte 'sb) (:short 'sh))
-                 value lip (- (* ,offset n-word-bytes) ,lowtag))
-           (move result value)))
+                 value lip (- (* ,offset n-word-bytes) ,lowtag))))
        (define-vop (,(symbolicate name "-C"))
          ,@(when translate
              `((:translate ,translate)))
          (:policy :fast-safe)
          (:args (object :scs (descriptor-reg))
-                (value :scs ,scs :target result))
+                (value :scs ,scs))
          (:info index)
          (:arg-types ,type
                      (:constant (load/store-index ,scale
                                                   ,(eval lowtag)
                                                   ,(eval offset)))
                      ,el-type)
-         (:results (result :scs ,scs))
-         (:result-types ,el-type)
          (:generator 4
            (inst ,(ecase size (:byte 'sb) (:short 'sh))
                  value object
-                 (- (+ (* ,offset n-word-bytes) (* index ,scale)) ,lowtag))
-           (move result value))))))
+                 (- (+ (* ,offset n-word-bytes) (* index ,scale)) ,lowtag)))))))

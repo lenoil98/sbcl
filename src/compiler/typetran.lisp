@@ -46,8 +46,7 @@
           (cons (cons type name)
                 (remove name *backend-type-predicates*
                         :key #'cdr)))
-    (%deftransform name '(function (t) *) #'fold-type-predicate)
-    name))
+    (%deftransform name nil '(function (t) *) #'fold-type-predicate)))
 
 ;;;; IR1 transforms
 
@@ -358,14 +357,29 @@
 (defun source-transform-hairy-typep (object type)
   (declare (type hairy-type type))
   (let ((spec (hairy-type-specifier type)))
-    (cond ((unknown-type-p type)
+    (cond ((and (unknown-type-p type)
+                (symbolp spec)
+                (eq (info :type :kind spec) :forthcoming-defclass-type))
+           ;; Knowing that it was DEFCLASSed is enough to emit a CLASSOID-CELL-TYPEP test.
+           ;; Combinators involving this - e.g. (OR A-NEW-CLASS OTHER-CLASS) -
+           ;; are handled correctly, because we don't punt on everything in the expression
+           ;; as soon as any unknown is present.
+           `(classoid-cell-typep ,(find-classoid-cell spec :create t) ,object))
+          ((unknown-type-p type)
            #+sb-xc-host
            (warn "can't open-code test of unknown type ~S"
                  (type-specifier type))
-           #-sb-xc-host
-           (when (policy *lexenv* (> speed inhibit-warnings))
-             (compiler-notify "can't open-code test of unknown type ~S"
-                              (type-specifier type)))
+           ;; This is not a policy-based decision to notify here,
+           ;; because it is _ALWAYS_ questionable style imho to refer to unknown types.
+           ;; Unfortunately, people love to suppress COMPILER-NOTE because SBCL produces
+           ;; far too many of those for low-level things like untagged-SAP-to-tagged-SAP.
+           ;; So we could opt to STYLE-WARN, which is, in this case, perhaps more severe
+           ;; than we'd like?
+           ;; I guess we're just going to have to say that if you've muffled too may
+           ;; kinds of NOTEs, that's on you.
+           #-sb-xc-host (compiler-notify 'unknown-typep-note
+                                         :format-control "can't open-code test of unknown type ~S"
+                                         :format-arguments (list (type-specifier type)))
            `(let ((object ,object)
                   (cache (load-time-value (cons #'sb-kernel::cached-typep ',spec)
                                           t)))
@@ -599,7 +613,7 @@
                 `(characterp ,object))))
         (let ((n-code (sb-xc:gensym "CODE")))
           `(and (characterp ,object)
-                (let ((,n-code (sb-xc:char-code ,object)))
+                (let ((,n-code (char-code ,object)))
                   (or
                    ,@(loop for pair in pairs
                            collect
@@ -827,12 +841,15 @@
 ;;; So in actual practice, you can't make something that is a pure STREAM, etc.
 #-(or x86 x86-64) ; vop-translated for these 2
 (defmacro layout-depthoid-ge (layout depthoid)
-  `(>= (layout-depthoid ,layout) ,depthoid))
+  `(>= (wrapper-depthoid ,layout) ,depthoid))
+(symbol-macrolet ((get-hash #+metaspace 'layout-clos-hash #-metaspace 'wrapper-clos-hash)
+                  (get-flags #+metaspace 'layout-flags #-metaspace 'wrapper-flags))
 (defun transform-instance-typep (classoid)
   (binding*
       ((name (classoid-name classoid))
-       (layout (let ((res (info :type :compiler-layout name)))
-                 (when (and res (not (layout-invalid res))) res)))
+       (wrapper (let ((res (info :type :compiler-layout name)))
+                 (when (and res (not (wrapper-invalid res))) res)))
+       (layout (and wrapper (wrapper-friend wrapper)))
        ((lowtag lowtag-test slot-reader)
         (cond ((csubtypep classoid (specifier-type 'funcallable-instance))
                (values sb-vm:fun-pointer-lowtag
@@ -840,17 +857,23 @@
               ((csubtypep classoid (specifier-type 'instance))
                (values sb-vm:instance-pointer-lowtag
                        '(%instancep object) '(%instance-layout object)))))
-       (depthoid (if layout (layout-depthoid layout) -1))
-       (wrapper (make-symbol "LAYOUT")))
+       (depthoid (if wrapper (wrapper-depthoid wrapper) -1))
+       (type (make-symbol "TYPE")))
+    (declare (ignorable layout))
 
     ;; Easiest case first: single bit test.
     (cond ((member name '(condition pathname structure-object))
            `(and (%instancep object)
-                 (logtest (layout-flags (%instance-layout object))
+                 (logtest (,get-flags (%instance-layout object))
                           ,(case name
                              (condition +condition-layout-flag+)
                              (pathname  +pathname-layout-flag+)
                              (t         +structure-layout-flag+)))))
+
+          ;; TODO: remove after April 2021 release.
+          ((eq name 'sb-kernel::random-class)
+           (style-warn "~S should not appear in a TYPEP test" name)
+           nil)
 
           ;; Next easiest: Sealed and no subtypes. Typically for DEFSTRUCT only.
           ;; Even if you don't seal a DEFCLASS, we're allowed to assume that things
@@ -860,13 +883,14 @@
           ;; I think that means we should know the lowtag always. Nonetheless, this isn't
           ;; an important scenario, and only if you _do_ seal a class could this case be
           ;; reached; users rarely seal their classes since the standard doesn't say how.
-          ((and layout
+          ((and wrapper
                 (eq (classoid-state classoid) :sealed)
                 (not (classoid-subclasses classoid)))
            (if lowtag-test
-               `(and ,lowtag-test ,(if (vop-existsp :translate layout-eq)
-                                       `(layout-eq object ,layout ,lowtag)
-                                       `(eq ,slot-reader ,layout)))
+               `(and ,lowtag-test
+                     ,(if (vop-existsp :translate layout-eq)
+                          `(layout-eq object ,wrapper ,lowtag)
+                          `(eq ,slot-reader ,layout)))
                ;; `(eq ,layout
                ;;      (if-vop-existsp (:translate %instanceoid-layout)
                ;;        (%instanceoid-layout object)
@@ -874,10 +898,10 @@
                ;;        (cond ((%instancep object) (%instance-layout object))
                ;;              ((funcallable-instance-p object) (%fun-layout object))
                ;;              (t ,(find-layout 't)))))
-               (bug "Unexpected metatype for ~S" layout)))
+               (bug "Unexpected metatype for ~S" wrapper)))
 
           ;; All other structure types
-          ((and (typep classoid 'structure-classoid) layout)
+          ((and (typep classoid 'structure-classoid) wrapper)
             ;; structure type tests; hierarchical layout depths
             (aver (eql lowtag sb-vm:instance-pointer-lowtag))
             ;; we used to check for invalid layouts here, but in fact that's both unnecessary and
@@ -889,45 +913,45 @@
                     ;; this might have to change to consider object invalidation. Probably would
                     ;; want to track structure classoids that would render this code inadmissible.
                   ,(if (<= depthoid sb-kernel::layout-id-vector-fixed-capacity)
-                       `(%structure-is-a (%instance-layout object) ,layout)
-                       `(let ((,wrapper (%instance-layout object)))
-                          (and (layout-depthoid-ge ,wrapper ,depthoid)
-                               (%structure-is-a ,wrapper ,layout))))))
+                       `(%structure-is-a (%instance-layout object) ,wrapper)
+                       `(let ((,type (%instance-layout object)))
+                          (and (layout-depthoid-ge ,type ,depthoid)
+                               (%structure-is-a ,type ,wrapper))))))
 
           ((> depthoid 0)
            ;; fixed-depth ancestors of non-structure types:
            ;; STREAM, FILE-STREAM, STRING-STREAM, and SEQUENCE.
             #+sb-xc-host (when (typep classoid 'static-classoid)
                            ;; should have use :SEALED code above
-                           (bug "Non-frozen static classoids?"))
-            (let ((guts `((when (zerop (layout-clos-hash ,wrapper))
-                            (setq ,wrapper (update-object-layout object)))
+                           (bug "Non-frozen static classoids ~S" name))
+            (let ((guts `((when (zerop (,get-hash ,type))
+                            (setq ,type (update-object-layout object)))
                           ,(ecase name
                             (stream
-                             `(logtest (layout-flags ,wrapper) ,+stream-layout-flag+))
+                             `(logtest (,get-flags ,type) ,+stream-layout-flag+))
                             (file-stream
-                             `(logtest (layout-flags ,wrapper) ,+file-stream-layout-flag+))
+                             `(logtest (,get-flags ,type) ,+file-stream-layout-flag+))
                             (string-stream
-                             `(logtest (layout-flags ,wrapper) ,+string-stream-layout-flag+))
+                             `(logtest (,get-flags ,type) ,+string-stream-layout-flag+))
                             ;; Testing the type EXTENDED-SEQUENCE tests for #<LAYOUT of SEQUENCE>.
                             ;; It can only arise from a direct invocation of TRANSFORM-INSTANCE-TYPEP,
                             ;; because the lisp type is not a classoid. It's done this way to define
                             ;; the logic once only, instead of both here and src/code/pred.lisp.
                             (sequence
-                             `(logtest (layout-flags ,wrapper) ,+sequence-layout-flag+))))))
+                             `(logtest (,get-flags ,type) ,+sequence-layout-flag+))))))
               (if lowtag-test
-                  `(and ,lowtag-test (let ((,wrapper ,slot-reader)) ,@guts))
+                  `(and ,lowtag-test (let ((,type ,slot-reader)) ,@guts))
                   (if-vop-existsp (:translate %instanceoid-layout)
-                    `(let ((,wrapper (%instanceoid-layout object))) ,@guts)
+                    `(let ((,type (%instanceoid-layout object))) ,@guts)
                     `(block typep
-                       (let ((,wrapper (cond ((%instancep object) (%instance-layout object))
-                                             ((funcallable-instance-p object) (%fun-layout object))
-                                             (t (return-from typep nil)))))
+                       (let ((,type (cond ((%instancep object) (%instance-layout object))
+                                          ((funcallable-instance-p object) (%fun-layout object))
+                                          (t (return-from typep nil)))))
                          ,@guts))))))
 
           (t
             `(classoid-cell-typep ',(find-classoid-cell name :create t)
-                                  object)))))
+                                  object))))))
 
 ;;; If the specifier argument is a quoted constant, then we consider
 ;;; converting into a simple predicate or other stuff. If the type is
@@ -1212,7 +1236,9 @@
        (if (types-equal-or-intersect value-type (specifier-type 'float))
            `(the ,tval (if (floatp x)
                            x
-                           (%single-float x)))
+                           (let ((r (the* (real :silent-conflict t) x)))
+                             (declare (muffle-conditions code-deletion-note))
+                             (sb-kernel:%single-float r))))
            `(the ,tval (%single-float x))))
       ((csubtypep tspec (specifier-type 'complex))
        (multiple-value-bind (part-type result-type)
@@ -1241,49 +1267,57 @@
                     `(the ,result-type
                           (complex (coerce (realpart x) ',part-type)
                                    (coerce (imagpart x) ',part-type)))))))))
-      ;; Special case STRING and SIMPLE-STRING as they are union types
-      ;; in SBCL.
-      ((member tval '(string simple-string))
-       `(the ,tval
-             (if (typep x ',tval)
-                 x
-                 (replace (make-array (length x) :element-type 'character) x))))
       ((eq tval 'character)
        `(character x))
-      ;; Special case VECTOR
-      ((eq tval 'vector)
-       `(the ,tval
-             (if (vectorp x)
-                 x
-                 (replace (make-array (length x)) x))))
       ;; Handle specialized element types for 1D arrays.
-      ((csubtypep tspec (specifier-type '(array * (*))))
-       ;; Can we avoid checking for dimension issues like (COERCE FOO
-       ;; '(SIMPLE-VECTOR 5)) returning a vector of length 6?
-       ;;
-       ;; CLHS actually allows this for all code with SAFETY < 3,
-       ;; but we're a conservative bunch.
-       (if (or (policy node (zerop safety)) ; no need in unsafe code
-               (and (array-type-p tspec) ; no need when no dimensions
-                    (equal (array-type-dimensions tspec) '(*))))
-           ;; We can!
-           (multiple-value-bind (vtype etype upgraded) (simplify-vector-type tspec)
-             (unless upgraded
-               (give-up-ir1-transform))
-             (let ((vtype (type-specifier vtype)))
-               `(the ,vtype
-                     (if (typep x ',vtype)
-                         x
-                         (replace
-                          (make-array (length x)
-                                      ,@(and (not (eq etype *universal-type*))
-                                             (not (eq etype *wild-type*))
-                                             `(:element-type ',(type-specifier etype))))
-                          x)))))
-           ;; No, duh. Dimension checking required.
-           (give-up-ir1-transform
-            "~@<~S specifies dimensions other than (*) in safe code.~:@>"
-            tval)))
+      ((multiple-value-bind (result already-type-p dimension specialization)
+           (cond ((or (and (array-type-p tspec)
+                           (neq (array-type-complexp tspec) t) ; :MAYBE and NIL are good
+                           (not (contains-unknown-type-p (array-type-element-type tspec)))
+                           ;; just for requesting (array nil (*)), you lose
+                           (neq (array-type-specialized-element-type tspec) *empty-type*)
+                           (consp (array-type-dimensions tspec))))
+                  (values tspec
+                          (source-transform-array-typep 'x tspec)
+                          (car (array-type-dimensions tspec))
+                          (let ((et (array-type-specialized-element-type tspec)))
+                            (unless (or (eq et *universal-type*) ; don't need
+                                        ;; * is illegal as :element-type; in this context
+                                        ;; it means to produce a SIMPLE-VECTOR
+                                        (eq et *wild-type*))
+                              `(:element-type ',(type-specifier et))))))
+                 ;; Check for string types.  This loses on (STRING 1) and such.
+                 #+sb-unicode
+                 ((type= tspec (specifier-type 'simple-string))
+                  (values 'simple-string '(simple-string-p x) '* '(:element-type 'character)))
+                 #+sb-unicode
+                 ((type= tspec (specifier-type 'string))
+                  (values 'string '(stringp x) '* '(:element-type 'character))))
+         (when result
+           ;; If the dimension is in the type, we check the input length if safety > 0,
+           ;; though technically CLHS would allow not checking in safety < 3.
+           ;; And if mismatch occurs in unsafe code, the results accords with the
+           ;; specifier, NOT the dimension of the input. This is a rational choice
+           ;; because one could not argue that incorrect code should have taken the
+           ;; bad input's length when COERCE was asked for an exact type of output.
+           `(truly-the ,result
+               (if ,already-type-p
+                   x
+                   ,(cond ((eq dimension '*)
+                           #+ubsan
+                           ;; Passing :INITIAL-CONTENTS avoids allocating ubsan shadow bits,
+                           ;; but redundantly checks the length of the input in MAKE-ARRAY's
+                           ;; transform because we don't or can't infer that LENGTH gives the
+                           ;; same answer each time it is called on X. There may be a way to
+                           ;; extract more efficiency - at least eliminate the unreachable
+                           ;; error-signaling code on mismatch - but I don't care to try.
+                           `(make-array (length x) ,@specialization :initial-contents x)
+                           #-ubsan ; better: do not generate a redundant LENGTH check
+                           `(replace (make-array (length x) ,@specialization) x))
+                          ((policy node (= safety 0)) ; Disregard the input length
+                           `(replace (make-array ,dimension ,@specialization) x))
+                          (t
+                           `(make-array ,dimension ,@specialization :initial-contents x))))))))
       ((type= tspec (specifier-type 'list))
        `(coerce-to-list x))
       ((csubtypep tspec (specifier-type 'function))

@@ -23,10 +23,24 @@
   system-area-pointer)
 
 (declaim (inline memmove))
-(define-alien-routine ("memmove" memmove) void
+(define-alien-routine ("memmove" memmove) void ; BUG: technically returns void*
   (dest (* char))
   (src (* char))
-  (n unsigned-int))
+  (n sb-unix::size-t))
+
+(defun copy-ub8-to-system-area (src src-offset dst dst-offset length)
+  (with-pinned-objects (src)
+    (memmove (sap+ dst dst-offset) (sap+ (vector-sap src) src-offset) length))
+  (values))
+
+(defun copy-ub8-from-system-area (src src-offset dst dst-offset length)
+  (with-pinned-objects (dst)
+    (memmove (sap+ (vector-sap dst) dst-offset) (sap+ src src-offset) length))
+  (values))
+
+(defun system-area-ub8-copy (src src-offset dst dst-offset length)
+  (memmove (sap+ dst dst-offset) (sap+ src src-offset) length)
+  (values))
 
 (define-alien-routine ("os_get_errno" get-errno) int)
 (setf (documentation 'get-errno 'function)

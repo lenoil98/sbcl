@@ -19,7 +19,7 @@
   (:generator 1
     (move res csp-tn)))
 
-(define-vop ()
+(define-vop (current-fp-sap)
   (:translate current-fp)
   (:policy :fast-safe)
   (:results (res :scs (sap-reg)))
@@ -45,15 +45,12 @@
   (:policy :fast-safe)
   (:args (sap :scs (sap-reg))
          (offset :scs (any-reg) :target temp)
-         (value :scs (descriptor-reg) :target result))
+         (value :scs (descriptor-reg)))
   (:arg-types system-area-pointer positive-fixnum *)
   (:temporary (:scs (any-reg)) temp)
-  (:results (result :scs (descriptor-reg)))
-  (:result-types *)
   (:generator 5
     (inst lsl temp offset (- word-shift n-fixnum-tag-bits))
-    (inst str value (@ sap temp))
-    (move result value)))
+    (inst str value (@ sap temp))))
 
 (define-vop (code-from-mumble)
   (:policy :fast-safe)
@@ -71,10 +68,6 @@
       (inst sub temp temp (- other-pointer-lowtag lowtag)))
     (inst sub code thing temp)
     DONE))
-
-(define-vop (code-from-lra code-from-mumble)
-  (:translate sb-di::lra-code-header)
-  (:variant other-pointer-lowtag))
 
 (define-vop (code-from-fun code-from-mumble)
   (:translate sb-di::fun-code-header)

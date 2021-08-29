@@ -67,10 +67,8 @@
   (:generator 1
     (inst cmp
           (make-ea :dword
-                   :disp (+ (ash (+ (get-dsd-index layout sb-kernel::id-word0)
-                                    instance-slots-offset)
-                                 word-shift)
-                            (ash (- (layout-depthoid test) 2) 2)
+                   :disp (+ (id-bits-offset)
+                            (ash (- (wrapper-depthoid test) 2) 2)
                             (- instance-pointer-lowtag))
                    :base x)
           (if (or (typep (layout-id test) '(and (signed-byte 8) (not (eql 0))))
@@ -89,8 +87,8 @@
                                       :disp (- other-pointer-lowtag)))))
 
 
-(define-vop (fun-subtype)
-  (:translate fun-subtype)
+(define-vop ()
+  (:translate %fun-pointer-widetag)
   (:policy :fast-safe)
   (:args (function :scs (descriptor-reg)))
   (:results (result :scs (unsigned-reg)))
@@ -112,18 +110,15 @@
 (define-vop (set-header-data)
   (:translate set-header-data)
   (:policy :fast-safe)
-  (:args (x :scs (descriptor-reg) :target res :to (:result 0))
+  (:args (x :scs (descriptor-reg) :to :eval)
          (data :scs (any-reg) :target eax))
   (:arg-types * positive-fixnum)
-  (:results (res :scs (descriptor-reg)))
-  (:temporary (:sc unsigned-reg :offset eax-offset
-                   :from (:argument 1) :to (:result 0)) eax)
+  (:temporary (:sc unsigned-reg :offset eax-offset :from (:argument 1)) eax)
   (:generator 6
     (move eax data)
-    (inst shl eax (- n-widetag-bits 2))
+    (inst shl eax (- n-widetag-bits n-fixnum-tag-bits))
     (load-type al-tn x (- other-pointer-lowtag))
-    (storew eax x 0 other-pointer-lowtag)
-    (move res x)))
+    (storew eax x 0 other-pointer-lowtag)))
 
 (define-vop (test-header-bit)
   (:translate test-header-bit)

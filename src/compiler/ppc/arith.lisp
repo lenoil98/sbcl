@@ -1003,21 +1003,21 @@
   (:translate sb-bignum:%bignum-set-length)
   (:policy :fast-safe))
 
+#-bignum-assertions
 (define-vop (bignum-ref word-index-ref)
   (:variant bignum-digits-offset other-pointer-lowtag)
   (:translate sb-bignum:%bignum-ref)
   (:results (value :scs (unsigned-reg)))
   (:result-types unsigned-num))
 
-(define-vop (bignum-set word-index-set)
+(define-vop (bignum-set word-index-set-nr)
   (:variant bignum-digits-offset other-pointer-lowtag)
-  (:translate sb-bignum:%bignum-set)
+  (:translate #+bignum-assertions sb-bignum:%%bignum-set
+              #-bignum-assertions sb-bignum:%bignum-set)
   (:args (object :scs (descriptor-reg))
          (index :scs (any-reg immediate zero))
          (value :scs (unsigned-reg)))
-  (:arg-types t positive-fixnum unsigned-num)
-  (:results (result :scs (unsigned-reg)))
-  (:result-types unsigned-num))
+  (:arg-types t positive-fixnum unsigned-num))
 
 (define-vop (digit-0-or-plus)
   (:translate sb-bignum:%digit-0-or-plusp)

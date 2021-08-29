@@ -12,15 +12,15 @@
 (in-package "SB-VM")
 
 (define-vop ()
-  (:translate sb-di::current-sp)
+  (:translate current-sp)
   (:policy :fast-safe)
   (:results (res :scs (sap-reg)))
   (:result-types system-area-pointer)
   (:generator 1
     (move res csp-tn)))
 
-(define-vop ()
-  (:translate sb-di::current-fp)
+(define-vop (current-fp-sap)
+  (:translate current-fp)
   (:policy :fast-safe)
   (:results (res :scs (sap-reg)))
   (:result-types system-area-pointer)
@@ -45,15 +45,12 @@
   (:policy :fast-safe)
   (:args (sap :scs (sap-reg))
          (offset :scs (any-reg))
-         (value :scs (descriptor-reg) :target result))
+         (value :scs (descriptor-reg)))
   (:arg-types system-area-pointer positive-fixnum *)
-  (:results (result :scs (descriptor-reg)))
   (:temporary (:scs (unsigned-reg)) temp)
-  (:result-types *)
   (:generator 5
     (inst sldi temp offset (- word-shift n-fixnum-tag-bits))
-    (inst stdx value sap temp)
-    (move result value)))
+    (inst stdx value sap temp)))
 
 (define-vop (code-from-mumble)
   (:policy :fast-safe)

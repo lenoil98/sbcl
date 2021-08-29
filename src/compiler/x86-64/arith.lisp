@@ -603,7 +603,7 @@
           (inst cmp y 0))
       (inst jmp :eq (generate-error-code vop 'division-by-zero-error x y)))
     (move eax x)
-    (inst xor edx edx)
+    (zeroize edx)
     (inst div eax y)
     (move quo eax)
     (move rem edx)))
@@ -626,7 +626,7 @@
   (:save-p :compute-only)
   (:generator 32
     (move eax x)
-    (inst xor edx edx)
+    (zeroize edx)
     (inst mov y-arg y)
     (inst div eax y-arg)
     (move quo eax)
@@ -688,73 +688,74 @@
 
 
 ;;;; Shifting
+(macrolet ((encodable-as-lea ()
+             `(and (gpr-tn-p number) (gpr-tn-p result)
+                   (not (location= number result))
+                   (member amount '(1 2 3))))
+           (generate-lea ()
+             `(case amount
+                (1 (inst lea result (ea number number)))
+                (2 (inst lea result (ea nil number 4)))
+                (3 (inst lea result (ea nil number 8)))))
+           (with-shift-operands (&body body)
+             ;; If the initial "MOVE result number" is a legal instruction,
+             ;; then we're OK; otherwise use the temp reg to do the shift.
+             `(multiple-value-bind (save result)
+                  (if (or (location= number result) (gpr-tn-p number) (gpr-tn-p result))
+                      (values nil result)
+                      (values result temp-reg-tn))
+                (move result number)
+                ,@body
+                (when save (inst mov save result)))))
+
 (define-vop (fast-ash-c/fixnum=>fixnum)
   (:translate ash)
   (:policy :fast-safe)
-  (:args (number :scs (any-reg) :target result
-                 :load-if (not (and (sc-is number any-reg control-stack)
-                                    (sc-is result any-reg control-stack)
-                                    (location= number result)))))
+  (:args (number :scs (any-reg control-stack) :target result))
   (:info amount)
   (:arg-types tagged-num (:constant integer))
-  (:results (result :scs (any-reg)
-                    :load-if (not (and (sc-is number control-stack)
-                                       (sc-is result control-stack)
-                                       (location= number result)))))
+  (:results (result :scs (any-reg control-stack)))
   (:result-types tagged-num)
   (:note "inline ASH")
   (:variant nil)
   (:variant-vars modularp)
   (:generator 2
-    (cond ((and (= amount 1) (not (location= number result)))
-           (inst lea result (ea number number)))
-          ((and (= amount 2) (not (location= number result)))
-           (inst lea result (ea nil number 4)))
-          ((and (= amount 3) (not (location= number result)))
-           (inst lea result (ea nil number 8)))
+    (cond ((= amount 0) (bug "shifting by 0"))
+          ((>= amount 64) ; shifting left (zero fill)
+           (unless modularp
+             (bug "Impossible: fixnum ASH left exceeds word length"))
+           (zeroize result))
+          ((encodable-as-lea) (generate-lea))
           (t
-           (move result number)
-           (cond ((< -64 amount 64)
-                  ;; this code is used both in ASH and ASH-MODFX, so
-                  ;; be careful
-                  (if (plusp amount)
-                      (inst shl result amount)
-                      (progn
-                        (inst sar result (- amount))
-                        (inst and result (lognot fixnum-tag-mask)))))
-                 ;; shifting left (zero fill)
-                 ((plusp amount)
-                  (unless modularp
-                    (aver (not "Impossible: fixnum ASH should not be called with
-constant shift greater than word length")))
-                  (if (sc-is result any-reg)
-                      (zeroize result)
-                      (inst mov result 0)))
-                 ;; shifting right (sign fill)
-                 (t (inst sar result 63)
-                    (inst and result (lognot fixnum-tag-mask))))))))
+           (with-shift-operands
+            (cond ((< -64 amount 64)
+                   ;; this code is used both in ASH and ASH-MODFX, so
+                   ;; be careful
+                   (if (plusp amount)
+                       (inst shl result amount)
+                       (progn
+                         (inst sar result (- amount))
+                         (inst and result (lognot fixnum-tag-mask)))))
+                  ;; shifting right (sign fill)
+                  (t (move result number)
+                     (inst sar result 63)
+                     (inst and result (lognot fixnum-tag-mask)))))))))
 
 (define-vop (fast-ash-left/fixnum=>fixnum)
   (:translate ash)
-  (:args (number :scs (any-reg) :target result
-                 :load-if (not (and (sc-is number control-stack)
-                                    (sc-is result control-stack)
-                                    (location= number result))))
+  (:args (number :scs (any-reg control-stack) :target result)
          (amount :scs (unsigned-reg) :target ecx))
   (:arg-types tagged-num positive-fixnum)
   (:temporary (:sc unsigned-reg :offset rcx-offset :from (:argument 1)) ecx)
-  (:results (result :scs (any-reg) :from (:argument 0)
-                    :load-if (not (and (sc-is number control-stack)
-                                       (sc-is result control-stack)
-                                       (location= number result)))))
+  (:results (result :scs (any-reg control-stack) :from (:argument 0)))
   (:result-types tagged-num)
   (:policy :fast-safe)
   (:note "inline ASH")
   (:generator 3
-    (move result number)
-    (move ecx amount)
-    ;; The result-type ensures us that this shift will not overflow.
-    (inst shl result :cl)))
+    (with-shift-operands
+     (move ecx amount)
+     ;; The result-type ensures us that this shift will not overflow.
+     (inst shl result :cl))))
 
 (define-vop (fast-ash-left/fixnum-unbounded=>fixnum
              fast-ash-left/fixnum=>fixnum)
@@ -771,105 +772,67 @@ constant shift greater than word length")))
 (define-vop (fast-ash-c/signed=>signed)
   (:translate ash)
   (:policy :fast-safe)
-  (:args (number :scs (signed-reg) :target result
-                 :load-if (not (and (sc-is number signed-stack)
-                                    (sc-is result signed-stack)
-                                    (location= number result)))))
+  (:args (number :scs (signed-reg signed-stack) :target result))
   (:info amount)
   (:arg-types signed-num (:constant integer))
-  (:results (result :scs (signed-reg)
-                    :load-if (not (and (sc-is number signed-stack)
-                                       (sc-is result signed-stack)
-                                       (location= number result)))))
+  (:results (result :scs (signed-reg signed-stack)))
   (:result-types signed-num)
   (:note "inline ASH")
   (:generator 3
-    (cond ((and (= amount 1) (not (location= number result)))
-           (inst lea result (ea number number)))
-          ((and (= amount 2) (not (location= number result)))
-           (inst lea result (ea nil number 4)))
-          ((and (= amount 3) (not (location= number result)))
-           (inst lea result (ea nil number 8)))
+    (cond ((encodable-as-lea) (generate-lea))
           (t
-           (move result number)
-           (cond ((plusp amount) (inst shl result amount))
-                 (t (inst sar result (min 63 (- amount)))))))))
+           (with-shift-operands
+            (cond ((plusp amount) (inst shl result amount))
+                  (t (inst sar result (min 63 (- amount))))))))))
 
 (define-vop (fast-ash-c/unsigned=>unsigned)
   (:translate ash)
   (:policy :fast-safe)
-  (:args (number :scs (unsigned-reg) :target result
-                 :load-if (not (and (sc-is number unsigned-stack)
-                                    (sc-is result unsigned-stack)
-                                    (location= number result)))))
+  (:args (number :scs (unsigned-reg unsigned-stack) :target result))
   (:info amount)
   (:arg-types unsigned-num (:constant integer))
-  (:results (result :scs (unsigned-reg)
-                    :load-if (not (and (sc-is number unsigned-stack)
-                                       (sc-is result unsigned-stack)
-                                       (location= number result)))))
+  (:results (result :scs (unsigned-reg unsigned-stack)))
   (:result-types unsigned-num)
   (:note "inline ASH")
   (:generator 3
-    (cond ((and (= amount 1) (not (location= number result)))
-           (inst lea result (ea number number)))
-          ((and (= amount 2) (not (location= number result)))
-           (inst lea result (ea nil number 4)))
-          ((and (= amount 3) (not (location= number result)))
-           (inst lea result (ea nil number 8)))
+    (cond ((= amount 0) (bug "shifting by 0"))
+          ((not (< -64 amount 64)) (zeroize result))
+          ((encodable-as-lea) (generate-lea))
           (t
-           (move result number)
-           (cond ((< -64 amount 64) ;; XXXX
-                  ;; this code is used both in ASH and ASH-MOD64, so
-                  ;; be careful
+           (with-shift-operands
                   (if (plusp amount)
                       (inst shl result amount)
-                      (inst shr result (- amount))))
-                 (t (if (sc-is result unsigned-reg)
-                        (zeroize result)
-                        (inst mov result 0))))))))
+                      (inst shr result (- amount))))))))
 
 (define-vop (fast-ash-left/signed=>signed)
   (:translate ash)
-  (:args (number :scs (signed-reg) :target result
-                 :load-if (not (and (sc-is number signed-stack)
-                                    (sc-is result signed-stack)
-                                    (location= number result))))
+  (:args (number :scs (signed-reg signed-stack) :target result)
          (amount :scs (unsigned-reg) :target ecx))
   (:arg-types signed-num positive-fixnum)
   (:temporary (:sc unsigned-reg :offset rcx-offset :from (:argument 1)) ecx)
-  (:results (result :scs (signed-reg) :from (:argument 0)
-                    :load-if (not (and (sc-is number signed-stack)
-                                       (sc-is result signed-stack)
-                                       (location= number result)))))
+  (:results (result :scs (signed-reg signed-stack) :from (:argument 0)))
   (:result-types signed-num)
   (:policy :fast-safe)
   (:note "inline ASH")
   (:generator 4
-    (move result number)
-    (move ecx amount)
-    (inst shl result :cl)))
+    (with-shift-operands
+     (move ecx amount)
+     (inst shl result :cl))))
 
 (define-vop (fast-ash-left/unsigned=>unsigned)
   (:translate ash)
-  (:args (number :scs (unsigned-reg) :target result
-                 :load-if (not (and (sc-is number unsigned-stack)
-                                    (sc-is result unsigned-stack)
-                                    (location= number result))))
+  (:args (number :scs (unsigned-reg unsigned-stack) :target result)
          (amount :scs (unsigned-reg) :target ecx))
   (:arg-types unsigned-num positive-fixnum)
   (:temporary (:sc unsigned-reg :offset rcx-offset :from (:argument 1)) ecx)
-  (:results (result :scs (unsigned-reg) :from (:argument 0)
-                    :load-if (not (and (sc-is number unsigned-stack)
-                                       (sc-is result unsigned-stack)
-                                       (location= number result)))))
+  (:results (result :scs (unsigned-reg unsigned-stack) :from (:argument 0)))
   (:result-types unsigned-num)
   (:policy :fast-safe)
   (:note "inline ASH")
   (:generator 4
-    (move result number)
-    (move ecx amount)
-    (inst shl result :cl)))
+    (with-shift-operands
+     (move ecx amount)
+     (inst shl result :cl))))
 
 (define-vop (fast-ash-left/unsigned-unbounded=>unsigned
              fast-ash-left/unsigned=>unsigned)
@@ -945,45 +908,46 @@ constant shift greater than word length")))
 (define-vop (fast-%ash/right/unsigned)
   (:translate %ash/right)
   (:policy :fast-safe)
-  (:args (number :scs (unsigned-reg) :target result)
+  (:args (number :scs (unsigned-reg unsigned-stack) :target result)
          (amount :scs (unsigned-reg) :target rcx))
   (:arg-types unsigned-num unsigned-num)
-  (:results (result :scs (unsigned-reg) :from (:argument 0)))
+  (:results (result :scs (unsigned-reg unsigned-stack) :from (:argument 0)))
   (:result-types unsigned-num)
   (:temporary (:sc signed-reg :offset rcx-offset :from (:argument 1)) rcx)
   (:generator 4
-    (move result number)
-    (move rcx amount)
-    (inst shr result :cl)))
+    (with-shift-operands
+     (move rcx amount)
+     (inst shr result :cl))))
 
 (define-vop (fast-%ash/right/signed)
   (:translate %ash/right)
   (:policy :fast-safe)
-  (:args (number :scs (signed-reg) :target result)
+  (:args (number :scs (signed-reg signed-stack) :target result)
          (amount :scs (unsigned-reg) :target rcx))
   (:arg-types signed-num unsigned-num)
-  (:results (result :scs (signed-reg) :from (:argument 0)))
+  (:results (result :scs (signed-reg signed-stack) :from (:argument 0)))
   (:result-types signed-num)
   (:temporary (:sc signed-reg :offset rcx-offset :from (:argument 1)) rcx)
   (:generator 4
-    (move result number)
-    (move rcx amount)
-    (inst sar result :cl)))
+    (with-shift-operands
+     (move rcx amount)
+     (inst sar result :cl))))
 
 (define-vop (fast-%ash/right/fixnum)
   (:translate %ash/right)
   (:policy :fast-safe)
-  (:args (number :scs (any-reg) :target result)
+  (:args (number :scs (any-reg control-stack) :target result)
          (amount :scs (unsigned-reg) :target rcx))
   (:arg-types tagged-num unsigned-num)
-  (:results (result :scs (any-reg) :from (:argument 0)))
+  (:results (result :scs (any-reg control-stack) :from (:argument 0)))
   (:result-types tagged-num)
   (:temporary (:sc signed-reg :offset rcx-offset :from (:argument 1)) rcx)
   (:generator 3
-    (move result number)
-    (move rcx amount)
-    (inst sar result :cl)
-    (inst and result (lognot fixnum-tag-mask))))
+    (with-shift-operands
+     (move rcx amount)
+     (inst sar result :cl)
+     (inst and result (lognot fixnum-tag-mask)))))
+) ; end MACROLET
 
 (in-package "SB-C")
 
@@ -1311,7 +1275,7 @@ constant shift greater than word length")))
 
 ;;; This works for tagged or untagged values, but the vop optimizer
 ;;; has to pre-adjust Y if tagged.
-(define-vop (logtest-instance-ref fast-conditional)
+(define-vop (logtest-memref fast-conditional)
   (:args (x :scs (descriptor-reg)))
   (:arg-types * (:constant integer))
   (:info y)
@@ -1325,7 +1289,7 @@ constant shift greater than word length")))
                      (dotimes (i ,(/ 64 bits))
                        (when (zerop (logandc2 y mask))
                          (inst test ,size (ea disp x) (ash y (* i ,(- bits))))
-                         (return-from logtest-instance-ref))
+                         (return-from logtest-memref))
                        (setq mask (ash mask ,bits))
                        (incf disp ,(/ bits 8))))))
        (try :byte   8)
@@ -1345,32 +1309,42 @@ constant shift greater than word length")))
 (defoptimizer (sb-c::vop-optimize fast-logtest-c/fixnum) (vop)
   (unless (tn-ref-memory-access (sb-c::vop-args vop))
     (let ((prev (sb-c::previous-vop-is
-                 vop '(raw-instance-ref-c/signed-word
-                       raw-instance-ref-c/word
+                 ;; TODO: missing data-vector-ref/simple-vector-c
+                 vop '(%raw-instance-ref/signed-word
+                       %raw-instance-ref/word
                        instance-index-ref-c
                        ;; This would only happen in unsafe code most likely,
                        ;; because CAR,CDR, etc would need to cast/assert the loaded
                        ;; value to fixnum. However, in practive it doesn't work anyway
                        ;; because there seems to be a spurious MOVE vop in between
                        ;; the SLOT and the FAST-LOGTEST-C/FIXNUM.
-                       slot))))
+                       ;; But ironically enough we _did_ seem to want to optimize
+                       ;; an expression in GENERATE-CODE along the lines of:
+                       ;;  (if (oddp (length (ir2-component-constants ir2-component))) ...)
+                       ;; which, if #+ubsan, would not be admissible
+                       ;; because VECTOR-LENGTH is not in a slot.
+                       ;; Obviously a GENERATE-CODE bug is the mother of all bugs.
+                       #-ubsan slot))))
       (aver (not (sb-c::vop-results vop))) ; is a :CONDITIONAL vop
       (when (and prev (eq (vop-block prev) (vop-block vop)))
-        (let ((arg (sb-c::vop-args vop)))
+        ;; If the memory ref produces a fixnum, the constant should be a fixnum
+        ;; so that we don't see cases such as in lp#1939897.
+        ;; In the absence of vop combining, MOVE-TO-WORD would be inserted
+        ;; between INSTANCE-INDEX-REF and LOGTEST, but it did not happen yet.
+        (let* ((arg (sb-c::vop-args vop))
+               (info-arg (car (vop-codegen-info vop)))
+               (constant (if (member (vop-name prev) '(instance-index-ref-c slot))
+                             (ash info-arg n-fixnum-tag-bits)
+                             info-arg)))
           (when (and (eq (tn-ref-tn (sb-c::vop-results prev)) (tn-ref-tn arg))
-                     (sb-c::very-temporary-p (tn-ref-tn arg)))
-            (binding* ((mem-op (cons (vop-name prev) (vop-codegen-info prev)))
-                       (disp (valid-memref-byte-disp mem-op) :exit-if-null)
-                       (arg-ref
-                        (sb-c::reference-tn (tn-ref-tn (sb-c::vop-args prev)) nil))
-                       (codegen-info
-                        (if (eq (vop-name vop) 'fast-logtest-c/fixnum)
-                            (list (fixnumize (car (vop-codegen-info vop))))
-                            (vop-codegen-info vop)))
+                     (sb-c::very-temporary-p (tn-ref-tn arg))
+                     (typep constant '(or word signed-word)))
+            (binding* ((disp (valid-memref-byte-disp prev) :exit-if-null)
+                       (arg-ref (sb-c::reference-tn (tn-ref-tn (sb-c::vop-args prev)) nil))
                        (new (sb-c::emit-and-insert-vop
                              (sb-c::vop-node vop) (vop-block vop)
-                             (template-or-lose 'logtest-instance-ref)
-                             arg-ref nil prev codegen-info)))
+                             (template-or-lose 'logtest-memref)
+                             arg-ref nil prev (list constant))))
               (setf (tn-ref-memory-access arg-ref) `(:read . ,disp))
               (sb-c::delete-vop prev)
               (sb-c::delete-vop vop)
@@ -1379,6 +1353,12 @@ constant shift greater than word length")))
       #'vop-optimize-fast-logtest-c/fixnum-optimizer)
 (setf (sb-c::vop-info-optimizer (template-or-lose 'fast-logtest-c/unsigned))
       #'vop-optimize-fast-logtest-c/fixnum-optimizer)
+
+;;; TODO: The TEST instruction preceding this JEQ is entirely superfluous
+;;; and can be removed with a vop optimizer:
+;;; E1:       25FE0F0000       AND EAX, 4094
+;;; E6:       4885C0           TEST RAX, RAX
+;;; E9:       74C9             JEQ L2
 
 ;;; %LOGBITP has the same argument order as ordinary LOGBITP which is * backwards *
 ;;; relative to every other architecture.
@@ -1420,6 +1400,17 @@ constant shift greater than word length")))
                         temp-reg-tn))))
       (inst bt word bit))))
 
+(defun change-tested-flag (vop from-flag to-flag)
+  (ecase (vop-name vop)
+    (branch-if
+     (let ((info (vop-codegen-info vop)))
+       (aver (equal (third info) (list from-flag)))
+       (setf (vop-codegen-info vop) (list (car info) (cadr info) (list to-flag)))))
+    (compute-from-flags
+     (let ((info (vop-codegen-info vop)))
+       (aver (equal (first info) (list from-flag)))
+       (setf (vop-codegen-info vop) (list (list to-flag)))))))
+
 (define-vop (%logbitp/c fast-safe-arith-op)
   (:translate %logbitp)
   (:conditional :c)
@@ -1427,12 +1418,83 @@ constant shift greater than word length")))
   (:args (int :scs (signed-reg signed-stack unsigned-reg unsigned-stack
                     any-reg control-stack) :load-if nil))
   (:arg-types (:constant (mod 64)) untagged-num)
+  (:vop-var vop)
   (:generator 1
     (when (sc-is int any-reg control-stack)
-      ;; Adjust the index up by something.
+      ;; Acount for fixnum tag bit.
       ;; Reading beyond the sign bit is the same as reading the sign bit.
       (setf bit (min (1- n-word-bits) (+ bit n-fixnum-tag-bits))))
+    (let ((next (vop-next vop)))
+      (when (member (vop-name next) '(branch-if compute-from-flags))
+        (cond ((not (gpr-tn-p int)) ; is in memory, issue it as a TEST
+               ;; To test bit index 8: add 1 to the disp, and use immediate val 0x01
+               ;;             index 9: add 1 to the disp, and use immediate val 0x02
+               ;;             etc
+               ;; I'm not crazy about this approach, because we lose the connection
+               ;; to which TN we're reading.  There needs to be a way to emit the instruction
+               ;; as byte-within-stack-tn so that it is understood by other optimizations.
+               (binding* ((frame-disp  (frame-byte-offset (tn-offset int)))
+                          ((extra-disp bit-shift) (floor bit 8)))
+                 (inst test :byte (ea (+ frame-disp extra-disp) rbp-tn) (ash 1 bit-shift)))
+               (change-tested-flag next :c :ne)
+               (return-from %logbitp/c))
+              ((= bit 31) ; test the sign bit of the 32-bit register
+               (inst test :dword int int)
+               (change-tested-flag next :c :s)
+               (return-from %logbitp/c))
+              ((< bit 32)
+               (inst test (if (< bit 8) :byte :dword) int (ash 1 bit))
+               (change-tested-flag next :c :ne)
+               (return-from %logbitp/c)))))
     (inst bt (if (<= bit 31) :dword :qword) int bit)))
+
+(define-vop (%logbitp-memref fast-conditional)
+  (:args (x :scs (descriptor-reg)))
+  (:arg-types (:constant (mod 64)) *)
+  (:info bit)
+  (:args-var arg-ref)
+  (:vop-var vop)
+  (:conditional :ne)
+  (:generator 1
+    ;; This resembles the above case for TN being not in a GPR
+    (binding* ((slot-disp (cdr (tn-ref-memory-access arg-ref)))
+               ((extra-disp bit-shift) (floor bit 8)))
+      (inst test :byte (ea (+ slot-disp extra-disp) x) (ash 1 bit-shift)))))
+
+(defoptimizer (sb-c::vop-optimize %logbitp/c) (vop)
+  (unless (tn-ref-memory-access (sb-c::vop-args vop))
+    (let ((prev (sb-c::previous-vop-is
+                 ;; TODO: missing data-vector-ref/simple-vector-c and SLOT
+                 vop '(%raw-instance-ref/signed-word
+                       %raw-instance-ref/word
+                       instance-index-ref-c))))
+      (aver (not (sb-c::vop-results vop))) ; is a :CONDITIONAL vop
+      (when (and prev (eq (vop-block prev) (vop-block vop)))
+        (let ((arg (sb-c::vop-args vop)))
+          (when (and (eq (tn-ref-tn (sb-c::vop-results prev)) (tn-ref-tn arg))
+                     (sb-c::very-temporary-p (tn-ref-tn arg))
+                     (vop-next vop)
+                     ;; Ensure we can change the tested flag from CF to ZF
+                     (member (vop-name (vop-next vop))
+                             '(branch-if compute-from-flags)))
+            (binding* ((disp (valid-memref-byte-disp prev) :exit-if-null)
+                       (arg-ref
+                        (sb-c::reference-tn (tn-ref-tn (sb-c::vop-args prev)) nil))
+                       (bit (car (vop-codegen-info vop)))
+                       (info
+                        (if (sb-c::previous-vop-is vop 'instance-index-ref-c) ; tagged slot
+                            ;; Reading beyond the sign bit is the same as reading the sign bit.
+                            (min (+ bit n-fixnum-tag-bits) (1- n-word-bits))
+                            bit))
+                       (new (sb-c::emit-and-insert-vop
+                             (sb-c::vop-node vop) (vop-block vop)
+                             (template-or-lose '%logbitp-memref)
+                             arg-ref nil prev (list info))))
+              (setf (tn-ref-memory-access arg-ref) `(:read . ,disp))
+              (change-tested-flag (vop-next vop) :c :ne)
+              (sb-c::delete-vop prev)
+              (sb-c::delete-vop vop)
+              new)))))))
 
 (defun emit-optimized-cmp (x y)
   (if (and (gpr-tn-p x) (eql y 0))
@@ -1465,6 +1527,11 @@ constant shift greater than word length")))
   (define-conditional-vop < :l :b :ge :ae)
   (define-conditional-vop > :g :a :le :be))
 
+(declaim (inline load-bignum-length))
+(defun load-bignum-length (input output)
+  (loadw output input 0 other-pointer-lowtag)
+  (inst shr output n-widetag-bits))
+
 (define-vop (fast-if->-zero)
   (:args (x :scs (descriptor-reg)))
   (:arg-types integer (:constant (integer 0 0)))
@@ -1485,8 +1552,7 @@ constant shift greater than word length")))
       (inst jmp (if not-p :le :g) target)
       (inst jmp DONE))
     BIGNUM
-    (loadw temp x 0 other-pointer-lowtag)
-    (inst shr temp n-widetag-bits)
+    (load-bignum-length x temp)
     (inst cmp :qword
           (ea (- (+ (* bignum-digits-offset n-word-bytes))
                  other-pointer-lowtag
@@ -1512,8 +1578,7 @@ constant shift greater than word length")))
       (move temp x)
       (generate-fixnum-test temp)
       (inst jmp :z TEST))
-    (loadw temp x 0 other-pointer-lowtag)
-    (inst shr temp n-widetag-bits)
+    (load-bignum-length x temp)
     (inst mov temp (ea (- (* bignum-digits-offset n-word-bytes)
                           other-pointer-lowtag
                           n-word-bytes)
@@ -1597,7 +1662,7 @@ constant shift greater than word length")))
                 (:result-types unsigned-num)
                 (:generator 1
                  (move r num)
-                 (unless (location= rcx amount) (inst mov :dword rcx amount))
+                 (move rcx amount :dword)
                  (inst ,operation r :cl)))))
   (define shift-towards-start shr)
   (define shift-towards-end   shl))
@@ -1837,13 +1902,17 @@ constant shift greater than word length")))
   (:translate sb-bignum:%bignum-set-length)
   (:policy :fast-safe))
 
+#-bignum-assertions ; %BIGNUM-ref is an inline function if compiling with assertions
 (define-full-reffer bignum-ref * bignum-digits-offset other-pointer-lowtag
   (unsigned-reg) unsigned-num sb-bignum:%bignum-ref)
-(define-full-reffer+offset bignum-ref-with-offset * bignum-digits-offset
+#-bignum-assertions ; does not get called if compiling with assertions
+(define-full-reffer+addend bignum-ref-with-offset * bignum-digits-offset
   other-pointer-lowtag (unsigned-reg) unsigned-num
   sb-bignum:%bignum-ref-with-offset)
 (define-full-setter bignum-set * bignum-digits-offset other-pointer-lowtag
-  (unsigned-reg) unsigned-num sb-bignum:%bignum-set)
+  (unsigned-reg) unsigned-num
+  #+bignum-assertions sb-bignum:%%bignum-set
+  #-bignum-assertions sb-bignum:%bignum-set)
 
 (define-vop (digit-0-or-plus)
   (:translate sb-bignum:%digit-0-or-plusp)
@@ -1876,7 +1945,7 @@ constant shift greater than word length")))
     (inst neg temp) ; Set the carry flag to 0 if c=0 else to 1
     (inst adc result b)
     (unless (eq (tn-kind carry) :unused)
-     (inst set carry :c)
+     (inst set :c carry)
      (inst and :dword carry 1))))
 
 ;;; Note: the borrow is 1 for no borrow and 0 for a borrow, the opposite

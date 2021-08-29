@@ -26,7 +26,14 @@
                                   0 :type ,(if (= i 64) 'sb-ext:word t))))))
   (defbiggy))
 
-(assert (typep (sb-kernel:layout-bitmap
+(macrolet ((def-100slots ()
+             `(defstruct 100slots
+               ,@(loop for i from 0 repeat 100
+                    collect `(,(sb-int:symbolicate "SLOT" (write-to-string i))
+                              ,(format nil "This is ~D" i))))))
+  (def-100slots))
+
+(assert (typep (sb-kernel:wrapper-bitmap
                 (sb-kernel::find-layout 'biggy)) 'bignum))
 
 (defvar *x* nil)
@@ -53,55 +60,28 @@
 ;; Run it twice to make sure things really worked.
 
 (let ((*y* (make-biggy))
-      (*x* (sb-kernel:layout-bitmap
+      (*x* (sb-kernel:wrapper-bitmap
             (sb-kernel::find-layout 'biggy))))
   (sb-ext:gc :gen 1))
 (princ 'did-pass-1) (terpri)
 (force-output)
 
 (let ((*y* (make-biggy))
-      (*x* (sb-kernel:layout-bitmap
+      (*x* (sb-kernel:wrapper-bitmap
             (sb-kernel::find-layout 'biggy))))
   (sb-ext:gc :gen 1))
 (princ 'did-pass-2) (terpri)
 (force-output)
 
-;; Test the C bitmap bit extractor.
-(defun c-bitmap-logbitp (index layout)
-  (eql (sb-sys:with-pinned-objects (layout)
-         (alien-funcall (extern-alien "test_bitmap_logbitp"
-                                      (function int int unsigned))
-                        index
-                        (logandc2 (sb-kernel:get-lisp-obj-address layout)
-                                  sb-vm:lowtag-mask)))
-       1))
+(defun collect-slot-values (struct &aux result)
+  (sb-kernel:do-instance-tagged-slot (i struct)
+    (push (sb-kernel:%instance-ref struct i) result))
+  (nreverse result))
 
-(with-test (:name :bitmap-logbitp)
-  ;; walking 1 bit
-  (dotimes (i 256)
-    (let* ((num (ash 1 i))
-           (layout (sb-kernel:make-layout 0 (sb-kernel:find-classoid 'structure-object)
-                                          :bitmap num)))
-      (dotimes (j 257)
-        (assert (eq (c-bitmap-logbitp j layout) (logbitp j num))))))
-  ;; walking 0 bit
-  (dotimes (i 256)
-    (let* ((num (lognot (ash 1 i)))
-           (layout (sb-kernel:make-layout 0 (sb-kernel:find-classoid 'structure-object)
-                                          :bitmap num)))
-      (dotimes (j 257)
-        (assert (eq (c-bitmap-logbitp j layout) (logbitp j num))))))
-  ;; random bits
-  (let ((max (ash 1 768)))
-    (dotimes (i 100)
-      (let* ((num (- (random max) (floor max 20))) ; test both + and -
-             (layout
-              (sb-kernel:make-layout 0 (sb-kernel:find-classoid 'structure-object)
-                                     :bitmap num)))
-        (dotimes (j (if (typep num 'bignum)
-                        (* (sb-bignum:%bignum-length num) sb-vm:n-word-bits)
-                        sb-vm:n-word-bits))
-          (assert (eq (c-bitmap-logbitp j layout) (logbitp j num))))))))
+(with-test (:name :sign-extended-bitmap)
+  ;; could have 100 or 101 physical payload slots depending on
+  ;; presence of a padding word
+  (assert (>= (length (collect-slot-values (make-100slots))) 100)))
 
 ;; for testing the comparator
 (defstruct foo1
@@ -119,7 +99,7 @@
   (c 'cee))                                      ;    13       9
 
 (defvar *afoo* (make-foo1))
-(assert (= (sb-kernel:layout-length (sb-kernel:layout-of *afoo*))
+(assert (= (sb-kernel:wrapper-length (sb-kernel:wrapper-of *afoo*))
            (sb-kernel:%instance-length *afoo*)))
 (with-test (:name :tagged-slot-iterator-macro)
   ;; on 32-bit, the logical length is 14, which means 15 words (with header),

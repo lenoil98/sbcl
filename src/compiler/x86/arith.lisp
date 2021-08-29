@@ -1588,13 +1588,17 @@ constant shift greater than word length")))
   (:translate sb-bignum:%bignum-set-length)
   (:policy :fast-safe))
 
+#-bignum-assertions ; %BIGNUM-ref is an inline function if compiling with assertions
 (define-full-reffer bignum-ref * bignum-digits-offset other-pointer-lowtag
   (unsigned-reg) unsigned-num sb-bignum:%bignum-ref)
-(define-full-reffer+offset bignum-ref-with-offset *
+#-bignum-assertions ; does not get called if compiling with assertions
+(define-full-reffer+addend bignum-ref-with-offset *
   bignum-digits-offset other-pointer-lowtag
   (unsigned-reg) unsigned-num sb-bignum:%bignum-ref-with-offset)
 (define-full-setter bignum-set * bignum-digits-offset other-pointer-lowtag
-  (unsigned-reg) unsigned-num sb-bignum:%bignum-set)
+  (unsigned-reg) unsigned-num
+  #+bignum-assertions sb-bignum:%%bignum-set
+  #-bignum-assertions sb-bignum:%bignum-set)
 
 (define-vop (digit-0-or-plus)
   (:translate sb-bignum:%digit-0-or-plusp)
@@ -1626,7 +1630,7 @@ constant shift greater than word length")))
     (move temp c)
     (inst neg temp) ; Set the carry flag to 0 if c=0 else to 1
     (inst adc result b)
-    (inst set carry-temp :c)
+    (inst set :c carry-temp)
     (inst and carry-temp 1)
     (move carry carry-temp)))
 

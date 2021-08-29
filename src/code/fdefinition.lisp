@@ -16,7 +16,7 @@
 
 ;; This variable properly belongs in 'target-hash-table',
 ;; but it's compiled after this file is.
-(!define-load-time-global *user-hash-table-tests* nil)
+(define-load-time-global *user-hash-table-tests* nil)
 
 
 ;;;; fdefinition (fdefn) objects
@@ -131,7 +131,7 @@
   ;; if we already know that FUNCTION is a function.
   ;; It will signal a type error if not, which is the right thing to do anyway.
   ;; (this isn't quite a true predicate)
-  (and (= (fun-subtype function) sb-vm:closure-widetag)
+  (and (= (%fun-pointer-widetag function) sb-vm:closure-widetag)
        ;; This test needs to reference the name of any macro, but in order for
        ;; cold-init to work, the macro has to be defined first.
        ;; So pick DX-LET, as it's in primordial-extensions.
@@ -223,8 +223,11 @@
     (symbol (%coerce-name-to-fun callable symbol-fdefn t))))
 
 ;;; Behaves just like %COERCE-CALLABLE-TO-FUN but has an ir2-convert optimizer.
-(%defun '%coerce-callable-for-call
-        #'%coerce-callable-to-fun)
+(defun %coerce-callable-for-call (callable)
+  (declare (explicit-check))
+  (etypecase callable
+    (function callable)
+    (symbol (%coerce-name-to-fun callable symbol-fdefn t))))
 
 
 ;;;; definition encapsulation
@@ -398,13 +401,14 @@
     ;; with this.
     (when (and (symbolp name) (fboundp name))
       (let ((old (symbol-function name)))
-        (dolist (spec *user-hash-table-tests*)
-          (cond ((eq old (second spec))
-                 ;; test-function
-                 (setf (second spec) new-value))
-                ((eq old (third spec))
-                 ;; hash-function
-                 (setf (third spec) new-value))))))
+        (when (boundp '*setf-fdefinition-hook*)
+          (dolist (spec *user-hash-table-tests*)
+            (cond ((eq old (second spec))
+                   ;; test-function
+                   (setf (second spec) new-value))
+                  ((eq old (third spec))
+                   ;; hash-function
+                   (setf (third spec) new-value)))))))
 
     ;; FIXME: This is a good hook to have, but we should probably
     ;; reserve it for users.
@@ -435,8 +439,7 @@
 (defun fboundp (name)
   "Return true if name has a global function definition."
   (declare (explicit-check))
-  (let ((fdefn (find-fdefn name)))
-    (and fdefn (fdefn-fun fdefn) t)))
+  (awhen (find-fdefn name) (fdefn-fun it)))
 
 (defun fmakunbound (name)
   "Make NAME have no global function definition."

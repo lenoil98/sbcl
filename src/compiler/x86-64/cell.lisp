@@ -13,13 +13,22 @@
 
 ;;;; data object ref/set stuff
 
+(defconstant vector-len-op-size #+ubsan :dword #-ubsan :qword)
+(defmacro vector-len-ea (v &optional (lowtag sb-vm:other-pointer-lowtag))
+  #+ubsan `(ea (- 4 ,lowtag) ,v) ; high 4 bytes of header
+  #-ubsan `(ea (- (ash vector-length-slot word-shift) ,lowtag) ,v))
+
 (define-vop (slot)
   (:args (object :scs (descriptor-reg)))
   (:info name offset lowtag)
-  (:ignore name)
+  #-ubsan (:ignore name)
   (:results (result :scs (descriptor-reg any-reg)))
   (:generator 1
-   (loadw result object offset lowtag)))
+   (cond #+ubsan
+         ((member name '(sb-c::vector-length %array-fill-pointer)) ; half-sized slot
+          (inst mov :dword result (vector-len-ea object)))
+         (t
+          (loadw result object offset lowtag)))))
 
 ;; This vop is selected by name from vm-ir2tran for converting any
 ;; setter or setf'er that is defined by 'objdef'
@@ -54,9 +63,16 @@
                   (inst push object)))
            (invoke-asm-routine 'call 'code-header-set vop))
           ((equal name '(setf %funcallable-instance-fun))
-           (gen-cell-set (object-slot-ea object offset lowtag) value nil vop t))
+           (pseudo-atomic ()
+             (inst push object)
+             (invoke-asm-routine 'call 'touch-gc-card vop)
+             (gen-cell-set (object-slot-ea object offset lowtag) value)))
+          #+ubsan
+          ((equal name '(setf %array-fill-pointer)) ; half-sized slot
+           (inst mov :dword (vector-len-ea object)
+                 (or (encode-value-if-immediate value) value)))
           (t
-           (gen-cell-set (object-slot-ea object offset lowtag) value nil)))))
+           (gen-cell-set (object-slot-ea object offset lowtag) value)))))
 
 ;; INIT-SLOT has to know about the :COMPACT-INSTANCE-HEADER feature.
 (define-vop (init-slot set-slot)
@@ -70,6 +86,11 @@
                  (if (sc-is value immediate)
                      (make-fixup (tn-value value) :layout)
                      value)))
+          #+ubsan
+          ((and (eq name 'make-array) (eql offset sb-vm:array-fill-pointer-slot))
+           (inst mov :qword (object-slot-ea object 1 lowtag) nil-value)
+           (inst mov :dword (vector-len-ea object)
+                 (or (encode-value-if-immediate value) value)))
           ((sc-is value immediate)
            (move-immediate (ea (- (* offset n-word-bytes) lowtag) object)
                            (encode-value-if-immediate value)
@@ -98,8 +119,7 @@
   (:args)
   (:results (result :scs (descriptor-reg any-reg)))
   (:generator 1
-    (inst mov result (logior (+ sb-vm:static-space-start #x100)
-                             unbound-marker-widetag))))
+    (inst mov result (unbound-marker-bits))))
 
 (define-vop (%set-symbol-global-value)
   (:args (object :scs (descriptor-reg immediate))
@@ -111,7 +131,7 @@
                         (t
                          (object-slot-ea object symbol-value-slot
                                                   other-pointer-lowtag)))
-                  value nil)))
+                  value)))
 
 (define-vop (fast-symbol-global-value)
   (:args (object :scs (descriptor-reg immediate)))
@@ -230,7 +250,7 @@
         ;; a register, so we can't conditionally move into the TLS and
         ;; conditionally move in the opposite flag sense to the symbol.
         (compute-virtual-symbol)
-        (gen-cell-set (symbol-value-slot-ea cell) value nil)))
+        (gen-cell-set (symbol-value-slot-ea cell) value)))
 
     ;; This code is tested by 'codegen.impure.lisp'
     (defun emit-symeval (value symbol symbol-reg check-boundp vop)
@@ -326,6 +346,11 @@
       (:variant nil)
       (:variant-cost 5))
 
+    ;; TODO: this vop doesn't see that when (INFO :VARIABLE :KIND) = :GLOBAL
+    ;; there is no need to check the TLS. Probably this is better handled in IR1
+    ;; rather than IR2. It would need a new GLOBAL-BOUNDP function.
+    ;; On the other hand, how many users know that you can declaim
+    ;; a variable GLOBAL without using DEFGLOBAL ?
     (define-vop (boundp)
       (:translate boundp)
       (:policy :fast-safe)
@@ -742,99 +767,88 @@
 (define-full-compare-and-swap %raw-instance-cas/word instance
   instance-slots-offset instance-pointer-lowtag
   (unsigned-reg) unsigned-num %raw-instance-cas/word)
+(define-vop ()
+  (:translate %raw-instance-xchg/word)
+  (:policy :fast-safe)
+  (:args (instance :scs (descriptor-reg))
+         (newval :scs (unsigned-reg immediate constant) :target result))
+  (:info index)
+  (:arg-types * (:constant integer) unsigned-num)
+  (:results (result :scs (unsigned-reg)))
+  (:result-types unsigned-num)
+  (:generator 3
+    ;; Use RESULT as the source of the exchange, unless doing so
+    ;; would clobber NEWVAL
+    (let ((source (if (location= result instance) temp-reg-tn result)))
+      (if (sc-is newval immediate)
+          (inst mov source (constantize (tn-value newval)))
+          (move source newval))
+      (inst xchg (ea (- (ash (+ instance-slots-offset index) word-shift)
+                        instance-pointer-lowtag) instance)
+            source)
+      (unless (eq source result)
+        (move result temp-reg-tn)))))
 
 ;;;; code object frobbing
 
 (define-full-reffer code-header-ref * 0 other-pointer-lowtag
   (any-reg descriptor-reg) * code-header-ref)
 
-;; CODE-HEADER-SET of a constant index is seldom used, so we specifically
-;; ask not to get it defined. (It's not impossible to use, it's just not
-;; helpful to have - either you want to access CODE-FIXUPS or CODE-DEBUG-INFO,
-;; which do things their own way, or you want a variable index.)
-(define-full-setter (code-header-set :no-constant-variant)
-  * 0 other-pointer-lowtag
-  (any-reg descriptor-reg) * code-header-set)
+(define-vop ()
+  (:translate code-header-set)
+  (:policy :fast-safe)
+  (:args (object :scs (descriptor-reg))
+         (index :scs (unsigned-reg))
+         (value :scs (any-reg descriptor-reg)))
+   (:arg-types * unsigned-num *)
+   (:vop-var vop)
+   (:generator 10
+     (inst push value)
+     (inst push index)
+     (inst push object)
+     (invoke-asm-routine 'call 'code-header-set vop)))
 
 ;;;; raw instance slot accessors
 
 (flet ((instance-slot-ea (object index)
-         (etypecase index
-           (integer
-              (ea (+ (* (+ instance-slots-offset index) n-word-bytes)
-                     (- instance-pointer-lowtag))
-                  object))
-           (tn
-              (ea (+ (* instance-slots-offset n-word-bytes)
-                     (- instance-pointer-lowtag))
-                  object index (ash 1 (- word-shift n-fixnum-tag-bits)))))))
+         (let ((constant-index
+                (if (integerp index) index
+                    (if (sc-is index immediate) (tn-value index)))))
+           (if constant-index
+               (ea (+ (* (+ instance-slots-offset constant-index) n-word-bytes)
+                      (- instance-pointer-lowtag))
+                   object)
+               (ea (+ (* instance-slots-offset n-word-bytes)
+                      (- instance-pointer-lowtag))
+                   object index (ash 1 (- word-shift n-fixnum-tag-bits)))))))
   (macrolet
-      ((def (suffix result-sc result-type inst &optional (inst/c (list 'quote inst)))
+      ((def (suffix result-sc result-type inst)
          `(progn
-            (define-vop (,(symbolicate "RAW-INSTANCE-REF/" suffix))
+            (define-vop ()
               (:translate ,(symbolicate "%RAW-INSTANCE-REF/" suffix))
               (:policy :fast-safe)
-              (:args (object :scs (descriptor-reg)) (index :scs (any-reg)))
+              (:args (object :scs (descriptor-reg)) (index :scs (any-reg immediate)))
               (:arg-types * tagged-num)
               (:results (value :scs (,result-sc)))
               (:result-types ,result-type)
-              (:generator 5
-                (inst ,inst value (instance-slot-ea object index))))
-            (define-vop (,(symbolicate "RAW-INSTANCE-REF-C/" suffix))
-              (:translate ,(symbolicate "%RAW-INSTANCE-REF/" suffix))
-              (:policy :fast-safe)
-              (:args (object :scs (descriptor-reg)))
-              ;; Why are we pedantic about the index constraint here
-              ;; if we're not equally so in the init vop?
-              (:arg-types * (:constant (load/store-index #.n-word-bytes
-                                                         #.instance-pointer-lowtag
-                                                         #.instance-slots-offset)))
-              (:info index)
-              (:results (value :scs (,result-sc)))
-              (:result-types ,result-type)
-              (:generator 4
-                (inst* ,inst/c value (instance-slot-ea object index))))
-            (define-vop (,(symbolicate "RAW-INSTANCE-SET/" suffix))
+              (:generator 1 (inst ,inst value (instance-slot-ea object index))))
+            (define-vop ()
               (:translate ,(symbolicate "%RAW-INSTANCE-SET/" suffix))
               (:policy :fast-safe)
               (:args (object :scs (descriptor-reg))
-                     (index :scs (any-reg))
-                     (value :scs (,result-sc) :target result))
-              (:arg-types * tagged-num ,result-type)
-              (:results (result :scs (,result-sc)))
-              (:result-types ,result-type)
-              (:generator 5
-                (inst ,inst (instance-slot-ea object index) value)
-                (move result value)))
-            (define-vop (,(symbolicate "RAW-INSTANCE-SET-C/" suffix))
-              (:translate ,(symbolicate "%RAW-INSTANCE-SET/" suffix))
-              (:policy :fast-safe)
-              (:args (object :scs (descriptor-reg))
-                     (value :scs (,result-sc) :target result))
-              (:arg-types * (:constant (load/store-index #.n-word-bytes
-                                                         #.instance-pointer-lowtag
-                                                         #.instance-slots-offset))
-                          ,result-type)
-              (:info index)
-              (:results (result :scs (,result-sc)))
-              (:result-types ,result-type)
-              (:generator 4
-                (inst* ,inst/c (instance-slot-ea object index) value)
-                (move result value)))
-            (define-vop (,(symbolicate "RAW-INSTANCE-INIT/" suffix))
-              (:args (object :scs (descriptor-reg))
+                     (index :scs (any-reg immediate))
                      (value :scs (,result-sc)))
-              (:arg-types * ,result-type)
-              (:info index)
-              (:generator 4
-                (inst* ,inst/c (instance-slot-ea object index) value))))))
+              (:arg-types * tagged-num ,result-type)
+              (:generator 1 (inst ,inst (instance-slot-ea object index) value))))))
     (def word unsigned-reg unsigned-num mov)
     (def signed-word signed-reg signed-num mov)
     (def single single-reg single-float movss)
     (def double double-reg double-float movsd)
     (def complex-single complex-single-reg complex-single-float movq)
     (def complex-double complex-double-reg complex-double-float
-         movupd (if (oddp index) 'movapd 'movupd)))
+      ;; Todo: put back the choice of using APD or UPD.
+      ;; But was it even right for either +/- compact-instance-header?
+         movupd #| (if (oddp index) 'movapd 'movupd) |#))
 
   (define-vop (raw-instance-atomic-incf/word)
     (:translate %raw-instance-atomic-incf/word)

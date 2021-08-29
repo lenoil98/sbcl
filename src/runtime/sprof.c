@@ -6,6 +6,7 @@
 #include "gc-assert.h"
 #include "arch.h" // why is component_ptr_from_pc declared here???
 #include "gc-internal.h"
+#include "gc.h"
 #include "lispregs.h"
 #if !defined LISP_FEATURE_X86 && !defined LISP_FEATURE_X86_64
 #include "callframe.inc"
@@ -16,6 +17,7 @@
 #include <sanitizer/msan_interface.h>
 #endif
 
+#include <limits.h>
 #include <fcntl.h>
 #include <unistd.h>
 /* Basic approach:
@@ -283,7 +285,7 @@ gather_trace_from_context(struct thread* thread, os_context_t* context,
         }
     }
 #else
-    if (gc_managed_addr_p(pc) && component_ptr_from_pc((void*)pc)) {
+    if (gc_managed_heap_space_p(pc) && component_ptr_from_pc((void*)pc)) {
         // If the PC was in lisp code, then the frame register is probably correct,
         // and so it's probably the case that 'frame->saved_lra' is a tagged PC
         // in the caller. Unfortunately it is not 100% reliable in a signal handler,
@@ -471,7 +473,8 @@ static void diagnose_failure(struct thread* thread) {
     // but if multithreaded, each thread could allocate a buffer and grow it an
     // arbitrary number of times. The automatic disable tries to avoid an explosion
     // in memory consumption.
-    if (((struct sprof_data*)thread->sprof_data)->capacity == CAPACITY_MAX) {
+    struct sprof_data* data = (void*)thread->sprof_data;
+    if (data && data->capacity == CAPACITY_MAX) {
         // disable the profiler in this thread
         thread->state_word.sprof_enable = 0;
 #ifdef LISP_FEATURE_SB_THREAD

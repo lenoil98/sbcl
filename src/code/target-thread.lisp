@@ -732,6 +732,81 @@ returns NIL each time."
       (declare (dynamic-extent #'cas))
       (%%wait-for #'cas stop-sec stop-usec)))))
 
+#+mutex-benchmarks
+(symbol-macrolet ((val (mutex-state mutex)))
+  (export '(wait-for-mutex-algorithm-2
+            wait-for-mutex-algorithm-3
+            wait-for-mutex-2-partial-inline
+            wait-for-mutex-3-partial-inline))
+  (declaim (sb-ext:maybe-inline %wait-for-mutex-algorithm-2
+                                %wait-for-mutex-algorithm-3))
+  (sb-ext:define-load-time-global *grab-mutex-calls-performed* 0)
+  ;; Like futex-wait but without garbage having to do with re-invoking
+  ;; a wake on account of async unwind while releasing the mutex.
+  (declaim (inline fast-futex-wait))
+  (defun fast-futex-wait (word-addr oldval to-sec to-usec)
+    (with-alien ((%wait (function int unsigned
+                                  #+freebsd unsigned #-freebsd (unsigned 32)
+                                  long unsigned-long)
+                        :extern "futex_wait"))
+      (alien-funcall %wait word-addr oldval to-sec to-usec)))
+
+  (defun %wait-for-mutex-algorithm-2 (mutex)
+    (incf *grab-mutex-calls-performed*)
+    (let* ((mutex (sb-ext:truly-the mutex mutex))
+           (c (sb-ext:cas val 0 1))) ; available -> taken
+      (unless (= c 0) ; Got it right off the bat?
+        (loop
+          ;; Mark it as contested, and sleep, unless it is now in state 0.
+          (when (or (eql c 2) (/= 0 (sb-ext:cas val 1 2)))
+            (with-pinned-objects (mutex)
+              (fast-futex-wait (mutex-state-address mutex) 2 -1 0)))
+          ;; Try to get it, still marking it as contested.
+          (when (= 0 (setq c (sb-ext:cas val 0 2))) (return)))))) ; win
+  (defun %wait-for-mutex-algorithm-3 (mutex)
+    (incf *grab-mutex-calls-performed*)
+    (let* ((mutex (sb-ext:truly-the mutex mutex))
+           (c (sb-ext:cas val 0 1))) ; available -> taken
+      (unless (= c 0) ; Got it right off the bat?
+        (unless (= c 2)
+          (setq c (%raw-instance-xchg/word mutex (get-dsd-index mutex state) 2)))
+        (loop while (/= c 0)
+              do (with-pinned-objects (mutex)
+                   (fast-futex-wait (mutex-state-address mutex) 2 -1 0))
+                 (setq c (%raw-instance-xchg/word mutex (get-dsd-index mutex state) 2))))))
+
+  (defun wait-for-mutex-algorithm-2 (mutex)
+    (declare (inline %wait-for-mutex-algorithm-2))
+    (let ((mutex (sb-ext:truly-the mutex mutex)))
+      (%wait-for-mutex-algorithm-2 mutex)
+      (setf (mutex-%owner mutex) *current-thread*)))
+  ;; The improvement with algorithm 3 is fairly negligible.
+  ;; Code size is a little less. More improvement comes from doing the
+  ;; partial-inline algorithms which perform one CAS without a function call.
+  (defun wait-for-mutex-algorithm-3 (mutex)
+    (declare (inline %wait-for-mutex-algorithm-3))
+    (let ((mutex (sb-ext:truly-the mutex mutex)))
+      (%wait-for-mutex-algorithm-3 mutex)
+      (setf (mutex-%owner mutex) *current-thread*)))
+  (defmacro wait-for-mutex-2-partial-inline (mutex)
+    `(let ((m ,mutex))
+       (or (= (sb-ext:cas (mutex-state m) 0 1) 0) (%wait-for-mutex-algorithm-2 m))
+       (setf (mutex-%owner m) *current-thread*)))
+  (defmacro wait-for-mutex-3-partial-inline (mutex)
+    `(let ((m ,mutex))
+       (or (= (sb-ext:cas (mutex-state m) 0 1) 0) (%wait-for-mutex-algorithm-3 m))
+       (setf (mutex-%owner m) *current-thread*)))
+  ;; This is like RELEASE-MUTEX but without keyword arg parsing
+  ;; and all the different error modes.
+  (export 'fast-release-mutex)
+  (defun fast-release-mutex (mutex)
+    (let ((mutex (sb-ext:truly-the mutex mutex)))
+      (setf (mutex-%owner mutex) nil)
+      (unless (eql (sb-ext:atomic-decf (mutex-state mutex) 1) 1)
+        (setf (mutex-state mutex) 0)
+        (with-pinned-objects (mutex)
+          (futex-wake (mutex-state-address mutex) 1))))))
+
 #+sb-thread
 (defun %wait-for-mutex (mutex self timeout to-sec to-usec stop-sec stop-usec deadlinep)
   (declare (sb-ext:muffle-conditions sb-ext:compiler-note))
@@ -904,7 +979,7 @@ IF-NOT-OWNER is :FORCE)."
   #-sb-futex
   protected)
 
-(declaim (inline %condition-wait))
+(declaim (sb-ext:maybe-inline %condition-wait))
 (defun %condition-wait (queue mutex
                         timeout to-sec to-usec stop-sec stop-usec deadlinep)
   #-sb-thread
@@ -1019,7 +1094,6 @@ IF-NOT-OWNER is :FORCE)."
          ;; The only case we return normally without re-acquiring
          ;; the mutex is when there is a :TIMEOUT that runs out.
          (bug "%CONDITION-WAIT: invalid status on normal return: ~S" status))))))
-(declaim (notinline %condition-wait))
 
 (declaim (ftype (sfunction (waitqueue mutex &key (:timeout (or null (real 0)))) boolean) condition-wait))
 (defun condition-wait (queue mutex &key timeout)
@@ -1365,6 +1439,8 @@ on this semaphore, then N of them is woken up."
            body)))
 
 (sb-ext:define-load-time-global *sprof-data* nil)
+#+allocator-metrics
+(sb-ext:define-load-time-global *allocator-metrics* nil)
 
 #+sb-thread
 (progn
@@ -1384,6 +1460,11 @@ on this semaphore, then N of them is woken up."
       ;; That in turn caused a failure in GC because a fixnum is not a legal value
       ;; for the startup info when observed by GC.
       #+pauseless-threadstart (aver (not (memq thread *starting-threads*)))
+      ;; If collecting allocator metrics, transfer them to the global list
+      ;; so that we can summarize over exited threads.
+      #+allocator-metrics
+      (let ((metrics (cons (thread-name thread) (allocator-histogram))))
+        (sb-ext:atomic-push metrics *allocator-metrics*))
       ;; Stash the primitive thread SAP for reuse, but clobber the PRIMITIVE-THREAD
       ;; slot which makes ALIVE-P return NIL.
       ;; A minor TODO: can this lock acquire/release be moved to where we actually
@@ -2509,15 +2590,19 @@ mechanism for inter-thread communication."
             #+sb-thread (ash sb-vm::*free-tls-index* sb-vm:n-fixnum-tag-bits)
             #-sb-thread (ash thread-obj-len sb-vm:word-shift)
             by sb-vm:n-word-bytes
-            do (let ((thread-slot-name
-                       (if (< tlsindex (ash thread-obj-len sb-vm:word-shift))
+            do
+         (unless (<= sb-vm::thread-obj-size-histo-slot
+                     (ash tlsindex (- sb-vm:word-shift))
+                     (+ sb-vm::thread-obj-size-histo-slot (1- sb-vm:n-word-bits)))
+           (let ((thread-slot-name
+                  (if (< tlsindex (ash thread-obj-len sb-vm:word-shift))
                            (aref names (ash tlsindex (- sb-vm:word-shift))))))
                  (if (and thread-slot-name (neq thread-slot-name 'sb-vm::lisp-thread))
                      (format t " ~3d ~30a : #x~x~%" (ash tlsindex (- sb-vm:word-shift))
                              thread-slot-name (sap-ref-word sap tlsindex))
                      (let ((val (safely-read sap tlsindex)))
                        (unless (eq val :no-tls-value)
-                         (show tlsindex val))))))
+                         (show tlsindex val)))))))
       (let ((from (descriptor-sap sb-vm:*binding-stack-start*))
             (to (binding-stack-pointer-sap)))
         (format t "~%Binding stack: (depth ~d)~%"
@@ -2529,3 +2614,74 @@ mechanism for inter-thread communication."
                      #-sb-thread (sap-ref-lispobj from sb-vm:n-word-bytes)))
             (show sym val))
           (setq from (sap+ from (* sb-vm:binding-size sb-vm:n-word-bytes))))))))
+
+#+allocator-metrics
+(macrolet ((histogram-value (c-thread index)
+             `(sap-ref-word (int-sap ,c-thread)
+                            (ash (+ sb-vm::thread-obj-size-histo-slot ,index)
+                                 sb-vm:word-shift)))
+           (metric (c-thread slot)
+             `(sap-ref-word (int-sap ,c-thread)
+                            (ash ,slot sb-vm:word-shift))))
+(export '(print-allocator-histogram reset-allocator-histogram))
+(defun allocator-histogram (&optional (thread *current-thread*))
+  (if (eq thread :all)
+      (labels ((vector-sum (a b)
+                 (let ((result (make-array (max (length a) (length b))
+                                           :element-type 'fixnum)))
+                   (dotimes (i (length result) result)
+                     (setf (aref result i)
+                           (+ (if (< i (length a)) (aref a i) 0)
+                              (if (< i (length b)) (aref b i) 0))))))
+               (sum (a b)
+                 (cond ((null a) b)
+                       ((null b) a)
+                       (t (cons (vector-sum (car a) (car b))
+                                (mapcar #'+ (cdr a) (cdr b)))))))
+        (reduce #'sum
+                ;; what about the finalizer thread?
+                (mapcar 'allocator-histogram (list-all-threads))))
+      (with-deathlok (thread c-thread)
+        (unless (= c-thread 0)
+          (let ((a (make-array sb-vm:n-word-bits :element-type 'fixnum)))
+            (declare (notinline position)) ; style-warning for some reason
+            (dotimes (i sb-vm:n-word-bits)
+              (setf (aref a i) (histogram-value c-thread i)))
+            (list (subseq a sb-vm:n-lowtag-bits ; discard uninteresting entries
+                          (1+ (position 0 a :from-end t :test #'/=)))
+                  (metric c-thread sb-vm::thread-tot-bytes-alloc-boxed-slot)
+                  (metric c-thread sb-vm::thread-tot-bytes-alloc-unboxed-slot)
+                  (metric c-thread sb-vm::thread-slow-path-allocs-slot)
+                  (metric c-thread sb-vm::thread-et-allocator-mutex-acq-slot)
+                  (metric c-thread sb-vm::thread-et-find-freeish-page-slot)
+                  (metric c-thread sb-vm::thread-et-bzeroing-slot)))))))
+
+(defun reset-allocator-histogram (&optional (thread *current-thread*))
+  (with-deathlok (thread c-thread)
+    (unless (= c-thread 0)
+      (setf (metric c-thread sb-vm::thread-tot-bytes-alloc-boxed-slot) 0
+            (metric c-thread sb-vm::thread-tot-bytes-alloc-unboxed-slot) 0
+            (metric c-thread sb-vm::thread-slow-path-allocs-slot) 0)
+      (dotimes (i sb-vm:n-word-bits)
+        (setf (histogram-value c-thread i) 0)))))
+
+(defun print-allocator-histogram (&optional (thread *current-thread*))
+  (destructuring-bind (bins tot-bytes-boxed tot-bytes-unboxed n-slow-path lock find clear)
+      (allocator-histogram thread)
+    (let ((total-objects (reduce #'+ bins))
+          (size (* 4 sb-vm:n-word-bytes)) ; "<=" this size is the smallest bin
+          (cumulative 0))
+      (format t "~&       Size      Count    Cum%~%")
+      (dovector (count bins)
+        (incf cumulative count)
+        (format t "~& ~10@a : ~8d  ~6,2,2f~%"
+                (if (< size 1048576)
+                    (format nil "< ~d" size)
+                    (format nil "< 2^~d" (1- (integer-length size))))
+                count (/ cumulative total-objects))
+        (setq size (* size 2)))
+      (format t "Total: ~D+~D bytes, ~D objects, ~,2,2f% fast path~%"
+              tot-bytes-boxed tot-bytes-unboxed total-objects
+              (/ (- total-objects n-slow-path) total-objects))
+      (format t "Times (sec): lock=~,,-9f find=~,,-9f clear=~,,-9f~%"
+              lock find clear)))))

@@ -134,8 +134,8 @@
   ;; next GC.
   (hash-fun nil :type function :read-only t)
 
-  ;; The type of hash table this is. Only used for printing and as
-  ;; part of the exported interface.
+  ;; The type of hash table this is. Part of the exported interface,
+  ;; as well as needed for the MAKE-LOAD-FORM and PRINT-OBJECT methods.
   (test nil :type symbol :read-only t)
   ;; How much to grow the hash table by when it fills up. If an index,
   ;; then add that amount. If a floating point number, then multiply
@@ -180,14 +180,7 @@
   ;; List of values (i.e. the second half of the k/v pair) culled out during
   ;; GC, used only by the finalizer hash-table. This informs Lisp of the IDs
   ;; (small fixnums) of the finalizers that need to run.
-  (culled-values nil :type list)
-  ;; For detecting concurrent accesses.
-  #+sb-hash-table-debug
-  (signal-concurrent-access t :type (member nil t))
-  #+sb-hash-table-debug
-  (reading-thread nil)
-  #+sb-hash-table-debug
-  (writing-thread nil))
+  (culled-values nil :type list))
 
 (sb-xc:defmacro hash-table-lock (table)
   `(let ((ht ,table)) (or (hash-table-%lock ht) (install-hash-table-lock ht))))

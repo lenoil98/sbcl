@@ -90,19 +90,6 @@
 
 ;;; stream manipulation functions
 
-(defstruct (broadcast-stream (:include ansi-stream
-                                       (out #'broadcast-out)
-                                       (bout #'broadcast-bout)
-                                       (sout #'broadcast-sout)
-                                       (misc #'broadcast-misc))
-                             (:constructor %make-broadcast-stream
-                                           (streams))
-                             (:copier nil)
-                             (:predicate nil))
-  ;; a list of all the streams we broadcast to
-  (streams () :type list :read-only t))
-(declaim (freeze-type broadcast-stream))
-
 (defun maybe-resolve-synonym-stream (stream)
   (labels ((recur (stream)
              (if (synonym-stream-p stream)
@@ -137,7 +124,9 @@
 
 (defmethod open-stream-p ((stream ansi-stream))
   ;; CLHS 21.1.4 lets us not worry about synonym streams here.
-  (not (eq (ansi-stream-in stream) #'closed-flame)))
+  (let ((in (ansi-stream-in stream)))
+    (not (or (eq in (load-time-value #'closed-flame t))
+             (eq in (load-time-value #'closed-flame-saved t))))))
 
 (defmethod stream-element-type ((stream ansi-stream))
   (call-ansi-stream-misc stream :element-type))
@@ -403,8 +392,9 @@
               (values (eof-or-lose stream eof-error-p eof-value) t)
               (values string eof)))))
 
-;;; We proclaim them INLINE here, then proclaim them NOTINLINE later on,
-;;; so, except in this file, they are not inline by default, but they can be.
+;;; We proclaim them INLINE here, then proclaim them MAYBE-INLINE
+;;; later on, so, except in this file, they are not inline by default,
+;;; but they can be.
 (declaim (inline read-char unread-char read-byte))
 
 (declaim (inline ansi-stream-read-char))
@@ -562,44 +552,25 @@
   (declare (type ansi-stream stream)
            (type index numbytes start)
            (type (or (simple-array * (*)) system-area-pointer) buffer))
-  (let* ((in-buffer (ansi-stream-in-buffer stream))
-         (index (ansi-stream-in-index stream))
-         (num-buffered (- +ansi-stream-in-buffer-length+ index)))
-    (declare (fixnum index num-buffered))
-    (cond
-     ((not in-buffer)
-      (funcall (ansi-stream-n-bin stream)
-               stream
-               buffer
-               start
-               numbytes
-               eof-error-p))
-     ((<= numbytes num-buffered)
-      #+nil
-      (let ((copy-function (typecase buffer
-                             ((simple-array * (*)) #'ub8-bash-copy)
-                             (system-area-pointer #'copy-ub8-to-system-area))))
-        (funcall copy-function in-buffer index buffer start numbytes))
-      (%byte-blt in-buffer index
-                 buffer start (+ start numbytes))
-      (setf (ansi-stream-in-index stream) (+ index numbytes))
-      numbytes)
-     (t
-      (let ((end (+ start num-buffered)))
-        #+nil
-        (let ((copy-function (typecase buffer
-                             ((simple-array * (*)) #'ub8-bash-copy)
-                             (system-area-pointer #'copy-ub8-to-system-area))))
-          (funcall copy-function in-buffer index buffer start num-buffered))
-        (%byte-blt in-buffer index buffer start end)
-        (setf (ansi-stream-in-index stream) +ansi-stream-in-buffer-length+)
-        (+ (funcall (ansi-stream-n-bin stream)
-                    stream
-                    buffer
-                    end
-                    (- numbytes num-buffered)
-                    eof-error-p)
-           num-buffered))))))
+  (let ((in-buffer (ansi-stream-in-buffer stream)))
+    (unless in-buffer
+      (return-from ansi-stream-read-n-bytes
+        (funcall (ansi-stream-n-bin stream) stream buffer start numbytes eof-error-p)))
+    (let* ((index (ansi-stream-in-index stream))
+           (num-buffered (- +ansi-stream-in-buffer-length+ index)))
+      ;; These bytes are of course actual bytes, i.e. 8-bit octets
+      ;; and not variable-length bytes.
+      (cond ((<= numbytes num-buffered)
+             (%byte-blt in-buffer index buffer start (+ start numbytes))
+             (setf (ansi-stream-in-index stream) (+ index numbytes))
+             numbytes)
+            (t
+             (let ((end (+ start num-buffered)))
+               (%byte-blt in-buffer index buffer start end)
+               (setf (ansi-stream-in-index stream) +ansi-stream-in-buffer-length+)
+               (+ (funcall (ansi-stream-n-bin stream) stream buffer
+                           end (- numbytes num-buffered) eof-error-p)
+                  num-buffered)))))))
 
 ;;; the amount of space we leave at the start of the in-buffer for
 ;;; unreading
@@ -797,7 +768,7 @@
   integer)
 
 
-(declaim (notinline read-char unread-char read-byte)) ; too big
+(declaim (maybe-inline read-char unread-char read-byte)) ; too big
 
 ;;; This is called from ANSI-STREAM routines that encapsulate CLOS
 ;;; streams to handle the misc routines and dispatch to the
@@ -1342,14 +1313,15 @@
 ;;; of WITH-INPUT-FROM-STRING, and we lack a way to perform partial inline
 ;;; dx allocation of structures, this'll have to do.
 (defun %init-string-input-stream (stream string &optional (start 0) end)
-  (declare (string string))
-  (setf (%instance-layout (truly-the instance stream))
+  (declare (explicit-check string))
+  (setf (%instance-wrapper (truly-the instance stream))
         #.(find-layout 'string-input-stream))
   (macrolet ((initforms ()
-               `(setf
-                 ,@(mapcan (lambda (dsd)
-                             (list `(%instance-ref stream ,(dsd-index dsd))
-                                   (case (dsd-name dsd)
+               `(progn
+                 ,@(mapcar (lambda (dsd)
+                             ;; good thing we have no raw slots in stream structures
+                             `(%instance-set stream ,(dsd-index dsd)
+                                   ,(case (dsd-name dsd)
                                      ((index start) 'start)
                                      (limit 'end)
                                      (string 'simple-string)
@@ -1368,31 +1340,25 @@
                         (t
                          (setf (string-input-stream-index stream) (1+ index))
                          (char string index))))))
-  (flet ((base-char-in (stream eof-error-p eof-value)
-           (declare (optimize (sb-c::verify-arg-count 0)
-                              (sb-c::insert-array-bounds-checks 0)))
-           (char-in base-char))
-         (character-in (stream eof-error-p eof-value)
-           (declare (optimize (sb-c::verify-arg-count 0)
-                              (sb-c::insert-array-bounds-checks 0)))
-           (char-in character))
-         (nil-in (stream eof-error-p eof-value)
-           (if (>= (string-input-stream-index stream)
-                   (string-input-stream-limit stream))
-               (eof-or-lose stream eof-error-p eof-value)
-               (error "Attempt to read from stream with NIL element type"))))
-    (let ((input-routine
-            (typecase string
-              #+sb-unicode (sb-kernel::character-string #'character-in)
-              (base-string #'base-char-in)
-              (t #'nil-in))))
-      (with-array-data ((simple-string string :offset-var offset)
-                        (start start)
-                        (end end)
-                        :check-fill-pointer t)
-        (initforms)
-        (values (truly-the string-input-stream stream)
-                offset))))))
+    (flet ((base-char-in (stream eof-error-p eof-value)
+             (declare (optimize (sb-c::verify-arg-count 0)
+                                (sb-c::insert-array-bounds-checks 0)))
+             (char-in base-char))
+           (character-in (stream eof-error-p eof-value)
+             (declare (optimize (sb-c::verify-arg-count 0)
+                                (sb-c::insert-array-bounds-checks 0)))
+             (char-in character)))
+      (let ((input-routine
+             (etypecase string
+               (base-string #'base-char-in)
+               (string #'character-in))))
+        (with-array-data ((simple-string string :offset-var offset)
+                          (start start)
+                          (end end)
+                          :check-fill-pointer t)
+          (initforms)
+          (values (truly-the string-input-stream stream)
+                  offset))))))
 
 ;;; It's debatable whether we should try to convert
 ;;;  (let ((s (make-string-input-stream))) (declare (dynamic-extent s)) ...)
@@ -1415,11 +1381,12 @@
   (declare (optimize speed (sb-c::verify-arg-count 0)))
   (declare (string buffer)
            (ignorable wild-result-type)) ; if #-sb-unicode
-  (setf (%instance-layout (truly-the instance stream)) #.(find-layout 'string-output-stream))
+  (setf (%instance-wrapper (truly-the instance stream)) #.(find-layout 'string-output-stream))
   (macrolet ((initforms ()
-               `(setf ,@(mapcan (lambda (dsd)
-                                  (list `(%instance-ref stream ,(dsd-index dsd))
-                                        (case (dsd-name dsd)
+               `(progn
+                  ,@(mapcar (lambda (dsd)
+                              `(%instance-set stream ,(dsd-index dsd)
+                                       ,(case (dsd-name dsd)
                                           (sout '#'string-sout) ; global fun
                                           (misc '#'misc) ; local fun
                                           ((element-type unicode-p out sout-aux buffer)
@@ -1535,7 +1502,7 @@
                               nil))
 (defun %make-character-string-ostream ()
   (%init-string-output-stream (%allocate-string-ostream)
-                              (make-array 31 :element-type 'character) ; 2w + 128b
+                              (make-array 32 :element-type 'character) ; 2w + 128b
                               nil))
 
 (defun make-string-output-stream (&key (element-type 'character))
@@ -1913,12 +1880,12 @@ benefit of the function GET-OUTPUT-STREAM-STRING."
   (unless (and (stringp string)
                (array-has-fill-pointer-p string))
     (error "~S is not a string with a fill-pointer" string))
-  (setf (%instance-layout (truly-the instance stream))
+  (setf (%instance-wrapper (truly-the instance stream))
         #.(find-layout 'fill-pointer-output-stream))
   (macrolet ((initforms ()
-               `(setf ,@(mapcan (lambda (dsd)
-                                  (list `(%instance-ref stream ,(dsd-index dsd))
-                                        (case (dsd-name dsd)
+               `(progn ,@(mapcar (lambda (dsd)
+                                   `(%instance-set stream ,(dsd-index dsd)
+                                       ,(case (dsd-name dsd)
                                           (string 'string)
                                           (t (dsd-default dsd)))))
                                 (dd-slots
@@ -2327,7 +2294,7 @@ benefit of the function GET-OUTPUT-STREAM-STRING."
     :native (ansi-stream-read-sequence seq stream start end)
     :gray (stream-read-sequence stream seq start end)))
 
-(declaim (inline read-sequence/read-function))
+(declaim (maybe-inline read-sequence/read-function))
 (defun read-sequence/read-function (seq stream start %end
                                     stream-element-mode
                                     character-read-function binary-read-function)
@@ -2395,7 +2362,6 @@ benefit of the function GET-OUTPUT-STREAM-STRING."
                             data offset-start offset-end))))
         (t
          (read-generic-sequence (compute-read-function nil)))))))
-(declaim (notinline read-sequence/read-function))
 
 (defun ansi-stream-read-sequence (seq stream start %end)
   (declare (type sequence seq)
@@ -2475,7 +2441,7 @@ benefit of the function GET-OUTPUT-STREAM-STRING."
          (declare (type index i))
          (funcall ,write-function ,stream (aref ,seq i))))))
 
-(declaim (inline write-sequence/write-function))
+(declaim (maybe-inline write-sequence/write-function))
 (defun write-sequence/write-function (seq stream start %end
                                       stream-element-mode
                                       character-write-function
@@ -2538,7 +2504,6 @@ benefit of the function GET-OUTPUT-STREAM-STRING."
                   (buffer-output stream data offset-start offset-end)))))
         (sequence
          (write-generic-sequence (compute-write-function nil)))))))
-(declaim (notinline write-sequence/write-function))
 
 ;;; This takes any kind of stream, not just ansi streams, because of recursion.
 ;;; It's basically just the non-keyword-accepting entry for WRITE-SEQUENCE.

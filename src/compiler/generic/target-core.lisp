@@ -37,7 +37,7 @@
   (defun sb-vm::function-raw-address (name &aux (fun (fdefinition name)))
     (cond ((not (immobile-space-obj-p fun))
            (error "Can't statically link to ~S: code is movable" name))
-          ((neq (fun-subtype fun) sb-vm:simple-fun-widetag)
+          ((neq (%fun-pointer-widetag fun) sb-vm:simple-fun-widetag)
            (error "Can't statically link to ~S: non-simple function" name))
           (t
            (let ((addr (get-lisp-obj-address fun)))
@@ -93,7 +93,7 @@
                    (:code-object (get-lisp-obj-address code-obj))
                    #+sb-thread (:symbol-tls-index (ensure-symbol-tls-index sym))
                    (:layout (get-lisp-obj-address
-                             (if (symbolp sym) (find-layout sym) sym)))
+                             (wrapper-friend (if (symbolp sym) (find-layout sym) sym))))
                    (:layout-id (layout-id sym))
                    (:immobile-symbol (get-lisp-obj-address sym))
                    (:symbol-value (get-lisp-obj-address (symbol-global-value sym)))
@@ -135,7 +135,7 @@
              (setf (sap-ref-32 (int-sap (get-lisp-obj-address fun))
                                (- 4 sb-vm:fun-pointer-lowtag))
                    (truly-the (unsigned-byte 32)
-                     (get-lisp-obj-address #.(find-layout 'function))))))
+                     (get-lisp-obj-address (wrapper-friend #.(find-layout 'function)))))))
          ;; And finally, make the memory range executable
          #-(or x86 x86-64) (sb-vm:sanctify-for-execution code-obj)
          ;; Return fixups amenable to static linking
@@ -250,7 +250,7 @@
 
 (defun assign-code-serialno (code-obj)
   (let* ((serialno (ldb (byte (byte-size sb-vm::code-serialno-byte) 0)
-                        (atomic-incf sb-fasl::*code-serialno*)))
+                        (atomic-incf *code-serialno*)))
          (insts (code-instructions code-obj))
          (jumptable-word (sap-ref-word insts 0)))
     (aver (zerop (ash jumptable-word -14)))
@@ -318,6 +318,7 @@
         (let ((fun (%code-entry-point code-obj (decf fun-index)))
               (w (+ sb-vm:code-constants-offset
                     (* sb-vm:code-slots-per-simple-fun fun-index))))
+          (aver (functionp fun)) ; in case %CODE-ENTRY-POINT returns NIL
           (setf (code-header-ref code-obj (+ w sb-vm:simple-fun-name-slot))
                 (entry-info-name entry-info)
                 (code-header-ref code-obj (+ w sb-vm:simple-fun-arglist-slot))
@@ -355,6 +356,9 @@
                  (setf (code-header-ref code-obj index) referent)))))))
     (when named-call-fixups
       (sb-vm::statically-link-code-obj code-obj named-call-fixups))
+    (when sb-fasl::*show-new-code*
+      (let ((*print-pretty* nil))
+        (format t "~&~X New code(core): ~A~%" (get-lisp-obj-address code-obj) code-obj)))
     code-obj))
 
 (defun set-code-fdefn (code index fdefn)

@@ -321,6 +321,8 @@
   (data-section (make-section) :read-only t)
   (code-section (make-section) :read-only t)
   (elsewhere-section (make-section) :read-only t)
+  (data-origin-label (gen-label "data start") :read-only t)
+  (text-origin-label (gen-label "text start") :read-only t)
   (elsewhere-label (gen-label "elsewhere start") :read-only t)
   (inter-function-padding :normal :type (member :normal :nop))
   ;; for collecting unique "unboxed constants" prior to placing them
@@ -331,6 +333,9 @@
   ;; can print "in the {x} section" whenever it changes.
   (tracing-state (list nil nil) :read-only t)) ; segment and vop
 (declaim (freeze-type asmstream))
+;;; FIXME: suboptimal since *asmstream* was declaimed earlier because reasons.
+;;; (so we're missing uses of the known type even though the special var is known)
+(declaim (type asmstream *asmstream*))
 
 ;;; Insert STMT after PREDECESSOR.
 (defun insert-stmt (stmt predecessor)

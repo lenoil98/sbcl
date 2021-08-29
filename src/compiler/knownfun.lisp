@@ -30,9 +30,9 @@
   (type (missing-arg) :type ctype)
   ;; the transformation function. Takes the COMBINATION node and
   ;; returns a lambda expression, or throws out.
-  (function (missing-arg) :type function)
-  ;; string used in efficiency notes
-  (note (missing-arg) :type string)
+  ;; If a cons, then the CAR is the function to call, and the CDR is an argument
+  ;; to pass to that function in addition to the NODE being considered.
+  (%fun (missing-arg) :type (or function (cons function)))
   ;; T if we should emit a failure note even if SPEED=INHIBIT-WARNINGS.
   (important nil :type (member nil :slightly t))
   ;; A function with NODE as an argument that checks wheteher the
@@ -41,29 +41,34 @@
   ;; notes about failed transformation due to types even though it
   ;; wouldn't have been applied with the right types anyway,
   ;; or if another transform could be applied with the right policy.
-  (policy nil :type (or null function))
-  (extra-type nil))
+  (policy nil :type (or null function)))
+(defun transform-function (transform)
+  (let ((fun (transform-%fun transform))) (if (listp fun) (car fun) fun)))
+(defun transform-note (transform)
+  (or #+sb-xc-host (documentation (transform-function transform) 'function)
+      #-sb-xc-host (and (fboundp 'sb-pcl::fun-doc)
+                        (funcall 'sb-pcl::fun-doc (transform-function transform)))
+      "optimize"))
 
 (defprinter (transform) type note important)
 
 ;;; Grab the FUN-INFO and enter the function, replacing any old
 ;;; one with the same type and note.
-(defun %deftransform (name type fun &optional note important policy)
+;;; Argument order is: policy constraint, ftype constraint, consequent.
+;;; (think "qualifiers + specializers -> method")
+(defun %deftransform (name policy type fun &optional (important :slightly))
   (let* ((ctype (specifier-type type))
-         (note (or note "optimize"))
          (info (fun-info-or-lose name))
          (old (find ctype (fun-info-transforms info)
                     :test #'type=
                     :key #'transform-type)))
     (cond (old
-           (style-warn 'redefinition-with-deftransform
-                       :transform old)
-           (setf (transform-function old) fun
-                 (transform-note old) note
+           (style-warn 'redefinition-with-deftransform :transform old)
+           (setf (transform-%fun old) fun
                  (transform-important old) important
                  (transform-policy old) policy))
           (t
-           (push (make-transform :type ctype :function fun :note note
+           (push (make-transform :type ctype :%fun fun
                                  :important important
                                  :policy policy)
                  (fun-info-transforms info))))

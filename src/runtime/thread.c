@@ -410,7 +410,8 @@ unregister_thread(struct thread *th,
 #ifdef LISP_FEATURE_SB_SAFEPOINT
 
     block_blockable_signals(0);
-    ensure_region_closed(&th->alloc_region, BOXED_PAGE_FLAG);
+    ensure_region_closed(&th->boxed_tlab, BOXED_PAGE_FLAG);
+    ensure_region_closed(&th->unboxed_tlab, UNBOXED_PAGE_FLAG);
     pop_gcing_safety(&scribble->safety);
     lock_ret = thread_mutex_lock(&all_threads_lock);
     gc_assert(lock_ret == 0);
@@ -436,7 +437,8 @@ unregister_thread(struct thread *th,
     /* FIXME: this nests the free_pages_lock inside the all_threads_lock.
      * There's no reason for that, so closing of regions should be done
      * sooner to eliminate an ordering constraint. */
-    ensure_region_closed(&th->alloc_region, BOXED_PAGE_FLAG);
+    ensure_region_closed(&th->boxed_tlab, BOXED_PAGE_FLAG);
+    ensure_region_closed(&th->unboxed_tlab, UNBOXED_PAGE_FLAG);
     unlink_thread(th);
     thread_mutex_unlock(&all_threads_lock);
     gc_assert(lock_ret == 0);
@@ -521,14 +523,14 @@ void* new_thread_trampoline(void* arg)
          *  restricted to 16 characters, including the terminating null byte ('\0').
          *  The pthread_setname_np() function can fail with the following error:
          *  ERANGE The length of the string ... exceeds the allowed limit." */
-        if (fixnum_value(VECTOR(name)->length) <= 15)
+        if (vector_len(VECTOR(name)) <= 15)
             pthread_setname_np(pthread_self(), (char*)VECTOR(name)->data);
 #endif
 #ifdef LISP_FEATURE_NETBSD
         /* This constant is an upper bound on the length including the NUL.
          * Exceeding it will fail the call. It happens to be 32.
          * Also, don't want to printf-format a name containing a '%' */
-        if (fixnum_value(VECTOR(name)->length) < PTHREAD_MAX_NAMELEN_NP)
+        if (vector_len(VECTOR(name)) < PTHREAD_MAX_NAMELEN_NP)
             pthread_setname_np(pthread_self(), "%s", (char*)VECTOR(name)->data);
 #endif
 #if defined LISP_FEATURE_FREEBSD || defined LISP_FEATURE_OPENBSD
@@ -537,7 +539,7 @@ void* new_thread_trampoline(void* arg)
         pthread_set_name_np(pthread_self(), (char*)VECTOR(name)->data);
 #endif
 #ifdef LISP_FEATURE_DARWIN
-        if (fixnum_value(VECTOR(name)->length) < 64)
+        if (vector_len(VECTOR(name)) < 64)
             pthread_setname_np((char*)VECTOR(name)->data);
 #endif
     }
@@ -850,10 +852,6 @@ callback_wrapper_trampoline(
 
 struct thread *
 alloc_thread_struct(void* spaces, lispobj start_routine) {
-#ifdef LISP_FEATURE_SB_THREAD
-    unsigned int i;
-#endif
-
     /* May as well allocate all the spaces at once: it saves us from
      * having to decide what to do if only some of the allocations
      * succeed. SPACES must be appropriately aligned, since the GC
@@ -883,7 +881,7 @@ alloc_thread_struct(void* spaces, lispobj start_routine) {
     // Refer to the ASCII art in the block comment above
     struct thread *th = (void*)(csp_page + THREAD_CSP_PAGE_SIZE
                                 + THREAD_HEADER_SLOTS*N_WORD_BYTES);
-    __attribute((unused)) lispobj* tls = (lispobj*)th;
+
 #ifdef LISP_FEATURE_SB_SAFEPOINT
     // Out of caution I'm supposing that the last thread to use this memory
     // might have left this page as read-only. Could it? I have no idea.
@@ -891,11 +889,13 @@ alloc_thread_struct(void* spaces, lispobj start_routine) {
 #endif
 
 #ifdef LISP_FEATURE_SB_THREAD
-    for(i = 0; i < (unsigned int)(dynamic_values_bytes/N_WORD_BYTES); i++)
-        tls[i] = NO_TLS_VALUE_MARKER_WIDETAG;
-    th->lisp_thread = 0; // force it to be always-thread-local, of course
+    memset(th, 0, sizeof *th);
+    lispobj* ptr = (lispobj*)(th + 1);
+    lispobj* end = (lispobj*)((char*)th + dynamic_values_bytes);
+    while (ptr < end) *ptr++ = NO_TLS_VALUE_MARKER_WIDETAG;
     th->tls_size = dynamic_values_bytes;
 #endif
+    __attribute((unused)) lispobj* tls = (lispobj*)th;
 #ifdef THREAD_T_NIL_CONSTANTS_SLOT
     tls[THREAD_T_NIL_CONSTANTS_SLOT] = (NIL << 32) | T;
 #endif
@@ -997,7 +997,8 @@ alloc_thread_struct(void* spaces, lispobj start_routine) {
 #endif
 
 #ifdef LISP_FEATURE_GENCGC
-    gc_init_region(&th->alloc_region);
+    gc_init_region(&th->boxed_tlab);
+    gc_init_region(&th->unboxed_tlab);
 #endif
 #ifdef LISP_FEATURE_SB_THREAD
     /* This parallels the same logic in globals.c for the
@@ -1049,6 +1050,7 @@ alloc_thread_struct(void* spaces, lispobj start_routine) {
     th->no_tls_value_marker = start_routine;
 
 #if defined(LISP_FEATURE_WIN32)
+    int i;
     for (i = 0; i<NUM_PRIVATE_EVENTS; ++i)
         thread_private_events(th,i) = CreateEvent(NULL,FALSE,FALSE,NULL);
     thread_extra_data(th)->synchronous_io_handle_and_flag = 0;

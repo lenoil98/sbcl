@@ -265,7 +265,10 @@
                       :original-form form
                       :format-args args
                       :context src-context
-                      :file-name (file-info-name file-info)
+                      :file-name (if (symbolp (file-info-truename file-info)) ; :LISP or :STREAM
+                                     ;; (pathname will be NIL in those two cases)
+                                     (file-info-truename file-info)
+                                     (file-info-pathname file-info))
                       :file-position
                       (nth-value 1 (find-source-root tlf *source-info*))
                       :path path
@@ -434,6 +437,7 @@ a STYLE-WARNING (or any more serious condition)."))
   (:documentation
    "A condition type signalled when the compiler deletes code that the user
 has written, having proved that it is unreachable."))
+(define-condition unknown-typep-note (simple-compiler-note) ())
 
 (define-condition compiler-macro-application-missed-warning
     (style-warning)
@@ -665,7 +669,7 @@ has written, having proved that it is unreachable."))
 ;;
 (defun warn-if-inline-failed/proclaim (name new-inlinep)
   (when (eq new-inlinep 'inline)
-    (let ((warning-count (emitted-full-call-count name)))
+    (let ((warning-count (sb-impl::emitted-full-call-count name)))
       (when (and warning-count
                  ;; Warn only if the the compiler did not have the expansion.
                  (not (fun-name-inline-expansion name))

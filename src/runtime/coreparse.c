@@ -487,9 +487,9 @@ static void relocate_space(uword_t start, lispobj* end, struct heap_adjust* adj)
               struct vector* v = (struct vector*)where;
               // If you could make a hash-table vector with space for exactly 1 k/v pair,
               // it would have length 5.
-              gc_assert(v->length >= make_fixnum(5));
+              gc_assert(vector_len(v) >= 5); // KLUDGE: need a manifest constant for fixed overhead
               lispobj* data = (lispobj*)v->data;
-              adjust_pointers(&data[fixnum_value(v->length)-1], 1, adj);
+              adjust_pointers(&data[vector_len(v)-1], 1, adj);
               int hwm = KV_PAIRS_HIGH_WATER_MARK(data);
               boolean needs_rehash = 0;
               lispobj *where = &data[2], *end = &data[2*(hwm+1)];
@@ -610,7 +610,7 @@ set_adjustment(struct heap_adjust* adj,
     gc_assert(j <= 2);
     adj->range[j].start = (lispobj)desired_addr;
     adj->range[j].end   = (lispobj)desired_addr + len;
-    adj->range[j].delta = actual_addr - desired_addr;
+    adj->range[j].delta = len ? actual_addr - desired_addr : 0;
     adj->n_ranges = j+1;
 }
 
@@ -623,7 +623,12 @@ set_adjustment(struct heap_adjust* adj,
 /// Compute the bounds of the lisp assembly routine code object
 void calc_asm_routine_bounds()
 {
-#ifdef LISP_FEATURE_IMMOBILE_SPACE
+#ifdef LISP_FEATURE_METASPACE
+    if (widetag_of((lispobj*)READ_ONLY_SPACE_START) == CODE_HEADER_WIDETAG)
+        asm_routines_start = READ_ONLY_SPACE_START;
+    else
+        asm_routines_start = READ_ONLY_SPACE_START + (256+2)*N_WORD_BYTES;
+#elif defined LISP_FEATURE_IMMOBILE_CODE
     asm_routines_start = VARYOBJ_SPACE_START;
 #else
     if (widetag_of((lispobj*)READ_ONLY_SPACE_START) == CODE_HEADER_WIDETAG) {
@@ -867,7 +872,7 @@ process_directory(int count, struct ndir_entry *entry,
                   DYNAMIC_0_SPACE_START = addr = semispace_0_start;
                   current_dynamic_space = (lispobj*)addr;
                   // Request that much again now
-                  uword_t addr1 = (uword_t)os_allocate(request);
+                  uword_t addr1 = (uword_t)os_validate(MOVABLE, 0, request, 1, 0);
                   uword_t semispace_1_start = ALIGN_UP(addr1, BACKEND_PAGE_BYTES);
                   uword_t semispace_1_end = ALIGN_DOWN(addr1 + request, BACKEND_PAGE_BYTES);
 
@@ -1085,7 +1090,7 @@ load_core_file(char *file, os_vm_offset_t file_offset, int merge_core_pages)
 #include "genesis/hash-table.h"
 #include "genesis/vector.h"
 #include "genesis/cons.h"
-char* get_asm_routine_by_name(const char* name)
+char* get_asm_routine_by_name(const char* name, int *index)
 {
     struct code* code = (struct code*)asm_routines_start;
     lispobj ht = CONS(code->debug_info)->car;
@@ -1094,21 +1099,28 @@ char* get_asm_routine_by_name(const char* name)
             VECTOR(((struct hash_table*)native_pointer(ht))->pairs);
         lispobj sym;
         int i;
-        for (i=2 ; i < fixnum_value(table->length) ; i += 2)
+        // ASSUMPTION: hash-table representation is known (same as in gc-common of course)
+        for (i=2 ; i < vector_len(table) ; i += 2)
             if (lowtag_of(sym = table->data[i]) == OTHER_POINTER_LOWTAG
                 && widetag_of(&SYMBOL(sym)->header) == SYMBOL_WIDETAG
-                && !strcmp(name, (char*)(VECTOR(SYMBOL(sym)->name)->data)))
-                return code_text_start(code) + fixnum_value(CONS(table->data[i+1])->car);
+                && !strcmp(name, (char*)(VECTOR(SYMBOL(sym)->name)->data))) {
+                lispobj value = table->data[i+1];
+                // value = (start-address . (end-address . index))
+                if (index)
+                  *index = fixnum_value(CONS(CONS(value)->cdr)->cdr); // take cddr
+                return code_text_start(code) + fixnum_value(CONS(value)->car);
+            }
         // Something is wrong if we have a hashtable but find nothing.
         fprintf(stderr, "WARNING: get_asm_routine_by_name(%s) failed\n",
                 name);
     }
+    if (index) *index = 0;
     return NULL;
 }
 
 void asm_routine_poke(const char* routine, int offset, char byte)
 {
-    char *address = get_asm_routine_by_name(routine);
+    char *address = get_asm_routine_by_name(routine, 0);
     if (address)
         address[offset] = byte;
 }
@@ -1154,8 +1166,11 @@ static void graph_visit(lispobj __attribute__((unused)) referer,
         RECURSE(CONS(ptr)->cdr);
     } else switch (widetag_of(obj = native_pointer(ptr))) {
         case SIMPLE_VECTOR_WIDETAG:
-            nwords = fixnum_value(obj[1]); // vector length
-            for(i=0; i<nwords; ++i) RECURSE(obj[i+2]);
+            {
+            struct vector* v = (void*)obj;
+            sword_t len = vector_len(v);
+            for(i=0; i<len; ++i) RECURSE(v->data[i]);
+            }
             break;
         case INSTANCE_WIDETAG:
         case FUNCALLABLE_INSTANCE_WIDETAG:

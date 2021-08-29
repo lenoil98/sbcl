@@ -266,6 +266,8 @@
 ;;;           - Don't actually instantiate a transform, instead just DEFUN
 ;;;             Name with the specified transform definition function. This
 ;;;             may be later instantiated with %DEFTRANSFORM.
+;;;   :INFO   - an extra piece of information the transform receives,
+;;;             typically for use with :DEFUN-ONLY
 ;;;   :IMPORTANT
 ;;;           - If the transform fails and :IMPORTANT is
 ;;;               NIL,       then never print an efficiency note.
@@ -275,24 +277,30 @@
 (defmacro deftransform (name (lambda-list &optional (arg-types '*)
                                           (result-type '*)
                                           &key result policy node defun-only
+                                          (info nil info-p)
                                           (important :slightly))
                              &body body-decls-doc)
   (declare (type (member nil :slightly t) important))
+  (cond (defun-only
+         (aver (eq important :slightly)) ; can't be specified
+         (aver (not policy))) ; has no effect on the defun
+        (t
+         (aver (not info))))
   (multiple-value-bind (body decls doc) (parse-body body-decls-doc t)
-    (let ((n-node (or node (make-symbol "NODE")))
-          (n-decls (sb-xc:gensym))
-          (n-lambda (sb-xc:gensym)))
+    (let ((n-node (or node '#:node))
+          (n-decls '#:decls)
+          (n-lambda '#:lambda))
       (multiple-value-bind (bindings vars)
           (parse-deftransform lambda-list n-node
                               '(give-up-ir1-transform))
         (let ((stuff
-                `((,n-node &aux ,@bindings
+                `((,n-node ,@(if info-p (list info)) &aux ,@bindings
                            ,@(when result
                                `((,result (node-lvar ,n-node)))))
                   (declare (ignorable ,@(mapcar #'car bindings)))
                   (declare (lambda-list (node)))
                   ,@decls
-                  ,@(and defun-only doc `(,doc))
+                  ,@(if doc `(,doc))
                   ;; What purpose does it serve to allow the transform's body
                   ;; to return decls as a second value? They would go in the
                   ;; right place if simply returned as part of the expression.
@@ -307,15 +315,11 @@
                            ,,n-lambda)))))))
           (if defun-only
               `(defun ,name ,@stuff)
-              `(%deftransform
-                ',name
-                '(function ,arg-types ,result-type)
-                (named-lambda (deftransform ,name) ,@stuff)
-                ,doc
-                ,important
-                ,(and policy
-                      `(lambda (,n-node)
-                         (policy ,n-node ,policy))))))))))
+              `(%deftransform ',name
+                              ,(and policy `(lambda (,n-node) (policy ,n-node ,policy)))
+                              '(function ,arg-types ,result-type)
+                              (named-lambda (deftransform ,name) ,@stuff)
+                              ,important)))))))
 
 (defmacro deftransforms (names (lambda-list &optional (arg-types '*)
                                                       (result-type '*)
@@ -323,24 +327,18 @@
                          &body body-decls-doc)
 
   (let ((transform-name (symbolicate (car names) '-transform))
-        (type (list 'function arg-types result-type))
-        (doc (nth-value 2 (parse-body body-decls-doc t))))
+        (type (list 'function arg-types result-type)))
     `(progn
        (deftransform ,transform-name
            (,lambda-list ,arg-types ,result-type
             :defun-only t
             :result ,result :policy ,policy :node ,node)
          ,@body-decls-doc)
-       ,@(loop for name in names
-               collect
-               `(let ((policy ,(and policy
-                                    (let ((node-sym (gensym "NODE")))
-                                      `(lambda (,node-sym)
-                                         (policy ,node-sym ,policy))))))
-                  (%deftransform ',name ',type #',transform-name
-                                 ,doc
-                                 ,important
-                                 policy))))))
+       (flet ,(if policy `((policy-test (node) (policy node ,policy))))
+         ,@(mapcar (lambda (name)
+                     `(%deftransform ',name ,(if policy '#'policy-test) ',type
+                                     #',transform-name ,important))
+                   names)))))
 
 ;;; Create a function which parses combination args according to WHAT
 ;;; and LAMBDA-LIST, where WHAT is either a function name or a list
@@ -846,3 +844,64 @@ specify bindings for printer control variables.")
         (nreverse (mapcar #'car *compiler-print-variable-alist*))
         (nreverse (mapcar #'cdr *compiler-print-variable-alist*))
       ,@forms)))
+
+#|
+In trying to figure out whether we can rectify the totally unobvious behavior
+that FUN-INFO-TRANSFORMS are tried in the reverse order of their definitions,
+it is helpful to understand when multiple transforms exist where more than
+one could be selected.
+In the absence of type overlap, it wouldn't matter what order they were attempted.
+Unfortunately there are plenty of cases where the _least_ _specific_ fun-type
+should be attempted first, which at least superfically makes no sense at all.
+
+(in-package sb-c)
+;; As a special case, delete any functions where there are 2 transforms
+;; and they can't possibly both apply. Just check the first arg.
+(defun domains-possibly-overlap (xforms)
+  (when (/= (length xforms) 2) ; lazy, just say yes
+    (return-from domains-possibly-overlap t))
+  (let ((t1 (transform-type (car xforms)))
+        (t2 (transform-type (cadr xforms))))
+    (unless (and (fun-type-p t1) (fun-type-p t2))
+      (return-from domains-possibly-overlap t))
+    (let ((req1 (car (fun-type-required t1)))
+          (req2 (car (fun-type-required t2))))
+      (unless (and req1 req2)
+        (return-from domains-possibly-overlap t))
+      (when (or (and (type= req1 (specifier-type 'single-float))
+                     (type= req2 (specifier-type 'double-float)))
+                (and (type= req1 (specifier-type 'double-float))
+                     (type= req2 (specifier-type 'single-float))))
+        (return-from domains-possibly-overlap nil))))
+  ;; The conservative answer is always T.
+  t)
+(let (list)
+  (do-all-symbols (s)
+    (dolist (name (list s `(setf ,s) `(cas ,s)))
+      (let* ((info (sb-int:info :function :info name))
+             (xforms (and info (sb-c::fun-info-transforms info))))
+        (when (and info
+                   (> (length xforms) 1)
+                   (not (assoc name list)))
+          (if (domains-possibly-overlap xforms)
+              (push (cons name xforms) list)
+              (format t "~&Nonoverlapping xforms on ~s~%" name))))))
+  (let ((*print-pretty* nil))
+    (dolist (x (sort (copy-list list) #'> :key (lambda (x) (length (cdr x))))
+               (format t "~s functions~%" (length list)))
+      (format t "~a~%" (car x))
+      (let ((i 0))
+        (dolist (xform (cdr x))
+          (incf i)
+          (format t " ~2d. ~s~%" i (sb-kernel:type-specifier
+                                  (sb-c::transform-type xform)))
+          (let* ((fun (sb-c::transform-function xform))
+                 (code (sb-kernel:fun-code-header fun))
+                 (info (sb-kernel:%code-debug-info code))
+                 (source (sb-c::compiled-debug-info-source info))
+                 (tlf (sb-c::compiled-debug-info-tlf-number info))
+                 (offs (sb-c::compiled-debug-info-char-offset info))
+                 (ns (sb-c::debug-source-namestring source))
+                 (doc (documentation (sb-c::transform-function xform) 'function)))
+            (format t "     ; ~a ~a ~d ~d~%" doc ns tlf offs)))))))
+|#

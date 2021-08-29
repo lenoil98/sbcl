@@ -72,20 +72,6 @@
            (!make-meta-info id category kind type-spec type-checker
                             validate-function default)))))
 
-#-sb-xc
-(setf (get '!%define-info-type :sb-cold-funcall-handler/for-effect)
-      (lambda (category kind type-spec checker validator default id)
-        ;; The SB-FASL: symbols are poor style, but the lesser evil.
-        ;; If exported, then they'll stick around in the target image.
-        ;; Perhaps SB-COLD should re-export some of these.
-        (sb-fasl::cold-svset
-         (sb-fasl::cold-symbol-value '*info-types*)
-         id
-         (sb-fasl::write-slots
-          (sb-fasl::allocate-struct-of-type 'meta-info)
-          :category category :kind kind :type-spec type-spec
-          :type-checker checker :validate-function validator
-          :default default :number id))))
 
 ;;;; info types, and type numbers, part II: what's
 ;;;; needed only at compile time, not at run time
@@ -114,16 +100,17 @@
   ;; There was formerly a remark that (COPY-TREE TYPE-SPEC) ensures repeatable
   ;; fasls. That's not true now, probably never was. A compiler is permitted to
   ;; coalesce EQUAL quoted lists and there's no defense against it, so why try?
-  `(!%define-info-type
-           ,category ,kind ',type-spec
-           ,(if (eq type-spec 't)
-                '#'identity
-                `(named-lambda "check-type" (x) (the ,type-spec x)))
-           ,validate-function ,default
-           ;; Rationale for hardcoding here is explained at INFO-VECTOR-FDEFN.
-           ,(or (and (eq category :function) (eq kind :definition)
-                     +fdefn-info-num+)
-                #+sb-xc (meta-info-number (meta-info category kind)))))
+  `(!cold-init-forms
+    (!%define-info-type
+     ,category ,kind ',type-spec
+     ,(if (eq type-spec 't)
+          '#'identity
+          `(named-lambda "check-type" (x) (the ,type-spec x)))
+     ,validate-function ,default
+     ;; Rationale for hardcoding here is explained at INFO-VECTOR-FDEFN.
+     ,(or (and (eq category :function) (eq kind :definition)
+               +fdefn-info-num+)
+          #+sb-xc (meta-info-number (meta-info category kind))))))
 ;; It's an external symbol of SB-INT so wouldn't be removed automatically
 (push '("SB-INT" define-info-type) *!removable-symbols*)
 
@@ -190,18 +177,6 @@
         (info-puthash *info-environment* name #'clear-hairy)))
     (not (null new))))
 
-;;;; *INFO-ENVIRONMENT*
-
-(defun !globaldb-cold-init ()
-  ;; Genesis writes the *INFO-TYPES* array, but setting up the mapping
-  ;; from keyword-pair to object is deferred until cold-init.
-  (dovector (x (the simple-vector *info-types*))
-    (when x (!register-meta-info x)))
-  #-sb-xc-host
-  (let ((h (make-info-hashtable)))
-    (setf (sb-thread:mutex-name (info-env-mutex h)) "globaldb")
-    (setq *info-environment* h)))
-
 ;;;; GET-INFO-VALUE
 
 ;;; If non-nil, *GLOBALDB-OBSERVER*'s CAR is a bitmask over info numbers
@@ -251,6 +226,7 @@
         (funcall (truly-the function (cdr hook)) name info-number answer nil))
       (values answer nil))))
 
+(!begin-collecting-cold-init-forms)
 ;;;; ":FUNCTION" subsection - Data pertaining to globally known functions.
 (define-info-type (:function :definition) :type-spec #-sb-xc-host (or fdefn null) #+sb-xc-host t)
 
@@ -280,12 +256,28 @@
 (define-info-type (:function :deprecated)
   :type-spec (or null deprecation-info))
 
-;;; Why are these here? It seems like the wrong place.
+;;; FIXME: Why are these here? It seems like the wrong place.
 (declaim (ftype (sfunction (t &optional t symbol) ctype) specifier-type)
          (ftype (sfunction (t) ctype) ctype-of sb-kernel::ctype-of-array))
 
+;;; The parsed or unparsed type for this function, or the symbol :GENERIC-FUNCTION.
+;;; Ordinarily a parsed type is stored. Only if the parsed type contains
+;;; an unknown type will the original specifier be stored; we attempt to reparse
+;;; on each lookup, in the hope that the type becomes known at some point.
+;;; If :GENERIC-FUNCTION, the info is recomputed from methods at the time of lookup
+;;; and stored back. Method redefinition resets the value to :GENERIC-FUNCTION.
+(define-info-type (:function :type)
+  :type-spec (or ctype (cons (eql function)) (member :generic-function))
+  :default (lambda (name)
+             (declare (ignorable name))
+             #+sb-xc-host (specifier-type 'function)
+             #-sb-xc-host (sb-impl::ftype-from-fdefn name)))
+
 ;;; the ASSUMED-TYPE for this function, if we have to infer the type
 ;;; due to not having a declaration or definition
+;;; FIXME: It may be better to have this and/or :TYPE stored in a single
+;;; property as either (:known . #<ctype>) or (:assumed . #<ctype>)
+;;; rather than using two different properties. Do we ever use *both* ?
 (define-info-type (:function :assumed-type)
   ;; FIXME: The type-spec really should be
   ;;   (or approximate-fun-type null)).
@@ -323,7 +315,7 @@
 ;;; If only (B) is stored, then this is a DXABLE-ARGS.
 ;;; If both, this is an INLINING-DATA.
 (define-info-type (:function :inlining-data)
-    :type-spec (or list sb-c::dxable-args sb-c::inlining-data))
+  :type-spec (or list sb-c::dxable-args sb-c::inlining-data))
 
 ;;; This specifies whether this function may be expanded inline. If
 ;;; null, we don't care.
@@ -334,6 +326,22 @@
 ;;; Useful for finding functions that were supposed to have been converted
 ;;; through some kind of transformation but were not.
 (define-info-type (:function :emitted-full-calls) :type-spec list)
+
+;; Return the number of calls to NAME that IR2 emitted as full calls,
+;; not counting calls via #'F that went untracked.
+;; Return 0 if the answer is nonzero but a warning was already signaled
+;; about any full calls were emitted. This return convention satisfies the
+;; intended use of this statistic - to decide whether to generate a warning
+;; about failure to inline NAME, which is shown at most once per name
+;; to avoid unleashing a flood of identical warnings.
+(defun emitted-full-call-count (name)
+  (let ((status (car (info :function :emitted-full-calls name))))
+     (and (integerp status)
+          ;; Bit 0 tells whether any call was NOT in the presence of
+          ;; a 'notinline' declaration, thus eligible to be inline.
+          ;; Bit 1 tells whether any warning was emitted yet.
+          (= (logand status 3) #b01)
+          (ash status -2)))) ; the call count as tracked by IR2
 
 ;;; a macro-like function which transforms a call to this function
 ;;; into some other Lisp form. This expansion is inhibited if inline
@@ -477,6 +485,13 @@
 ;;; The classoid-cell for this type
 (define-info-type (:type :classoid-cell) :type-spec t)
 
+;;; wrapper for this type being used by the compiler
+(define-info-type (:type :compiler-layout)
+  :type-spec (or wrapper null)
+  :default (lambda (name)
+             (let ((class (find-classoid name nil)))
+               (and class (classoid-wrapper class)))))
+
 ;;; DEFTYPE lambda-list
 ;; FIXME: remove this after making swank-fancy-inspector not use it.
 (define-info-type (:type :lambda-list) :type-spec t)
@@ -554,6 +569,16 @@
 (define-info-type (:source-location :symbol-macro) :type-spec t)
 (define-info-type (:source-location :declaration) :type-spec t)
 (define-info-type (:source-location :alien-type) :type-spec t)
+
+(!defun-from-collected-cold-init-forms !info-type-cold-init)
+
+#-sb-xc-host
+(defun !globaldb-cold-init ()
+  (let ((h (make-info-hashtable)))
+    (setf (sb-thread:mutex-name (info-env-mutex h)) "globaldb")
+    (setq *info-environment* h))
+  (setq *info-types* (make-array (ash 1 info-number-bits) :initial-element nil))
+  (!info-type-cold-init))
 
 ;; This is for the SB-INTROSPECT contrib module, and debugging.
 (defun call-with-each-info (function symbol)

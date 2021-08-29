@@ -275,6 +275,9 @@
 ;;; A (SIGNED-BYTE 64) can be represented with either fixnum or a bignum with
 ;;; exactly one digit.
 
+(defmacro bignum-header-for-length (n)
+  (logior (ash n n-widetag-bits) bignum-widetag))
+
 (define-vop (signed-byte-64-p type-predicate)
   (:translate signed-byte-64-p)
   (:generator 45
@@ -295,8 +298,7 @@
            (inst and :byte temp lowtag-mask)
            (inst cmp :byte temp other-pointer-lowtag)))
       (inst jmp :ne nope)
-      (inst cmp :qword (ea (- other-pointer-lowtag) value)
-            (+ (ash 1 n-widetag-bits) bignum-widetag))
+      (inst cmp :qword (ea (- other-pointer-lowtag) value) (bignum-header-for-length 1))
       (inst jmp (if not-p :ne :e) target))
     NOT-TARGET))
 
@@ -325,11 +327,11 @@
         ;; Get the header.
         (loadw temp value 0 other-pointer-lowtag)
         ;; Is it one?
-        (inst cmp temp (+ (ash 1 n-widetag-bits) bignum-widetag))
+        (inst cmp temp (bignum-header-for-length 1))
         (inst jmp :e single-word)
         ;; If it's other than two, we can't be an (unsigned-byte 64)
         ;: Leave TEMP holding 0 in the affirmative case.
-        (inst sub temp (+ (ash 2 n-widetag-bits) bignum-widetag))
+        (inst sub temp (bignum-header-for-length 2))
         (inst jmp :ne nope)
         ;; Compare the second digit to zero (in TEMP).
         (inst cmp (object-slot-ea value (1+ bignum-digits-offset) other-pointer-lowtag)
@@ -512,12 +514,10 @@
    (:translate %set-instance-layout)
    (:policy :fast-safe)
    (:args (object :scs (descriptor-reg))
-          (value :scs (any-reg descriptor-reg) :target res))
-   (:results (res :scs (any-reg descriptor-reg)))
+          (value :scs (any-reg descriptor-reg)))
    (:vop-var vop)
    (:generator 1
-     (inst mov :dword (ea (- 4 instance-pointer-lowtag) object) value)
-     (move res value)))
+     (inst mov :dword (ea (- 4 instance-pointer-lowtag) object) value)))
  (define-vop (%fun-layout %instance-layout)
    (:translate %fun-layout)
    (:variant fun-pointer-lowtag))
@@ -527,39 +527,46 @@
      (pseudo-atomic ()
        (inst push object)
        (invoke-asm-routine 'call 'touch-gc-card vop)
-       (inst mov :dword (ea (- 4 fun-pointer-lowtag) object) value))
-     (move res value)))
-(define-vop ()
+       (inst mov :dword (ea (- 4 fun-pointer-lowtag) object) value))))
+ (define-vop ()
   (:translate sb-c::layout-eq)
   (:policy :fast-safe)
   (:conditional :e)
   (:args (object :scs (descriptor-reg))
-         (layout :scs (descriptor-reg immediate)))
+         (layout :scs (descriptor-reg immediate #+metaspace constant)))
   (:arg-types * * (:constant t))
   (:info lowtag)
   (:generator 1
+    ;; With metaspace, the layout argument is actually a #<WRAPPER>
+    ;; which does not have IMMEDIATE sc, but rather CONSTANT sc.
+    ;; But we use a layout fixup which stuffs in the pointer to the layout.
     (inst cmp :dword (ea (- 4 lowtag) object)
-          (if (sc-is layout immediate)
+          (if (sc-is layout immediate constant)
               (make-fixup (tn-value layout) :layout)
               layout)))))
 
-;;; Return the DISP part of an EA based on MEM-OP, which is comprised
-;;; of a vop name and its codegen info.
-;;; Return NIL if the value can't be encoded in a machine instruction.
-(defun valid-memref-byte-disp (mem-op)
-  (ecase (car mem-op)
-    ((instance-index-ref-c
-      raw-instance-ref-c/word
-      raw-instance-ref-c/signed-word)
-     (destructuring-bind (index) (cdr mem-op)
+;;; Return the DISP part of an EA based on MEM-OP,
+;;; which is a memory access vop such as INSTANCE-REF.
+;;; Return NIL if the access can't be absorbed into a following instruction.
+(defun valid-memref-byte-disp (mem-op &aux (info (vop-codegen-info mem-op)))
+  (ecase (vop-name mem-op)
+    (instance-index-ref-c
+     ;; for historical reasons, this has a "-C" variant which takes an info arg
+     (destructuring-bind (index) info
        (- (ash (+ index instance-slots-offset) word-shift)
           instance-pointer-lowtag)))
+    ((%raw-instance-ref/word %raw-instance-ref/signed-word)
+     ;; raw slot vops accept an immediate TN, not a codegen arg
+     (let ((index (tn-ref-tn (tn-ref-across (sb-c::vop-args mem-op)))))
+       (when (sc-is index immediate)
+         (- (ash (+ (tn-value index) instance-slots-offset) word-shift)
+            instance-pointer-lowtag))))
     (slot
-     (destructuring-bind (name index lowtag) (cdr mem-op)
+     (destructuring-bind (name index lowtag) info
        (declare (ignore name))
        (- (ash index word-shift) lowtag)))
     (data-vector-ref-with-offset/simple-vector-c
-     (destructuring-bind (index offset) (cdr mem-op)
+     (destructuring-bind (index offset) info
        (let ((disp (- (ash (+ vector-data-offset index offset) word-shift)
                       other-pointer-lowtag)))
          (if (typep disp '(signed-byte 32)) disp))))))
@@ -601,14 +608,24 @@
     (let ((prev (sb-c::previous-vop-is
                  vop
                  '(instance-index-ref-c slot
+                   ;; FIXME: could we also handle the non "-C" vop?
+                   ;; The problem is that because FIXNUMP only takes one arg,
+                   ;; an additional TN would have to be grafted into the data flow
+                   ;; to convey the INDEX arg. So it's not the same fixnump vop
+                   ;; any more - it's like a two-arg variant of fixnump.
                    data-vector-ref-with-offset/simple-vector-c))))
+      ;; Inhibit the optimization on simple-vector if we need to trap uninitialized reads.
+      ;; #+ubsan always inhibits, otherwise it's policy-based
+      (when (and prev
+                 (eq (vop-name prev) 'data-vector-ref-with-offset/simple-vector-c)
+                 #-ubsan (sb-c::policy (sb-c::vop-node vop) (= safety 3)))
+        (return-from vop-optimize-fixnump-optimizer nil))
       (aver (not (sb-c::vop-results vop))) ; is a :CONDITIONAL vop
       (when (and prev (eq (vop-block prev) (vop-block vop)))
         (let ((arg (sb-c::vop-args vop)))
           (when (and (eq (tn-ref-tn (sb-c::vop-results prev)) (tn-ref-tn arg))
                      (sb-c::very-temporary-p (tn-ref-tn arg)))
-            (binding* ((mem-op (cons (vop-name prev) (vop-codegen-info prev)))
-                       (disp (valid-memref-byte-disp mem-op) :exit-if-null)
+            (binding* ((disp (valid-memref-byte-disp prev) :exit-if-null)
                        (arg-ref
                         (sb-c::reference-tn (tn-ref-tn (sb-c::vop-args prev)) nil))
                        (new (sb-c::emit-and-insert-vop

@@ -552,6 +552,7 @@ necessary, since type inference may take arbitrarily long to converge.")
               (if (fasl-output-p *compile-object*)
                   (and (eq *compile-file-to-memory-space* :immobile)
                        (neq (component-kind component) :toplevel)
+                       (policy *lexenv* (/= sb-c:store-coverage-data 3))
                        :immobile)
                   (if (core-object-ephemeral *compile-object*)
                       :dynamic
@@ -836,22 +837,40 @@ necessary, since type inference may take arbitrarily long to converge.")
   (terpri)
   (values))
 
+;;; Leave this as NIL if you want modern, rational, correct, behavior,
+;;; or switch it to T for legacy (CLHS-specified) bullshit a la
+;;;  "During a call to compile-file, *compile-file-pathname* is bound to the pathname
+;;;   denoted by the first argument to compile-file, merged against the defaults"
+;;; The normal build sets it to T in make-target-2, despite that I think most people would
+;;; prefer the nonstandard behavior. The standard behavior makes stored pathnames all wrong
+;;; when files are physically moved. (Same problem as SBCL_HOME embedded into C pretty much)
+(defglobal *merge-pathnames* nil)
+
 ;;; Given a pathname, return a SOURCE-INFO structure.
 (defun make-file-source-info (file external-format &optional form-tracking-p)
   (make-source-info
-   :file-info (make-file-info :name (truename file) ; becomes *C-F-TRUENAME*
-                              :untruename #+sb-xc-host file ; becomes *C-F-PATHNAME*
-                                          #-sb-xc-host (merge-pathnames file)
+   :file-info (make-file-info :pathname ; becomes *C-F-PATHNAME*
+                              (if *merge-pathnames* (merge-pathnames file) file)
                               :external-format external-format
                               :subforms
                               (if form-tracking-p
                                   (make-array 100 :fill-pointer 0 :adjustable t))
                               :write-date (file-write-date file))))
 
+;; LOAD-AS-SOURCE uses this.
+(defun make-file-stream-source-info (file-stream)
+  (make-source-info
+   :file-info (make-file-info :truename (truename file-stream)
+                              ;; This T-L-P has been around since at least 2011.
+                              ;; It's unclear why an LPN isn't good enough.
+                              :pathname (translate-logical-pathname file-stream)
+                              :external-format (stream-external-format file-stream)
+                              :write-date (file-write-date file-stream))))
+
 ;;; Return a SOURCE-INFO to describe the incremental compilation of FORM.
 (defun make-lisp-source-info (form &key parent)
   (make-source-info
-   :file-info (make-file-info :name :lisp
+   :file-info (make-file-info :truename :lisp
                               :forms (vector form)
                               :positions '#(0))
    :parent parent))
@@ -865,7 +884,7 @@ necessary, since type inference may take arbitrarily long to converge.")
             (finfo (source-info-file-info sinfo)
                    (source-info-file-info sinfo)))
            ((or (not (source-info-p (source-info-parent sinfo)))
-                (pathnamep (file-info-name finfo)))
+                (pathnamep (file-info-truename finfo)))
             finfo))))
 
 ;;; If STREAM is present, return it, otherwise open a stream to the
@@ -879,34 +898,38 @@ necessary, since type inference may take arbitrarily long to converge.")
 ;;;   This gives the effect of rebinding around each file.
 ;;; which doesn't seem to be true now. Check to make sure that if
 ;;; such rebinding is necessary, it's still done somewhere.
-;;; FIXME: We will want to have a way to process multiple files again
-;;; for the sake of block compilation.
 (defun get-source-stream (info)
   (declare (type source-info info))
   (or (source-info-stream info)
       (let* ((file-info (source-info-file-info info))
-             (name (file-info-name file-info))
+             (pathname (file-info-pathname file-info))
              (external-format (file-info-external-format file-info)))
-        (setf *compile-file-truename* name
-              *compile-file-pathname* (file-info-untruename file-info)
-              (source-info-stream info)
-              (let ((stream
-                     (open name
-                           :direction :input
-                           :external-format external-format
-                           ;; SBCL stream classes aren't available in the host
-                           #-sb-xc-host :class
-                           #-sb-xc-host 'form-tracking-stream)))
-                #+(and sb-xc-host sb-show)
-                (setq stream (make-concatenated-stream
-                              stream
-                              (make-string-input-stream
-                               (format nil "(write-string \"Completed TLFs: ~A~%\")"
-                                       (file-info-untruename file-info)))))
-                (when (file-info-subforms file-info)
-                  (setf (form-tracking-stream-observer stream)
-                        (make-form-tracking-stream-observer file-info)))
-                stream)))))
+        (let ((stream
+               (open pathname
+                     :direction :input
+                     :external-format external-format
+                     ;; SBCL stream classes aren't available in the host
+                     #-sb-xc-host :class
+                     #-sb-xc-host 'form-tracking-stream)))
+          ;; If you don't want merged pathnames embedded in your build artifacts,
+          ;; then you surely don't want them in *COMPILE-FILE-PATHNAME* either.
+          ;; [And can't we just bind this to PATHNAME is all cases? If anything,
+          ;; it seems to me that asking the stream for its name is expressly backwards]
+          (setf *compile-file-pathname* (if *merge-pathnames* (pathname stream) pathname)
+                *compile-file-truename* (truename stream)
+                (file-info-truename file-info) *compile-file-truename*)
+          (when (file-info-subforms file-info)
+            (setf (form-tracking-stream-observer stream)
+                  (make-form-tracking-stream-observer file-info)))
+          (setf (source-info-stream info) stream)
+          ;; This used to happen before opening the file, which
+          ;; inhibited lazy computation of the truename, and was a
+          ;; minor time-of-check-vs-time-of-use mistake. It doesn't
+          ;; seem worthwhile to pass the verbose bit down from C-F,
+          ;; however.
+          (when *compile-verbose*
+            (print-compile-start-note info))
+          stream))))
 
 ;;; Close the stream in INFO if it is open.
 (defun close-source-info (info)
@@ -1029,6 +1052,13 @@ necessary, since type inference may take arbitrarily long to converge.")
             (if (eq (block-compile *compilation*) t)
                 (push tll (toplevel-lambdas *compilation*))
                 (compile-toplevel (list tll) nil))
+            (when (consp form)
+              (case (car form)
+                ;; Block compilation can cause packages to be defined after
+                ;; they are referenced at load time, so we have to delimit the
+                ;; current block compilation.
+                ((sb-impl::%defpackage)
+                 (delimit-block-compilation))))
             nil)))))
 
 ;;; Macroexpand FORM in the current environment with an error handler.
@@ -1401,6 +1431,20 @@ necessary, since type inference may take arbitrarily long to converge.")
 (defun producing-fasl-file ()
   (fasl-output-p *compile-object*))
 
+;;; Compile FORM and arrange for it to be called at load-time. Return
+;;; the dumper handle and our best guess at the type of the object.
+;;; Potential optimizations: We could test the form for constantness
+;;; (including FIND-PACKAGE forms) and dump it as a literal directly
+;;; instead. We could also fopcompile more complex non-constant forms.
+(defun compile-load-time-value (form &optional no-skip)
+  (let ((lambda (compile-load-time-stuff form t)))
+    (values (fasl-dump-load-time-value-lambda lambda *compile-object*
+                                              no-skip)
+            (let ((type (leaf-type lambda)))
+              (if (fun-type-p type)
+                  (single-value-type (fun-type-returns type))
+                  *wild-type*)))))
+
 ;;; Compile the FORMS and arrange for them to be called (for effect,
 ;;; not value) at load time.
 (defun compile-make-load-form-init-forms (forms fasl)
@@ -1424,8 +1468,7 @@ necessary, since type inference may take arbitrarily long to converge.")
             (dolist (form value-forms)
               (unless (eq form 'sb-pcl:+slot-unbound+)
                 (let ((val (constant-form-value form)))
-                  ;; invoke recursive MAKE-LOAD-FORM stuff as necessary
-                  (find-constant val)
+                  (maybe-emit-make-load-forms val)
                   (push val values))))
             (setq values (nreverse values))
             (dolist (form value-forms)
@@ -1461,6 +1504,113 @@ necessary, since type inference may take arbitrarily long to converge.")
       (setf (component-name component) (leaf-debug-name lambda))
       (compile-component component)
       (clear-ir1-info component))))
+
+
+;;; The entry point for MAKE-LOAD-FORM support. When IR1 conversion
+;;; finds a constant structure, it invokes this to arrange for proper
+;;; dumping. If it turns out that the constant has already been
+;;; dumped, then we don't need to do anything.
+;;;
+;;; If the constant hasn't been dumped, then we check to see whether
+;;; we are in the process of creating it. We detect this by
+;;; maintaining the special *CONSTANTS-BEING-CREATED* as a list of all
+;;; the constants we are in the process of creating. Actually, each
+;;; entry is a list of the constant and any init forms that need to be
+;;; processed on behalf of that constant.
+;;;
+;;; It's not necessarily an error for this to happen. If we are
+;;; processing the init form for some object that showed up *after*
+;;; the original reference to this constant, then we just need to
+;;; defer the processing of that init form. To detect this, we
+;;; maintain *CONSTANTS-CREATED-SINCE-LAST-INIT* as a list of the
+;;; constants created since the last time we started processing an
+;;; init form. If the constant passed to emit-make-load-form shows up
+;;; in this list, then there is a circular chain through creation
+;;; forms, which is an error.
+;;;
+;;; If there is some intervening init form, then we blow out of
+;;; processing it by throwing to the tag PENDING-INIT. The value we
+;;; throw is the entry from *CONSTANTS-BEING-CREATED*. This is so the
+;;; offending init form can be tacked onto the init forms for the
+;;; circular object.
+;;;
+;;; If the constant doesn't show up in *CONSTANTS-BEING-CREATED*, then
+;;; we have to create it. We call %MAKE-LOAD-FORM and check
+;;; if the result is 'FOP-STRUCT, and if so we don't do anything.
+;;; The dumper will eventually get its hands on the object and use the
+;;; normal structure dumping noise on it.
+;;;
+;;; Otherwise, we bind *CONSTANTS-BEING-CREATED* and
+;;; *CONSTANTS-CREATED-SINCE- LAST-INIT* and compile the creation form
+;;; much the way LOAD-TIME-VALUE does. When this finishes, we tell the
+;;; dumper to use that result instead whenever it sees this constant.
+;;;
+;;; Now we try to compile the init form. We bind
+;;; *CONSTANTS-CREATED-SINCE-LAST-INIT* to NIL and compile the init
+;;; form (and any init forms that were added because of circularity
+;;; detection). If this works, great. If not, we add the init forms to
+;;; the init forms for the object that caused the problems and let it
+;;; deal with it.
+(defvar *constants-being-created*)
+(defvar *constants-created-since-last-init*)
+(defun emit-make-load-form (constant &aux (constants-being-created
+                                           (if (boundp '*constants-being-created*)
+                                               *constants-being-created*))
+                                          (constants-created-since-last-init
+                                           (if (boundp '*constants-created-since-last-init*)
+                                               *constants-created-since-last-init*))
+                                          (fasl *compile-object*))
+  (aver (fasl-output-p fasl))
+  (unless (fasl-constant-already-dumped-p constant fasl)
+    (let ((circular-ref (assoc constant constants-being-created :test #'eq)))
+      (when circular-ref
+        (when (find constant constants-created-since-last-init :test #'eq)
+          (throw constant t))
+        (throw 'pending-init circular-ref)))
+    (multiple-value-bind (creation-form init-form) (%make-load-form constant)
+      (cond
+        ((eq init-form 'sb-fasl::fop-struct)
+         (fasl-note-dumpable-instance constant fasl)
+         t)
+        (t
+         (let* ((name (write-to-string constant :level 1 :length 2))
+                (info (if init-form
+                          (list constant name init-form)
+                          (list constant))))
+           (let ((*constants-being-created* (cons info constants-being-created))
+                 (*constants-created-since-last-init*
+                  (cons constant constants-created-since-last-init)))
+             (when
+                 (catch constant
+                   (fasl-note-handle-for-constant
+                    constant
+                    (cond ((typep creation-form
+                                  '(cons (eql sb-kernel::new-instance)
+                                         (cons symbol null)))
+                           (dump-object (cadr creation-form) fasl)
+                           (dump-fop 'sb-fasl::fop-allocate-instance fasl)
+                           (let ((index (sb-fasl::fasl-output-table-free fasl)))
+                             (setf (sb-fasl::fasl-output-table-free fasl) (1+ index))
+                             index))
+                          (t
+                           (compile-load-time-value creation-form t)))
+                    fasl)
+                   nil)
+               (compiler-error "circular references in creation form for ~S"
+                               constant)))
+           (when (cdr info)
+             (let* ((*constants-created-since-last-init* nil)
+                    (circular-ref
+                     (catch 'pending-init
+                       (loop for (nil form) on (cdr info) by #'cddr
+                         collect form into forms
+                         finally (compile-make-load-form-init-forms forms fasl))
+                       nil)))
+               (when circular-ref
+                 (setf (cdr circular-ref)
+                       (append (cdr circular-ref) (cdr info)))))))
+         nil)))))
+
 
 ;;;; COMPILE-FILE
 
@@ -1553,10 +1703,16 @@ necessary, since type inference may take arbitrarily long to converge.")
         (with-source-paths
             (compile-toplevel (nreverse (toplevel-lambdas compilation)) nil))
         (setf (toplevel-lambdas compilation) nil))
-      ;; CMUCL always reverts this to :SPECIFIED. But we probably want
-      ;; to restore it to the user default.
-      (setf (block-compile compilation) *block-compile-argument*)
-      (setf (entry-points compilation) nil))))
+      (setf (block-compile compilation) :specified)
+      (setf (entry-points compilation) nil)
+      (setf *hairy-defconstants* nil))))
+
+(defun delimit-block-compilation ()
+  (let ((compilation *compilation*))
+    (when (block-compile compilation)
+      (when (toplevel-lambdas compilation)
+        (compile-toplevel (nreverse (toplevel-lambdas compilation)) nil)
+        (setf (toplevel-lambdas compilation) nil)))))
 
 (declaim (ftype function handle-condition-p))
 (flet ((get-handled-conditions ()
@@ -1649,7 +1805,6 @@ necessary, since type inference may take arbitrarily long to converge.")
         (handler-bind (((satisfies handle-condition-p) #'handle-condition-handler))
           (with-compilation-values
             (with-compilation-unit ()
-              (with-world-lock ()
                 (setf (sb-fasl::fasl-output-source-info *compile-object*)
                       (debug-source-for-info info))
                 (with-ir1-namespace
@@ -1677,7 +1832,7 @@ necessary, since type inference may take arbitrarily long to converge.")
                                       list))
                                 nil
                                 nil))))
-                nil))))
+                nil)))
       ;; Some errors are sufficiently bewildering that we just fail
       ;; immediately, without trying to recover and compile more of
       ;; the input file.
@@ -1723,10 +1878,10 @@ necessary, since type inference may take arbitrarily long to converge.")
     #+sb-xc-host
     (compiler-mumble "~&; ~Aing file ~S:~%"
                      (if sb-cold::*compile-for-effect-only* "load" "x-compil")
-                     (namestring (file-info-name file-info)))
+                     (namestring (file-info-pathname file-info)))
     #-sb-xc-host
     (compiler-mumble "~&; compiling file ~S (written ~A):~%"
-                     (namestring (file-info-name file-info))
+                     (namestring (file-info-pathname file-info))
                      (format-universal-time nil
                                             (file-info-write-date file-info)
                                             :style :government
@@ -1751,16 +1906,15 @@ necessary, since type inference may take arbitrarily long to converge.")
      &key
 
      ;; ANSI options
-     (output-file (cfp-output-file-default input-file))
-     ;; FIXME: ANSI doesn't seem to say anything about
-     ;; *COMPILE-VERBOSE* and *COMPILE-PRINT* being rebound by this
-     ;; function..
+     (output-file "" output-file-p)
+     ;; We rebind the specials despite such behavior not being mentioned
+     ;; in CLHS. Several other lisp implementations do this as well.
      ((:verbose *compile-verbose*) *compile-verbose*)
      ((:print *compile-print*) *compile-print*)
-     ((:progress *compile-progress*) *compile-progress*)
      (external-format :default)
 
      ;; extensions
+     ((:progress *compile-progress*) *compile-progress*)
      (trace-file nil)
      ((:block-compile *block-compile-argument*)
       *block-compile-default*)
@@ -1809,37 +1963,53 @@ returning its filename.
   :EMIT-CFASL
      (Experimental). If true, outputs the toplevel compile-time effects
      of this file into a separate .cfasl file."
-  (let* ((fasl-output nil)
+  (%compile-files (list input-file) external-format output-file-p output-file
+                  trace-file emit-cfasl))
+
+(defun compile-files
+    (inputs &key (output-file "" output-file-p)
+                 ((:verbose *compile-verbose*) *compile-verbose*)
+                 ((:print *compile-print*) *compile-print*)
+                 (external-format :default)
+                 ((:progress *compile-progress*) *compile-progress*)
+                 (trace-file nil)
+                 ((:block-compile *block-compile-argument*) *block-compile-default*)
+                 ((:entry-points *entry-points-argument*) nil)
+                 (emit-cfasl *emit-cfasl*))
+  (%compile-files inputs external-format output-file-p output-file trace-file emit-cfasl))
+
+(defun %compile-files (inputs external-format output-file-p output-file
+                       trace-file emit-cfasl)
+  (let* ((output-file-pathname nil)
+         (fasl-output nil)
+         (cfasl-pathname nil)
          (cfasl-output nil)
-         (output-file-name nil)
-         (coutput-file-name nil)
          (abort-p t)
          (warnings-p nil)
          (failure-p t) ; T in case error keeps this from being set later
-         (input-pathname (verify-source-file input-file))
-         (source-info
-          (make-file-source-info input-pathname external-format
-                                 #-sb-xc-host t)) ; can't track, no SBCL streams
+         (input-pathname (verify-source-file (car inputs)))
+         (source-infos
+          (mapcar (lambda (file)
+                    (make-file-source-info (verify-source-file file)
+                                           external-format
+                                           #-sb-xc-host t)) ; can't track, no SBCL streams
+                  inputs))
          (*last-message-count* (list* 0 nil nil))
          (*last-error-context* nil)
          (*compiler-trace-output* nil)) ; might be modified below
 
     (unwind-protect
         (progn
-          (when output-file
-            (setq output-file-name
-                  (compile-file-pathname input-file
-                                               :output-file output-file))
-            (setq fasl-output
-                  (open-fasl-output output-file-name
-                                    (namestring input-pathname))))
+          ;; To avoid passing "" as OUTPUT-FILE when unsupplied, we exploit the fact
+          ;; that COMPILE-FILE-PATHNAME allows random &KEY args.
+          (setq output-file-pathname
+                (compile-file-pathname (car inputs)
+                                       (when output-file-p :output-file) output-file)
+                fasl-output (open-fasl-output output-file-pathname
+                                              (namestring input-pathname)))
           (when emit-cfasl
-            (setq coutput-file-name
-                  (make-pathname :type "cfasl"
-                                 :defaults output-file-name))
-            (setq cfasl-output
-                  (open-fasl-output coutput-file-name
-                                    (namestring input-pathname))))
+            (setq cfasl-pathname (make-pathname :type "cfasl" :defaults output-file-pathname))
+            (setq cfasl-output (open-fasl-output cfasl-pathname (namestring input-pathname))))
           (when trace-file
             (setf *compiler-trace-output*
                   (if (streamp trace-file)
@@ -1850,29 +2020,37 @@ returning its filename.
                                             (fasl-output-stream fasl-output)))
                             :if-exists :supersede :direction :output))))
 
-          (when *compile-verbose*
-            (print-compile-start-note source-info))
-
           (let ((*compile-object* fasl-output))
-            (setf (values abort-p warnings-p failure-p)
-                  (sub-compile-file source-info cfasl-output))))
+            (setf abort-p nil failure-p nil)
+            (dolist (source-info source-infos)
+              (multiple-value-bind (sub-abort-p sub-warnings-p sub-failure-p)
+                  (sub-compile-file source-info cfasl-output)
+                (setf abort-p (or abort-p sub-abort-p)
+                      warnings-p (or warnings-p sub-warnings-p)
+                      failure-p (or failure-p sub-failure-p))))))
 
-      (close-source-info source-info)
+      (mapc #'close-source-info source-infos)
 
       (when fasl-output
         (close-fasl-output fasl-output abort-p)
-        (setq output-file-name
-              (pathname (fasl-output-stream fasl-output)))
+        ;; There was an assignment here
+        ;;   (setq fasl-pathname (pathname (fasl-output-stream fasl-output)))
+        ;; which seems pretty bogus, because we've computed the fasl-pathname,
+        ;; and should return exactly what was computed so that it 100% agrees
+        ;; with what COMPILE-FILE-PATHNAME said we would write into.
+        ;; A distorted variation of the name coming from the stream is just wrong,
+        ;; because do not support versioned pathnames.
         (when (and (not abort-p) *compile-verbose*)
-          (compiler-mumble "~2&; wrote ~A~%" (namestring output-file-name))))
+          (compiler-mumble "~2&; wrote ~A~%" (namestring output-file-pathname))))
 
       (when cfasl-output
         (close-fasl-output cfasl-output abort-p)
         (when (and (not abort-p) *compile-verbose*)
-          (compiler-mumble "; wrote ~A~%" (namestring coutput-file-name))))
+          (compiler-mumble "; wrote ~A~%" (namestring cfasl-pathname))))
 
       (when *compile-verbose*
-        (print-compile-end-note source-info (not abort-p)))
+        (dolist (source-info source-infos)
+          (print-compile-end-note source-info (not abort-p))))
 
       ;; Don't nuke stdout if you use :trace-file *standard-output*
       (when (and trace-file (not (streamp trace-file)))
@@ -1884,24 +2062,20 @@ returning its filename.
     ;; before the whole file has been processed, due to eg. a reader
     ;; error.
     (values (when (and (not abort-p) output-file)
-              ;; Hack around filesystem race condition...
-              (or (probe-file output-file-name) output-file-name))
+              ;; Again, more bogosity. Why do PROBE-FILE here
+              ;; when it achieves nothing other than to potentially disagree
+              ;; with what COMPILE-FILE-PATHNAME returned.
+              ;; I would guess that the intent of the spec was to not return
+              ;; pathnames with a wild version component, but it never anticipated
+              ;; that content-addressable storage would be a thing.
+              ;; Unfortunately there's no way to give lossless information here
+              ;; while remaining ANSI-compliant. So let's repurpose the secret
+              ;; *MERGE-PATHNAMES* option to return pathnames that don't suck.
+              (or (and *merge-pathnames* (probe-file output-file-pathname))
+                  output-file-pathname))
             warnings-p
             failure-p)))
 
-;;; a helper function for COMPILE-FILE-PATHNAME: the default for
-;;; the OUTPUT-FILE argument
-;;;
-;;; ANSI: The defaults for the OUTPUT-FILE are taken from the pathname
-;;; that results from merging the INPUT-FILE with the value of
-;;; *DEFAULT-PATHNAME-DEFAULTS*, except that the type component should
-;;; default to the appropriate implementation-defined default type for
-;;; compiled files.
-(defun cfp-output-file-default (input-file)
-  (let* ((defaults (merge-pathnames input-file *default-pathname-defaults*))
-         (retyped (make-pathname :type *fasl-file-type* :defaults defaults)))
-    retyped))
-
 ;;; KLUDGE: Part of the ANSI spec for this seems contradictory:
 ;;;   If INPUT-FILE is a logical pathname and OUTPUT-FILE is unsupplied,
 ;;;   the result is a logical pathname. If INPUT-FILE is a logical
@@ -1911,119 +2085,99 @@ returning its filename.
 ;;; at the level of e.g. whether it returns logical pathname or a
 ;;; physical pathname. Patches to make it more correct are welcome.
 ;;; -- WHN 2000-12-09
-(defun compile-file-pathname (input-file
-                              &key
-                                (output-file nil output-file-p)
+;;;
+;;; Issues of logical-pathname handling aside, I checked some other lisps
+;;; to see what they do with the following two examples:
+;;;  (COMPILE-FILE "a/b/file.lisp :output-file "x/y/z/")
+;;;  (COMPILE-FILE "a/b/file.lisp :output-file "x/y/out")
+;;; and it turns out that they don't implement the spirit of the law,
+;;; forget about the letter of the law. The spirit (intent) is that regardless
+;;; of how pathnames are handled, COMPILE-FILE-PATHNAME should tell you exactly
+;;; what pathname the compiler would write into given the input and output to
+;;; COMPILE-FILE. But they can't even do that much correctly.
+;;; So forget about how merging "should" work - it's a crap shoot at best.
+
+;;; Clozure 1.10-r16196
+;;; -------------------
+;;; ? (COMPILE-FILE-PATHNAME "a/b/file.lisp" :output-file #p"x/y/z/")
+;;;  => #P"a/b/x/y/z/file.lx64fsl" ; ok, so it thinks it merges input and output dirs
+;;; let's confirm by actually compiling:
+;;; ? (COMPILE-FILE "a/b/file.lisp" :output-file #p"x/y/z/")
+;;; #P"/tmp/sbcl/x/y/z/file.lx64fsl" ; no, it didn't actually. it's what I want though
+;;;
+;;; ECL 16.1.3
+;;; ----------
+;;; (compile-file-pathname "a/b/file.lisp" :output-file #p"x/y/z/")
+;;; #P"x/y/z/" ; ok, maybe it will do additional defaulting to get the name and type?
+;;; (compile-file "a/b/file.lisp" :output-file #p"x/y/z/")
+;;; Internal error:
+;;;   ** Pathname without a physical namestring:
+;;; Nope, it won't default them. However:
+;;; (compile-file "a/b/file.lisp" :output-file #p"x/y/z/out")
+;;; => #P"/tmp/sbcl/x/y/z/out"
+;;; so it worked, but it failed to default the file type to '.fas'
+;;; which it would have if nothing were specified.
+;;;
+;;; ABCL 1.7.1
+;;; ----------
+;;; (compile-file-pathname "a/b/file.lisp" :output-file #p"x/y/z/")
+;;; #P"/tmp/sbcl/a/b/x/y/z/file.lisp" ; OK, so it says it merged input + output dirs
+;;; but it didn't stick on a pathname-type. However
+;;; (compile-file "a/b/file.lisp" :output-file #p"x/y/z/")
+;;; ; Compiling /tmp/sbcl/a/b/file.lisp ...
+;;; #<THREAD "interpreter" {E2B80EB}>: Debugger invoked on condition of type SIMPLE-ERROR
+;;;   Pathname has no namestring:
+;;; And now:
+;;; (compile-file "a/b/file.lisp" :output-file #p"x/y/z/out.abcl")
+;;; => #P"/tmp/sbcl/x/y/z/out.abcl" ; so it *didn't* actually merge dirs, which is fine
+;;;
+;;; But we try our best to give somewhat understandable semantics:
+;;; * strongly prefer that all fasls have a pathname-type
+;;;   whether or not the output was specified. However, if you are sadistic
+;;;   (and/or enjoy being confusing to others), then :OUTPUT-FILE is permitted
+;;;   to have :UNSPECIFIC as the type, and it will lack the '.fasl' suffix.
+;;; * we can accept just a directory for the output (a namestring ending in "/"
+;;;   on Unix) and will take the pathname-name from the input
+;;; * we will never merge directories from the input to output
+;;;
+;;; It is unclear what should happen with
+;;; (compile-file "sys:contrib;foo.lisp" :output-file "obj")
+;;; Is "obj" on the logical host or the physical host?
+
+(defun compile-file-pathname (input-file &key (output-file nil output-file-p)
                               &allow-other-keys)
   "Return a pathname describing what file COMPILE-FILE would write to given
    these arguments."
-  (if output-file-p
-      (merge-pathnames output-file (cfp-output-file-default input-file))
-      (cfp-output-file-default input-file)))
+  ;; ANSI: The defaults for the OUTPUT-FILE are taken from the pathname
+  ;; that results from merging the INPUT-FILE with the value of
+  ;; *DEFAULT-PATHNAME-DEFAULTS*, except that the type component should
+  ;; default to the appropriate implementation-defined default type for
+  ;; compiled files.
+   (let* ((input (pathname input-file))
+          (output (if output-file-p (pathname output-file)))
+          (host/dev/dir
+           (if (or (not output) (memq (pathname-directory output) '(nil :unspecific)))
+               input output)))
+     ;; Merging *D-P-D* here is ridiculous, because every pathname is eventually
+     ;; merged against it.
+     ;; Users can set it to #P"" around calling this to obtain a lossless answer.
+     (merge-pathnames
+      (flet ((pick (slot default &aux (specified (if output (funcall slot output))))
+               ;; :unspecific is left alone, "as if the field were 'filled'"
+               ;; (http://www.lispworks.com/documentation/HyperSpec/Body/19_bbbca.htm)
+               ;; which makes little to zero sense at all for the PATHNAME-NAME
+               ;; of a fasl file, but is allowable for its PATHNAME-TYPE.
+               (cond ((or (not specified)
+                          (and (eq specified :unspecific) (eq slot 'pathname-name)))
+                      default)
+                     (t
+                      specified))))
+        (make-pathname :host (pathname-host host/dev/dir)
+                       :device (pathname-device host/dev/dir)
+                       :directory (pathname-directory host/dev/dir)
+                       :name (pick 'pathname-name (pathname-name input))
+                       :type (pick 'pathname-type *fasl-file-type*))))))
 
-;;;; MAKE-LOAD-FORM stuff
-
-;;; The entry point for MAKE-LOAD-FORM support. When IR1 conversion
-;;; finds a constant structure, it invokes this to arrange for proper
-;;; dumping. If it turns out that the constant has already been
-;;; dumped, then we don't need to do anything.
-;;;
-;;; If the constant hasn't been dumped, then we check to see whether
-;;; we are in the process of creating it. We detect this by
-;;; maintaining the special *CONSTANTS-BEING-CREATED* as a list of all
-;;; the constants we are in the process of creating. Actually, each
-;;; entry is a list of the constant and any init forms that need to be
-;;; processed on behalf of that constant.
-;;;
-;;; It's not necessarily an error for this to happen. If we are
-;;; processing the init form for some object that showed up *after*
-;;; the original reference to this constant, then we just need to
-;;; defer the processing of that init form. To detect this, we
-;;; maintain *CONSTANTS-CREATED-SINCE-LAST-INIT* as a list of the
-;;; constants created since the last time we started processing an
-;;; init form. If the constant passed to emit-make-load-form shows up
-;;; in this list, then there is a circular chain through creation
-;;; forms, which is an error.
-;;;
-;;; If there is some intervening init form, then we blow out of
-;;; processing it by throwing to the tag PENDING-INIT. The value we
-;;; throw is the entry from *CONSTANTS-BEING-CREATED*. This is so the
-;;; offending init form can be tacked onto the init forms for the
-;;; circular object.
-;;;
-;;; If the constant doesn't show up in *CONSTANTS-BEING-CREATED*, then
-;;; we have to create it. We call %MAKE-LOAD-FORM and check
-;;; if the result is 'FOP-STRUCT, and if so we don't do anything.
-;;; The dumper will eventually get its hands on the object and use the
-;;; normal structure dumping noise on it.
-;;;
-;;; Otherwise, we bind *CONSTANTS-BEING-CREATED* and
-;;; *CONSTANTS-CREATED-SINCE- LAST-INIT* and compile the creation form
-;;; much the way LOAD-TIME-VALUE does. When this finishes, we tell the
-;;; dumper to use that result instead whenever it sees this constant.
-;;;
-;;; Now we try to compile the init form. We bind
-;;; *CONSTANTS-CREATED-SINCE-LAST-INIT* to NIL and compile the init
-;;; form (and any init forms that were added because of circularity
-;;; detection). If this works, great. If not, we add the init forms to
-;;; the init forms for the object that caused the problems and let it
-;;; deal with it.
-(defvar *constants-being-created* nil)
-(defvar *constants-created-since-last-init* nil)
-;;; FIXME: Shouldn't these^ variables be unbound outside LET forms?
-(defun emit-make-load-form (constant &aux (fasl *compile-object*))
-  (aver (fasl-output-p fasl))
-  (unless (fasl-constant-already-dumped-p constant fasl)
-    (let ((circular-ref (assoc constant *constants-being-created* :test #'eq)))
-      (when circular-ref
-        (when (find constant *constants-created-since-last-init* :test #'eq)
-          (throw constant t))
-        (throw 'pending-init circular-ref)))
-    (multiple-value-bind (creation-form init-form) (%make-load-form constant)
-      (cond
-        ((eq init-form 'sb-fasl::fop-struct)
-         (fasl-note-dumpable-instance constant fasl)
-         t)
-        (t
-         (let* ((name (write-to-string constant :level 1 :length 2))
-                (info (if init-form
-                          (list constant name init-form)
-                          (list constant))))
-           (let ((*constants-being-created*
-                  (cons info *constants-being-created*))
-                 (*constants-created-since-last-init*
-                  (cons constant *constants-created-since-last-init*)))
-             (when
-                 (catch constant
-                   (fasl-note-handle-for-constant
-                    constant
-                    (cond ((typep creation-form
-                                  '(cons (eql sb-kernel::new-instance)
-                                         (cons symbol null)))
-                           (dump-object (cadr creation-form) fasl)
-                           (dump-fop 'sb-fasl::fop-allocate-instance fasl)
-                           (let ((index (sb-fasl::fasl-output-table-free fasl)))
-                             (setf (sb-fasl::fasl-output-table-free fasl) (1+ index))
-                             index))
-                          (t
-                           (compile-load-time-value creation-form t)))
-                    fasl)
-                   nil)
-               (compiler-error "circular references in creation form for ~S"
-                               constant)))
-           (when (cdr info)
-             (let* ((*constants-created-since-last-init* nil)
-                    (circular-ref
-                     (catch 'pending-init
-                       (loop for (nil form) on (cdr info) by #'cddr
-                         collect form into forms
-                         finally (compile-make-load-form-init-forms forms fasl))
-                       nil)))
-               (when circular-ref
-                 (setf (cdr circular-ref)
-                       (append (cdr circular-ref) (cdr info)))))))
-         nil)))))
-
 ;;; FIXME: find a better place for this.
 (defun always-boundp (name)
   (case (info :variable :always-bound name)

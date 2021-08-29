@@ -259,7 +259,7 @@ during backtrace.
 (defconstant simple-fun-source-slot  2) ; form and/or docstring
 (defconstant simple-fun-info-slot    3) ; type and possibly xref
 
-#-(or x86 x86-64)
+#-(or x86 x86-64 arm64)
 (define-primitive-object (return-pc :lowtag other-pointer-lowtag :widetag t)
   (return-point :c-type "unsigned char" :rest-p t))
 
@@ -272,6 +272,10 @@ during backtrace.
                                    :alloc-trans %alloc-closure)
   (fun :init :arg :ref-trans #+(or x86 x86-64) %closure-callee
                              #-(or x86 x86-64) %closure-fun)
+  ;; 'fun' is an interior pointer to code, but we also need the base pointer
+  ;; for MPS. I'm trying to figure out how to avoid this word of overhead,
+  ;; but it works for the time being.
+  #+metaspace (code :ref-known (flushable) :ref-trans %closure-code)
   (info :rest-p t))
 
 (define-primitive-object (funcallable-instance
@@ -324,7 +328,7 @@ during backtrace.
 (define-primitive-object (unwind-block)
   (uwp :c-type "struct unwind_block *")
   (cfp :c-type "lispobj *")
-  #-(or x86 x86-64) code
+  #-(or x86 x86-64 arm64) code
   entry-pc
   #+(and win32 x86) next-seh-frame
   #+(and win32 x86) seh-frame-handler
@@ -336,7 +340,7 @@ during backtrace.
 (define-primitive-object (catch-block)
   (uwp :c-type "struct unwind_block *")
   (cfp :c-type "lispobj *")
-  #-(or x86 x86-64) code
+  #-(or x86 x86-64 arm64) code
   entry-pc
   #+(and win32 x86) next-seh-frame
   #+(and win32 x86) seh-frame-handler
@@ -508,15 +512,16 @@ during backtrace.
   (alien-stack-pointer :c-type "lispobj *" :pointer t
                        :special *alien-stack-pointer*)
   (stepping)
+  ;; Deterministic consing profile recording area.
+  (profile-data :c-type "uword_t *" :pointer t)
+  ;; Thread-local allocation buffers
+  #+gencgc (boxed-tlab :c-type "struct alloc_region" :length 4)
+  #+gencgc (unboxed-tlab :c-type "struct alloc_region" :length 4)
+  ;; END of slots to keep near the beginning.
+
   (dynspace-addr)
   (dynspace-card-count)
   (dynspace-pte-base)
-  ;; Deterministic consing profile recording area.
-  (profile-data :c-type "uword_t *" :pointer t)
-  ;; Lisp needs only the first two fields of the alloc_region, so it's OK if the
-  ;; final 2 fields have offsets >= 128 from the base of the thread structure.
-  #+gencgc (alloc-region :c-type "struct alloc_region" :length 4)
-  ;; END of slots to keep near the beginning.
 
   ;; This is the original address at which the memory was allocated,
   ;; which may have different alignment then what we prefer to use.
@@ -562,6 +567,16 @@ during backtrace.
   (control-stack-pointer :c-type "lispobj *")
   #+mach-exception-handler
   (mach-port-name :c-type "mach_port_name_t")
+
+  ;; allocation instrumenting
+  (tot-bytes-alloc-boxed)
+  (tot-bytes-alloc-unboxed)
+  (slow-path-allocs)
+  (et-allocator-mutex-acq) ; elapsed times
+  (et-find-freeish-page)
+  (et-bzeroing)
+  (obj-size-histo :c-type "size_histogram" :length #.sb-vm:n-word-bits)
+
   ;; The *current-thread* MUST be the last slot in the C thread structure.
   ;; It it the only slot that needs to be noticed by the garbage collector.
   (lisp-thread :pointer t :special sb-thread:*current-thread*))

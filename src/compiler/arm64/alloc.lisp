@@ -39,11 +39,12 @@
                         (load-stack-tn temp ,tn)
                         temp)))))
              (let* ((cons-cells (if star (1- num) num))
-                    (alloc (* (pad-data-block cons-size) cons-cells)))
-               (pseudo-atomic (pa-flag :sync nil)
+                    (alloc (* (pad-data-block cons-size) cons-cells))
+                    (dx (node-stack-allocate-p node)))
+               (pseudo-atomic (pa-flag :sync nil :elide dx)
                  (allocation 'list alloc list-pointer-lowtag res
                              :flag-tn pa-flag
-                             :stack-allocate-p (node-stack-allocate-p node)
+                             :stack-allocate-p dx
                              :lip lip)
                  (move ptr res)
                  (dotimes (i (1- cons-cells))
@@ -103,8 +104,7 @@
                              (logior
                               (ash (1- size) n-widetag-bits)
                               closure-widetag))
-        (storew pa-flag result 0 fun-pointer-lowtag)
-        (storew function result closure-fun-slot fun-pointer-lowtag)))))
+        (storew-pair pa-flag 0 function closure-fun-slot tmp-tn)))))
 
 ;;; The compiler likes to be able to directly make value cells.
 ;;;
@@ -117,8 +117,9 @@
   (:generator 10
     (with-fixed-allocation (result pa-flag value-cell-widetag
                             value-cell-size :stack-allocate-p stack-allocate-p
-                            :lip lip)
-      (storew value result value-cell-value-slot other-pointer-lowtag))))
+                            :lip lip
+                            :store-type-code nil)
+      (storew-pair pa-flag 0 value value-cell-value-slot tmp-tn))))
 
 ;;;; Automatic allocators for primitive objects.
 

@@ -12,7 +12,9 @@
 (in-package "SB-VM")
 
 (defun zeroize (tn)
-  (inst xor :dword tn tn))
+  (if (stack-tn-p tn)
+      (inst mov tn 0)
+      (inst xor :dword tn tn)))
 
 (define-move-fun (load-immediate 1) (vop x y)
   ((immediate)
@@ -246,22 +248,17 @@
   (signed-reg unsigned-reg) (any-reg descriptor-reg))
 
 (eval-when (:compile-toplevel :execute)
-  ;; Don't use a macro for this, because define-vop is weird.
+  ;; This is like a macro, but not a macro, because define-vop is weird.
   (defun bignum-from-reg (tn signedp)
-    (flet ((make-vector (suffix)
+    (flet ((make-vector ()
              (map 'vector
                   (lambda (x)
                     ;; At present R11 can not occur here,
                     ;; but let's be future-proof and allow for it.
                     (unless (member x '(rsp rbp) :test 'string=)
-                      (symbolicate "ALLOC-" signedp "-BIGNUM-IN-" x suffix)))
+                      (symbolicate "ALLOC-" signedp "-BIGNUM-IN-" x)))
                   +qword-register-names+)))
-      `(aref (cond #+avx2
-                   ((avx-registers-used-p)
-                    ',(make-vector "-AVX2"))
-                   (t
-                    ',(make-vector "")))
-             (tn-offset ,tn)))))
+      `(aref ,(make-vector) (tn-offset ,tn)))))
 
 ;;; Convert an untagged signed word to a lispobj -- fixnum or bignum
 ;;; as the case may be. Fixnum case inline, bignum case in an assembly

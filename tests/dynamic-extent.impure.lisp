@@ -343,7 +343,7 @@
   (let ((thing sb-c::*backend-parsed-vops*))
     ;; check some preconditions
     (assert (typep thing 'hash-table))
-    (assert (/= (sb-kernel:layout-bitmap (sb-kernel:%instance-layout thing))
+    (assert (/= (sb-kernel:wrapper-bitmap (sb-kernel:%instance-wrapper thing))
                 sb-kernel:+layout-all-tagged+))
     (assert-no-consing
      (sb-int:dx-let ((x (copy-structure thing)))
@@ -763,11 +763,8 @@
   (assert-no-consing (make-array-on-stack-10))
   (assert-no-consing (make-array-on-stack-11)))
 
-(when (gethash 'sb-vm::raw-instance-init/word sb-c::*backend-parsed-vops*)
-  (pushnew :raw-instance-init-vops *features*))
 (with-test (:name (:no-consing :dx-raw-instances)
-            :skipped-on (or (not :raw-instance-init-vops)
-                            (not (and :gencgc :c-stack-is-control-stack))))
+            :skipped-on (not (and :gencgc :c-stack-is-control-stack)))
   (let (a b)
     (setf a 1.24 b 1.23d0)
     (assert-no-consing (make-foo2-on-stack a b)))
@@ -949,7 +946,7 @@
                   (with-test (:name (:dx-flet-test ,n))
                     (test-dx-flet-test #',name ,n ,f1 ,f2 ,f3))))))
   (def 0 (list :one) (list :two) (list :three))
-  (def 1 (make-array 128) (list 1 2 3 4 5 6 7 8) (list 'list))
+  (def 1 (make-array 128 :initial-element nil) (list 1 2 3 4 5 6 7 8) (list 'list))
   (def 2 (list 1) (list 2 3) (list 4 5 6 7)))
 
 ;;; Test that unknown-values coming after a DX value won't mess up the

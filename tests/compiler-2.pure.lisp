@@ -177,9 +177,7 @@
                                  collect (1+ (random 4000))))
            (test-list (sort (delete-duplicates random-numbers) #'<))
            (packed-int (sb-c::pack-code-fixup-locs test-list nil))
-           (result (make-array 1 :element-type 'sb-ext:word)))
-      ;; The packer intrinsically self-checks the packing
-      ;; so we don't need to assert anything about that.
+           (result (make-array 1 :element-type '(unsigned-byte 32))))
       (sb-sys:with-pinned-objects (packed-int result)
         ;; Now exercise the C unpacker.
         ;; This hack of allocating 4 longs is terrible, but whatever.
@@ -1785,7 +1783,7 @@
   (checked-compile-and-assert
       ()
       `(lambda (type)
-         (make-array 4 :element-type type))
+         (make-array 4 :element-type type :initial-element 0))
     (('(or (cons (satisfies eval)) atom)) #(0 0 0 0) :test #'equalp)))
 
 (with-test (:name :substitute-single-use-lvar-exit-cleanups)
@@ -2680,7 +2678,7 @@
                 (t :none))))))
     ;; There should be no #<layout> referenced directly from the code header.
     ;; There is of course a vector of layouts in there to compare against.
-    (assert (not (ctu:find-code-constants f :type 'sb-kernel:layout)))
+    (assert (not (ctu:find-code-constants f :type 'sb-kernel:wrapper)))
     ;; The function had better work.
     (assert (eq (funcall f 'wat) :none))
     (assert (equal (funcall f (make-broadcast-stream *error-output*))
@@ -3170,3 +3168,80 @@
           t))
    ((-98) -98)
    ((95) t)))
+
+(with-test (:name :svref-with-addend+if-eq-immediate)
+  (checked-compile-and-assert
+   ()
+   `(lambda (a d)
+      (eql (svref a d) -276932090860495638))
+   ((#(1 0) 0) nil)
+   ((#(-276932090860495638) 0) t))
+  (checked-compile-and-assert
+   ()
+   `(lambda (n)
+      (position #c(1.0 2.0) #(nil nil nil) :start n))
+   ((0) nil)))
+
+(with-test (:name :zeroize-stack-tns)
+  (checked-compile-and-assert
+   ()
+   `(lambda (a b d e)
+      (declare (type fixnum a))
+      (dpb
+       (ash
+        (truncate 562949953421316  (max 97 d))
+        (min 81 (expt (boole boole-and e b) 2)))
+       (byte 7 5)
+       (dotimes (i 2 a)
+         (count i #(61) :test '>=))))
+   ((1 2 3 4) 1985)))
+
+(with-test (:name :logtest-derive-type-nil)
+  (checked-compile-and-assert
+   (:allow-warnings t)
+   `(lambda (c)
+      (block nil
+        (evenp (the integer (ignore-errors (return c))))))
+   ((1) 1)))
+
+(with-test (:name :cast-filter-lvar)
+  (checked-compile-and-assert
+   (:allow-warnings t)
+   `(lambda ()
+      (block nil
+        (equal
+         (the integer (tagbody
+                         (let ((* (lambda () (go tag))))
+                           (return))
+                       tag))
+         (the integer (block nil
+                        (return))))))
+   (() nil)))
+
+;;; EXPLICIT-CHECK + ETYPECASE should not produce a error message
+;;; which reveals whether type-checking on entry to a standard function
+;;; was performed this way or that way.
+(with-test (:name :etypecase-error-simplify)
+  (let ((x (nth-value 1 (ignore-errors (logcount (opaque-identity #\a)))))
+        (y (nth-value 1 (ignore-errors (oddp (opaque-identity #\a))))))
+    (assert (string= (princ-to-string x) (princ-to-string y)))))
+
+(with-test (:name :set-exclusive-or-inlined)
+  (checked-compile-and-assert
+   ()
+   `(lambda (set1 set2)
+      (declare (inline set-exclusive-or))
+      (set-exclusive-or set1 set2))))
+
+(declaim (inline inline-deletion-note))
+(defun inline-deletion-note (x y)
+  (if y
+      10
+      x))
+
+(with-test (:name :inline-deletion-note)
+  (checked-compile-and-assert
+   (:allow-notes nil)
+   `(lambda (x)
+      (inline-deletion-note x t))
+   ((t) 10)))

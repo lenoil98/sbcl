@@ -317,6 +317,7 @@ sufficiently motivated to do lengthy fixes."
                             :interactive-threads interactive
                             :other-threads other)))))
     (when err (error err))
+    #+allocator-metrics (setq sb-thread::*allocator-metrics* nil)
     (setq sb-thread::*sprof-data* nil))
   (tune-image-for-dump)
   (float-deinit)
@@ -366,6 +367,7 @@ sufficiently motivated to do lengthy fixes."
 ;;; Doing too much consing within MAP-ALLOCATED-OBJECTS can lead to heap
 ;;; exhaustion (due to inhibited GC), so this takes several passes.
 (defun coalesce-ctypes (&optional verbose)
+  (declare (optimize (sb-c::aref-trapping 0)))
   (let* ((table (make-hash-table :test 'equal))
          interned-ctypes
          referencing-objects)
@@ -445,6 +447,7 @@ sufficiently motivated to do lengthy fixes."
                                (%set-symbol-global-value obj (coalesce part)))))
                          ((not (memq accessor
                                      '(%closure-fun
+                                       %fun-layout %instance-layout
                                        symbol-package symbol-name fdefn-name
                                        %numerator %denominator
                                        %realpart %imagpart
@@ -524,8 +527,7 @@ sb-c::
                      (cond ((not foundp)
                             (setf (gethash name name-ht) name))
                            ((neq name new)
-                            (setf (%instance-ref debug-fun
-                                                 (get-dsd-index compiled-debug-fun name))
+                            (%instance-set debug-fun (get-dsd-index compiled-debug-fun name)
                                   new))))
                    while next))
             (sb-lockless::linked-list
@@ -563,7 +565,7 @@ sb-c::
                                        result))
                           (pushnew (code-from-fun fun) result)))))))
              (code-from-fun (fun)
-               (ecase (fun-subtype fun)
+               (ecase (%fun-pointer-widetag fun)
                  (#.simple-fun-widetag
                   (fun-code-header fun))
                  (#.funcallable-instance-widetag

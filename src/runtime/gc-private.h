@@ -15,6 +15,7 @@
 #ifndef _GC_PRIVATE_H_
 #define _GC_PRIVATE_H_
 
+#include "genesis/instance.h"
 #include "genesis/weak-pointer.h"
 #include "immobile-space.h"
 #include "code.h"
@@ -423,6 +424,7 @@ static inline int layout_depth2_id(struct layout* layout) {
     return vector[0];
 }
 // Keep in sync with hardwired IDs in src/compiler/generic/genesis.lisp
+#define WRAPPER_LAYOUT_ID 2
 #define LAYOUT_LAYOUT_ID 3
 #define LFLIST_NODE_LAYOUT_ID 4
 
@@ -430,15 +432,54 @@ static inline int layout_depth2_id(struct layout* layout) {
 /// This predicate is careful, as is it used to verify heap invariants.
 static inline boolean layoutp(lispobj thing)
 {
-    lispobj base_ptr = thing - INSTANCE_POINTER_LOWTAG;
     lispobj layout;
-    if ((base_ptr & LOWTAG_MASK) || !(layout = layout_of((lispobj*)base_ptr)))
-        return 0;
+    if (lowtag_of(thing) != INSTANCE_POINTER_LOWTAG) return 0;
+    if ((layout = instance_layout(INSTANCE(thing))) == 0) return 0;
     return layout_depth2_id(LAYOUT(layout)) == LAYOUT_LAYOUT_ID;
 }
+#ifdef LISP_FEATURE_METASPACE
+static inline boolean wrapperp(lispobj thing)
+{
+    lispobj layout;
+    if (lowtag_of(thing) != INSTANCE_POINTER_LOWTAG) return 0;
+    if ((layout = instance_layout(INSTANCE(thing))) == 0) return 0;
+    return layout_depth2_id(LAYOUT(layout)) == WRAPPER_LAYOUT_ID;
+}
+static inline int wrapper_id(lispobj wrapper)
+{
+    struct layout* layout = LAYOUT(WRAPPER(wrapper)->friend);
+    return layout_depth2_id(layout);
+}
+#endif
 /// Return true if 'thing' is the layout of any subtype of sb-lockless::list-node.
 static inline boolean lockfree_list_node_layout_p(struct layout* layout) {
     return layout_depth2_id(layout) == LFLIST_NODE_LAYOUT_ID;
 }
+
+#ifdef LISP_FEATURE_METASPACE
+#define METASPACE_START (READ_ONLY_SPACE_START+32768) /* KLUDGE */
+// Keep in sync with the macro definitions in src/compiler/generic/early-vm.lisp
+struct slab_header {
+    short sizeclass;
+    short capacity;
+    short chunksize;
+    short count;
+    void* freelist;
+    struct slab_header *next;
+    struct slab_header *prev;
+};
+#endif
+
+/* Check whether 'pointee' was forwarded. If it has been, update the contents
+ * of 'cell' to point to it. Otherwise, set 'cell' to 'broken'.
+ * Note that this macro has no braces around the body because one of the uses
+ * of it needs to stick on another 'else' or two */
+#define TEST_WEAK_CELL(cell, pointee, broken) \
+    lispobj *native = native_pointer(pointee); \
+    if (from_space_p(pointee)) \
+        cell = forwarding_pointer_p(native) ? forwarding_pointer_value(native) : broken; \
+    else if (immobile_space_p(pointee)) { \
+        if (immobile_obj_gen_bits(base_pointer(pointee)) == from_space) cell = broken; \
+    }
 
 #endif /* _GC_PRIVATE_H_ */
