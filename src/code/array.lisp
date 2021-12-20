@@ -543,11 +543,11 @@
                                 (t complex-array-widetag))
                           array-rank)))
              (cond (fill-pointer
-                    (logior-header-bits array +array-fill-pointer-p+)
+                    (logior-array-flags array +array-fill-pointer-p+)
                     (setf (%array-fill-pointer array)
                           (if (eq fill-pointer t) total-size fill-pointer)))
                    (t
-                    (reset-header-bits array +array-fill-pointer-p+)
+                    (reset-array-flags array +array-fill-pointer-p+)
                     (setf (%array-fill-pointer array) total-size)))
              (setf (%array-available-elements array) total-size)
              (setf (%array-data array) data)
@@ -1395,7 +1395,7 @@ of specialized arrays is supported."
         ;; appear to be an out-of-bounds access if the length is not
         ;; changing at all. i.e. while it's safe to always do a store,
         ;; the length check has to be skipped.
-        (locally (declare (optimize (sb-c::insert-array-bounds-checks 0)))
+        (locally (declare (optimize (sb-c:insert-array-bounds-checks 0)))
           (setf (schar vector new-length) (code-char 0)))
         ;; Now treat both the old and new lengths as if they include
         ;; the byte that holds the implicit string terminator.
@@ -1500,10 +1500,10 @@ of specialized arrays is supported."
     (setf (%array-available-elements array) length)
     (cond (fill-pointer
            (setf (%array-fill-pointer array) fill-pointer)
-           (logior-header-bits array +array-fill-pointer-p+))
+           (logior-array-flags array +array-fill-pointer-p+))
           (t
            (setf (%array-fill-pointer array) length)
-           (reset-header-bits array +array-fill-pointer-p+)))
+           (reset-array-flags array +array-fill-pointer-p+)))
     (setf (%array-displacement array) displacement)
     (populate-dimensions array dimensions (array-rank array))
     (setf (%array-displaced-p array) displacedp)
@@ -1883,7 +1883,7 @@ function to be removed without further warning."
   (when (and element-p contents-p)
     (error "Can't specify both :INITIAL-ELEMENT and :INITIAL-CONTENTS"))
   ;; Explicitly compute a widetag with the weakness bit ORed in.
-  (let ((type (logior (ash vector-weak-flag n-widetag-bits) simple-vector-widetag)))
+  (let ((type (logior (ash vector-weak-flag array-flags-position) simple-vector-widetag)))
     ;; These allocation calls are the transforms of MAKE-ARRAY for a vector with
     ;; the respective initializing keyword arg. This is badly OAOO-violating and
     ;; almost makes me want to cry, but not quite enough for me to improve it.
@@ -1903,5 +1903,5 @@ function to be removed without further warning."
 
 (defun weak-vector-p (x)
   (and (simple-vector-p x)
-       #+(or x86 x86-64) (test-header-bit x vector-weak-flag)
-       #-(or x86 x86-64) (logtest (get-header-data x) vector-weak-flag)))
+       #+(or x86 x86-64) (test-header-bit x (ash vector-weak-flag array-flags-data-position))
+       #-(or x86 x86-64) (logtest (get-header-data x) (ash vector-weak-flag array-flags-data-position))))

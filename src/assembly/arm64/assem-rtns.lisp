@@ -177,10 +177,7 @@
                           (:return-style :none)
                           (:export tail-call-symbol))
     ((:temp fun (any-reg descriptor-reg) lexenv-offset)
-     (:temp length (any-reg descriptor-reg) nl0-offset)
-     (:temp vector (any-reg descriptor-reg) r7-offset)
-     (:temp temp (any-reg descriptor-reg) nl1-offset)
-     (:temp temp2 (any-reg descriptor-reg) nl2-offset))
+     (:temp temp (any-reg descriptor-reg) nl1-offset))
   (inst str lr-tn (@ cfp-tn 8))
   TAIL-CALL-SYMBOL
   (inst and temp fun lowtag-mask)
@@ -191,24 +188,9 @@
   (inst cmp temp symbol-widetag)
   (inst b :ne not-callable)
 
-  (load-symbol-info-vector vector fun temp)
-
-  ;; info-vector-fdefn
-  (inst cmp vector null-tn)
-  (inst b :eq undefined)
-
-  (inst ldr temp (@ vector (- (* 2 n-word-bytes) other-pointer-lowtag)))
-  (inst and temp temp (fixnumize (1- (ash 1 (* info-number-bits 2)))))
-  (inst movz temp2 (fixnumize (1+ (ash +fdefn-info-num+ info-number-bits))))
-  (inst cmp temp temp2)
-  (inst b :lt undefined)
-
-  (inst ldr length (@ vector
-                      (- (ash vector-length-slot word-shift) other-pointer-lowtag)))
-
-  (inst lsl length length (- word-shift n-fixnum-tag-bits))
-  (inst sub length length (- other-pointer-lowtag 8))
-  (inst ldr fun (@ vector length))
+  (loadw temp fun symbol-fdefn-slot other-pointer-lowtag)
+  (inst cbz temp undefined)
+  (move fun temp)
   (loadw lr-tn fun fdefn-raw-addr-slot other-pointer-lowtag)
   (inst add lr-tn lr-tn 4)
   (inst br lr-tn)
@@ -304,7 +286,7 @@
   (loadw next-uwp cur-uwp unwind-block-current-catch-slot)
   (store-tl-symbol-value next-uwp *current-catch-block*)
   (loadw-pair (make-random-tn :kind :normal :sc (sc-or-lose 'any-reg) :offset nfp-offset)
-              unwind-block-nfp-slot next-uwp unwind-block-nsp-slot block)
+              unwind-block-nfp-slot next-uwp unwind-block-nsp-slot cur-uwp)
   (inst mov-sp nsp-tn next-uwp)
   (inst br lip)
   RET

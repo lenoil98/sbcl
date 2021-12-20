@@ -246,11 +246,6 @@
   (imm)
   )
 
-;;; Same as reg, but with direction bit
-(define-instruction-format (reg-dir 8 :include reg)
-  (op  :field (byte 3 5))
-  (dir :field (byte 1 4)))
-
 (define-instruction-format (reg-reg/mem 16
                                         :default-printer
                                         `(:name :tab reg ", " reg/mem))
@@ -336,23 +331,6 @@
   (op    :field (byte 5 11))
   (reg   :field (byte 3 8) :type 'reg))
 
-;;; Same as reg/mem, but with a prefix of #b00001111
-(define-instruction-format (ext-reg/mem 24
-                                        :default-printer '(:name :tab reg/mem))
-  (prefix  :field (byte 8 0)    :value #b00001111)
-  (op      :fields (list (byte 7 9) (byte 3 19)))
-  (width   :field (byte 1 8)    :type 'width)
-  (reg/mem :fields (list (byte 2 22) (byte 3 16))
-                                :type 'sized-reg/mem)
-  ;; optional fields
-  (imm))
-
-(define-instruction-format (ext-reg/mem-imm 24
-                                        :include ext-reg/mem
-                                        :default-printer
-                                        '(:name :tab reg/mem ", " imm))
-  (imm :type 'imm-data))
-
 (define-instruction-format (ext-reg/mem-no-width+imm8 24
                                         :include ext-reg/mem-no-width
                                         :default-printer
@@ -376,17 +354,6 @@
   (suffix :field (byte 2 14) :value #b11)
   (op     :fields (list (byte 3 0) (byte 3 11)))
   (fp-reg :field (byte 3 8) :type 'fp-reg))
-
-;;; fp insn to/from fp reg, with the reversed source/destination flag.
-(define-instruction-format (floating-point-fp-d 16
-                            :default-printer
-                            `(:name :tab ,(swap-if 'd "ST0" ", " 'fp-reg)))
-  (prefix :field (byte 5 3) :value #b11011)
-  (suffix :field (byte 2 14) :value #b11)
-  (op     :fields (list (byte 2 0) (byte 3 11)))
-  (d      :field (byte 1 2))
-  (fp-reg :field (byte 3 8) :type 'fp-reg))
-
 
 ;;; (added by (?) pfw)
 ;;; fp no operand isns
@@ -864,11 +831,6 @@
                    (emit-byte segment #b11111111)
                    (emit-ea segment src #b110))))))))
 
-(define-instruction pusha (segment)
-  (:printer byte ((op #b01100000)))
-  (:emitter
-   (emit-byte segment #b01100000)))
-
 (define-instruction pop (segment dst)
   (:printer reg-no-width ((op #b01011)))
   (:printer reg/mem ((op '(#b1000111 #b000)) (width 1)))
@@ -881,11 +843,6 @@
            (t
             (emit-byte segment #b10001111)
             (emit-ea segment dst #b000))))))
-
-(define-instruction popa (segment)
-  (:printer byte ((op #b01100001)))
-  (:emitter
-   (emit-byte segment #b01100001)))
 
 (define-instruction xchg (segment operand1 operand2)
   ;; Register with accumulator.
@@ -959,71 +916,35 @@
 
 ;;;; flag control instructions
 
-;;; CLC -- Clear Carry Flag.
-(define-instruction clc (segment)
-  (:printer byte ((op #b11111000)))
-  (:emitter
-   (emit-byte segment #b11111000)))
-
-;;; CLD -- Clear Direction Flag.
-(define-instruction cld (segment)
-  (:printer byte ((op #b11111100)))
-  (:emitter
-   (emit-byte segment #b11111100)))
-
-;;; CLI -- Clear Iterrupt Enable Flag.
-(define-instruction cli (segment)
-  (:printer byte ((op #b11111010)))
-  (:emitter
-   (emit-byte segment #b11111010)))
-
-;;; CMC -- Complement Carry Flag.
-(define-instruction cmc (segment)
-  (:printer byte ((op #b11110101)))
-  (:emitter
-   (emit-byte segment #b11110101)))
-
-;;; LAHF -- Load AH into flags.
-(define-instruction lahf (segment)
-  (:printer byte ((op #b10011111)))
-  (:emitter
-   (emit-byte segment #b10011111)))
-
-;;; POPF -- Pop flags.
-(define-instruction popf (segment)
-  (:printer byte ((op #b10011101)))
-  (:emitter
-   (emit-byte segment #b10011101)))
-
-;;; PUSHF -- push flags.
-(define-instruction pushf (segment)
-  (:printer byte ((op #b10011100)))
-  (:emitter
-   (emit-byte segment #b10011100)))
-
-;;; SAHF -- Store AH into flags.
-(define-instruction sahf (segment)
-  (:printer byte ((op #b10011110)))
-  (:emitter
-   (emit-byte segment #b10011110)))
-
-;;; STC -- Set Carry Flag.
-(define-instruction stc (segment)
-  (:printer byte ((op #b11111001)))
-  (:emitter
-   (emit-byte segment #b11111001)))
-
-;;; STD -- Set Direction Flag.
-(define-instruction std (segment)
-  (:printer byte ((op #b11111101)))
-  (:emitter
-   (emit-byte segment #b11111101)))
-
-;;; STI -- Set Interrupt Enable Flag.
-(define-instruction sti (segment)
-  (:printer byte ((op #b11111011)))
-  (:emitter
-   (emit-byte segment #b11111011)))
+(macrolet ((def (mnemonic opcode)
+             `(define-instruction ,mnemonic (segment)
+                (:printer byte ((op ,opcode)))
+                (:emitter (emit-byte segment ,opcode)))))
+  (def daa   #x27) ; Decimal Adjust After Addition
+  (def das   #x2F) ; Decimal Adjust after Subtraction
+  (def aaa   #x37) ; ASCII Adjust After Addition
+  (def aas   #x3F) ; ASCII Adjust After Subtraction
+  (def pusha #x60) ; push all regs
+  (def popa  #x61) ; pop all regs
+  (def wait  #x9B) ; Wait
+  (def pushf #x9C) ; Push flags
+  (def popf  #x9D) ; Pop flags
+  (def sahf  #x9E) ; Store AH into flags
+  (def lahf  #x9F) ; Load AH from flags
+  (def leave #xC9)
+  (def into  #xCE) ; Interrupt if Overflow
+  (def iret  #xCF) ; Interrupt Return
+  (def xlat  #xD7) ; Translate Byte
+  (def icebp #xF1) ; ICE breakpoint
+  (def hlt   #xF4) ; Halt
+  (def cmc   #xF5) ; Complement Carry Flag
+  (def clc   #xF8) ; Clear Carry Flag
+  (def stc   #xF9) ; Set Carry Flag
+  (def cli   #xFA) ; Clear Iterrupt Enable Flag
+  (def sti   #xFB) ; Set Interrupt Enable Flag
+  (def cld   #xFC) ; Clear Direction Flag
+  (def std   #xFD) ; Set Direction Flag
+)
 
 ;;;; arithmetic
 
@@ -1032,7 +953,7 @@
     (maybe-emit-operand-size-prefix segment size)
     (cond
      ((or (integerp src)
-          (and (fixup-p src) (memq (fixup-flavor src) '(:layout-id))))
+          (and (fixup-p src) (memq (fixup-flavor src) '(:gc-barrier :layout-id))))
       (cond ((and (neq size :byte) (typep src '(signed-byte 8)))
              (emit-byte segment #b10000011)
              (emit-ea segment dst opcode)
@@ -1120,26 +1041,6 @@
      (maybe-emit-operand-size-prefix segment size)
      (emit-byte segment (if (eq size :byte) #b11110110 #b11110111))
      (emit-ea segment dst #b011))))
-
-(define-instruction aaa (segment)
-  (:printer byte ((op #b00110111)))
-  (:emitter
-   (emit-byte segment #b00110111)))
-
-(define-instruction aas (segment)
-  (:printer byte ((op #b00111111)))
-  (:emitter
-   (emit-byte segment #b00111111)))
-
-(define-instruction daa (segment)
-  (:printer byte ((op #b00100111)))
-  (:emitter
-   (emit-byte segment #b00100111)))
-
-(define-instruction das (segment)
-  (:printer byte ((op #b00101111)))
-  (:emitter
-   (emit-byte segment #b00101111)))
 
 (define-instruction mul (segment dst src)
   (:printer accum-reg/mem ((op '(#b1111011 #b100))))
@@ -1421,12 +1322,6 @@
      (aver (accumulator-p acc))
      (maybe-emit-operand-size-prefix segment size)
      (emit-byte segment (if (eq size :byte) #b10101010 #b10101011)))))
-
-(define-instruction xlat (segment)
-  (:printer byte ((op #b11010111)))
-  (:emitter
-   (emit-byte segment #b11010111)))
-
 
 ;;;; bit manipulation
 
@@ -1643,8 +1538,6 @@
    (emit-byte segment (dpb (conditional-opcode cond) (byte 4 0) #b10010000))
    (emit-ea segment dst #b000)))
 
-;;;; enter/leave
-
 (define-instruction enter (segment disp &optional (level 0))
   (:declare (type (unsigned-byte 16) disp)
             (type (unsigned-byte 8) level))
@@ -1653,11 +1546,6 @@
    (emit-byte segment #b11001000)
    (emit-word segment disp)
    (emit-byte segment level)))
-
-(define-instruction leave (segment)
-  (:printer byte ((op #b11001001)))
-  (:emitter
-   (emit-byte segment #b11001001)))
 
 ;;;; prefetch
 (define-instruction prefetchnta (segment ea)
@@ -1717,11 +1605,6 @@
       (emit-byte segment #b11001101)
       (emit-byte segment number)))))
 
-(define-instruction into (segment)
-  (:printer byte ((op #b11001110)))
-  (:emitter
-   (emit-byte segment #b11001110)))
-
 (define-instruction bound (segment reg bounds)
   (:emitter
    (let ((size (matching-operand-size reg bounds)))
@@ -1731,17 +1614,8 @@
      (emit-byte segment #b01100010)
      (emit-ea segment bounds (reg-tn-encoding reg)))))
 
-(define-instruction iret (segment)
-  (:printer byte ((op #b11001111)))
-  (:emitter
-   (emit-byte segment #b11001111)))
 
 ;;;; processor control
-
-(define-instruction hlt (segment)
-  (:printer byte ((op #b11110100)))
-  (:emitter
-   (emit-byte segment #b11110100)))
 
 (define-instruction nop (segment)
   (:printer byte ((op #b10010000)))
@@ -1749,10 +1623,6 @@
   (:emitter
    (emit-byte segment #b10010000)))
 
-(define-instruction wait (segment)
-  (:printer byte ((op #b10011011)))
-  (:emitter
-   (emit-byte segment #b10011011)))
 
 ;;;; miscellaneous hackery
 
@@ -2541,6 +2411,10 @@
   (declare (type index offset))
   #+sb-xc-host (declare (notinline code-object-size)) ; forward ref
   (sb-vm::with-code-instructions (sap code)
+    (when (eq flavor :gc-barrier)
+      ;; the VALUE is nbits, so convert it to an AND mask
+      (setf (sap-ref-32 sap offset) (1- (ash 1 value)))
+      (return-from fixup-code-object :immediate))
     (ecase kind
       (:absolute
        (case flavor
@@ -2556,7 +2430,8 @@
             ;; exception: fixups within the range of unboxed words containing
             ;; jump tables are automatically adjusted if the code moves.
             (and (sb-vm::self-referential-code-fixup-p final-val code)
-                 (>= offset (ash (code-jump-table-words code) word-shift)))))))
+                 (>= offset (ash (code-jump-table-words code) word-shift))
+                 :absolute)))))
       (:relative
        ;; VALUE is the actual address wanted.
        ;; Replace word with displacement to get there.
@@ -2572,7 +2447,7 @@
        ;; Record relative fixups pointing outside of this object.
        (when (eq (sb-vm::containing-memory-space code) :dynamic)
          (aver (not (sb-vm::self-referential-code-fixup-p value code)))
-         t)))))
+         :relative)))))
 
 ;;; Perform exhaustive analysis here because of the extreme degree
 ;;; of confusion I have about what is allowed to reach the instruction

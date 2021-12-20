@@ -430,13 +430,12 @@
                  (alloc-immobile-fixedobj
                   symbol-size
                   (logior (ash (1- symbol-size) n-widetag-bits) symbol-widetag)))))
-    ;; no pin, it's immobile (and obviously live)
-    (setf (sap-ref-lispobj (int-sap (get-lisp-obj-address symbol))
-                           (- (ash symbol-name-slot word-shift) other-pointer-lowtag))
-          name)
+    ;; symbol-hash was initialized to 0
     (%set-symbol-global-value symbol (make-unbound-marker))
-    ;; symbol-hash is 0
-    (setf (symbol-info symbol) nil)
+    (%primitive sb-vm::set-slot symbol nil
+                'make-symbol sb-vm:symbol-info-slot sb-vm:other-pointer-lowtag)
+    (%primitive sb-vm::set-slot symbol name
+                'make-symbol sb-vm:symbol-name-slot sb-vm:other-pointer-lowtag)
     (%set-symbol-package symbol nil)
     symbol))
 
@@ -485,14 +484,10 @@
                                         (ash 2 n-fixnum-tag-bits)
                                         other-pointer-lowtag
                                         (eq space :immobile)))
-              ;;; x86-64 has a vop which is nothing more than wrapping
-               ;; pseudo-atomic around a call to alloc_code_object() in the C runtime.
-               ;; The vop is defined in such a way that it can't be inserted into
-               ;; this fuction, but instead needs an out-of-line call to a helper function
-               ;; (because it clobbers all registers and doesn't indicate that)
-               #+(and x86-64 (not win32))
-               (alloc-dynamic-space-code total-words)
-               #-(and x86-64 (not win32))
+               ;; x86-64 has a vop which wraps pseudo-atomic around the foreign call,
+               ;; as is the custom for allocation trampolines.
+               #+x86-64 (%primitive sb-vm::alloc-code total-words)
+               #-x86-64
                (without-gcing
                  (%make-lisp-obj
                   (alien-funcall (extern-alien "alloc_code_object"

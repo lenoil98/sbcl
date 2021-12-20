@@ -103,24 +103,6 @@
     other-immediate-1-lowtag
     other-pointer-lowtag))
 
-(defconstant nil-value
-    (+ static-space-start
-       ;; boxed_region precedes NIL
-       ;; 8 is the number of words to reserve at the beginning of static space
-       ;; prior to the words of NIL.
-       ;; If you change this, then also change MAKE-NIL-DESCRIPTOR in genesis.
-       #+(and gencgc (not sb-thread) (not 64-bit)) (ash 8 word-shift)
-       #+64-bit #x100
-       (* 2 n-word-bytes)
-       list-pointer-lowtag))
-
-;;; BOXED-REGION is address in static space at which a 'struct alloc_region'
-;;; is overlaid on a lisp vector with element type WORD.
-#-sb-thread
-(defconstant boxed-region
-  (+ static-space-start
-     (* 2 n-word-bytes))) ; skip the array header
-
 (defconstant-eqx fixnum-lowtags
     #.(let ((fixtags nil))
         (do-external-symbols (sym "SB-VM")
@@ -252,6 +234,14 @@
   #-64-bit unused09-widetag                 ;  7E       7E
 
   simple-array-widetag                      ;  82   81  82   81
+  ;; NIL element type is not in the contiguous range of widetags
+  ;; corresponding to SIMPLE-UNBOXED-ARRAY
+  simple-array-nil-widetag
+
+  ;; IF YOU CHANGE THIS ORDER, THEN MANUALLY VERIFY CORRECTNESS OF:
+  ;; - leaf_obj_widetag_p()
+  ;; - conservative_root_p()
+  ;; - anything else I forgot to mention
   simple-vector-widetag                     ;
   simple-bit-vector-widetag                 ;
   simple-array-unsigned-byte-2-widetag      ;
@@ -285,9 +275,6 @@
   simple-array-complex-single-float-widetag ;
   simple-array-complex-double-float-widetag ;
 
-  ;; Not a string type
-  simple-array-nil-widetag                  ;
-
   simple-base-string-widetag                ;  D6   E1  D6   E1       \
   #+sb-unicode                              ;                          |
   simple-character-string-widetag           ;  DA   E5                 | Strings
@@ -310,10 +297,17 @@
 
 ;;; Byte index:           3           2           1           0
 ;;;                 +-----------------------------------+-----------+
-;;;                 |  unused   |   rank    |   flags   |  widetag  |
+;;;                 |  unused   |   rank   <|>   flags  |  widetag  |
 ;;;                 +-----------+-----------+-----------+-----------+
 ;;;                 |<---------- HEADER DATA ---------->|
 
+;;; Having contiguous rank and widetag allows
+;;; SIMPLE-ARRAY-HEADER-OF-RANK-P to be done with just one comparison.
+;;; Other backends may not be ready to switch the order yet.
+(defconstant array-rank-position  #-arm64 16 #+arm64 8)
+(defconstant array-flags-position #-arm64 8  #+arm64 16)
+
+(defconstant array-flags-data-position (- array-flags-position n-widetag-bits))
 (defconstant +array-fill-pointer-p+    #x80)
 
 (defconstant +vector-dynamic-extent+   #x40)
@@ -335,10 +329,6 @@
 ;; nonetheless, opportunities for sharing abound.
 (defconstant +vector-shareable-nonstd+ #x10)
 
-;; Weak vectors that are not hash-table backing vectors use this bit to track
-;; whether we've already recorded the vector for deferred scavenging.
-;; Hash-tables use an entirely different mechanism. Flag bit used only in C.
-(defconstant vector-weak-visited-flag  #x08)
 ;; All hash-table backing vectors are marked with this bit.
 ;; Essentially it informs GC that the vector has a high-water mark.
 (defconstant vector-hashing-flag       #x04)

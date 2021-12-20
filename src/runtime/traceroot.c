@@ -19,6 +19,7 @@
 #include "genesis/avlnode.h"
 #include "genesis/sap.h"
 #include "genesis/thread-instance.h"
+#include "print.h"
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -430,20 +431,20 @@ static inline lispobj decode_pointer(uint32_t encoding)
 
 static void maybe_show_object_name(lispobj obj, FILE* stream)
 {
-    extern void safely_show_lstring(lispobj* string, int quotes, FILE *s);
     lispobj package, package_name;
     if (lowtag_of(obj)==OTHER_POINTER_LOWTAG)
         switch(widetag_of(native_pointer(obj))) {
         case SYMBOL_WIDETAG:
             putc(',', stream);
-            if ((package = SYMBOL(obj)->package) == NIL) {
+            package = symbol_package(SYMBOL(obj));
+            if (package == NIL) {
                 fprintf(stream, "#:");
             } else {
                 package_name = ((struct package*)native_pointer(package))->_name;
-                safely_show_lstring(native_pointer(package_name), 0, stream);
+                safely_show_lstring(VECTOR(package_name), 0, stream);
                 fputs("::", stream);
             }
-            safely_show_lstring(native_pointer(SYMBOL(obj)->name), 0, stream);
+            safely_show_lstring(symbol_name(SYMBOL(obj)), 0, stream);
             break;
         }
 }
@@ -834,6 +835,7 @@ static uword_t build_refs(lispobj* where, lispobj* end,
 static void scan_spaces(struct scan_state* ss)
 {
     struct scan_state old = *ss;
+    build_refs((lispobj*)NIL_SYMBOL_SLOTS_START, (lispobj*)NIL_SYMBOL_SLOTS_END, ss);
     build_refs((lispobj*)STATIC_SPACE_OBJECTS_START, static_space_free_pointer, ss);
     show_tally(old, ss);
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
@@ -980,11 +982,13 @@ static int trace_paths(void (*context_scanner)(),
                                   &targets, &visited,
                                   inverted_heap, &scratchpad,
                                   n_pins, pins, context_scanner, criterion);
-            if ((VECTOR(paths)->data[i] = path) != 0) ++n_found;
+            lispobj* elt = VECTOR(paths)->data + i;
+            ensure_ptr_word_writable(elt);
+            if ((*elt = path) != 0) ++n_found;
         }
         ++i;
     } while (weak_pointers != NIL);
-    ensure_region_closed(&boxed_region, BOXED_PAGE_FLAG);
+    ensure_region_closed(&mixed_region, BOXED_PAGE_FLAG);
     os_invalidate(scratchpad.base, scratchpad.end-scratchpad.base);
 #if TRACEROOT_USE_ABSL_HASHMAP
     absl_hashmap_destroy(inverted_heap);
@@ -1044,15 +1048,6 @@ int gc_prove_liveness(void(*context_scanner)(),
         CONS(output)->car = make_fixnum(0);
         return 0;
     }
-    // Put back lowtags on pinned objects, since wipe_nonpinned_words() removed
-    // them. But first test whether lowtags were already repaired
-    // in case prove_liveness() is called after gc_prove_liveness().
-    if (n_pins>0 && !is_lisp_pointer(pins[0])) {
-        int i;
-        for(i=n_pins-1; i>=0; --i) {
-            pins[i] = compute_lispobj((lispobj*)pins[i]);
-        }
-    }
     n_paths = trace_paths(context_scanner, input, paths, ignore,
                           n_pins, (lispobj*)pins, criterion);
     CONS(output)->car = make_fixnum(n_paths);
@@ -1065,6 +1060,7 @@ int gc_prove_liveness(void(*context_scanner)(),
 int prove_liveness(lispobj objects, int criterion)
 {
     extern struct hopscotch_table pinned_objects;
-    extern int gc_n_stack_pins;
-    return gc_prove_liveness(0, objects, gc_n_stack_pins, pinned_objects.keys, criterion);
+    extern int gc_pin_count;
+    extern lispobj* gc_filtered_pins;
+    return gc_prove_liveness(0, objects, gc_pin_count, gc_filtered_pins, criterion);
 }

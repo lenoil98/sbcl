@@ -27,11 +27,13 @@
 #include "getallocptr.h"
 #include "unaligned.h"
 #include "search.h"
+#include "var-io.h"
 
 #include "genesis/static-symbols.h"
 #include "genesis/symbol.h"
 #include "forwarding-ptr.h"
 #include "core.h"
+#include "gc-private.h"
 
 #define INT3_INST 0xCC
 #define INTO_INST 0xCE
@@ -374,6 +376,12 @@ sigtrap_handler(int __attribute__((unused)) signal,
                 siginfo_t __attribute__((unused)) *info,
                 os_context_t *context)
 {
+#ifdef LISP_FEATURE_LINUX
+    // ICEBP instruction = handle-pending-interrupt following pseudo-atomic
+    if (((unsigned char*)*os_context_pc_addr(context))[-1] == 0xF1)
+        return interrupt_handle_pending(context);
+#endif
+
     unsigned int trap;
 
     if (single_stepping) {
@@ -707,7 +715,15 @@ static void record_pc(char* pc, unsigned int index, boolean sizedp)
        v->data[index] = v->data[index+1] = NIL;
        index += 2;
     }
+    // Wasn't the point of code serial# that you don't store
+    // code blob pointers into the various profiling buffers? (FIXME?)
     if (code) {
+#ifdef LISP_FEATURE_SOFT_CARD_MARKS
+        page_index_t page = find_page_index(&v->data[index]);
+        // technically this only needs to be unprotected if the generation
+        // of the code is younger, but the KISS principle pertains.
+        if (page >= 0) unprotect_page_index(page);
+#endif
         v->data[index] = make_lispobj(code, OTHER_POINTER_LOWTAG);
         v->data[index+1] = make_fixnum((lispobj)pc - (lispobj)code);
     } else {
@@ -726,9 +742,10 @@ allocation_tracker_counted(uword_t* sp)
         if (index == 0)
             index = 2; // reserved overflow counter for fixed-size alloc
         uword_t disp = index * 8;
-        // rewrite call into: LOCK INC QWORD PTR, [R11+n] ; opcode = 0xFF / 0
-        uword_t new_inst =
-          0xF0 | (0x49 << 8) | (0xFF << 16) | (0x83L << 24) | (disp << 32);
+        int base_reg = word_at_pc >> 56;
+        // rewrite call into: LOCK INC QWORD PTR, [Rbase+n] ; opcode = 0xFF / 0
+        uword_t new_inst = 0xF0 | ((0x48|(base_reg>>3)) << 8) // w + possibly 'b'
+            | (0xFF << 16) | ((0x80L+(base_reg&7)) << 24) | (disp << 32);
         // Ensure atomicity of the write. A plain store would probably do,
         // but since this is self-modifying code, the most stringent memory
         // order is prudent.
@@ -748,24 +765,17 @@ allocation_tracker_sized(uword_t* sp)
     if (instrumentp(sp, &pc, &word_at_pc)) {
         int index = claim_index(2);
         uword_t word_after_pc = pc[1];
-        unsigned char prefix = word_after_pc & 0xFF;
-        unsigned char opcode = (word_after_pc >>  8) & 0xFF;
-        unsigned char modrm  = (word_after_pc >> 16) & 0xFF;
-        if ((prefix == 0x48 || prefix == 0x4D) && /* REX w=1 or w=r=b=1 */
-            (opcode == 0x85) && /* TEST */
-            (modrm & 0xC0) == 0xC0 && /* register-direct mode */
-            ((modrm >> 3) & 0x7) == (modrm & 0x7)) { /* same register */
-        } else {
-            lose("Can't decode instruction @ pc %p", pc);
-        }
+        int pair = word_at_pc >> 56;
+        int base_reg = pair & 0xf;
+        int size_reg = pair >> 4;
         // rewrite call into:
-        //  LOCK INC QWORD PTR, [R11+n] ; opcode = 0xFF / 0
+        //  LOCK INC QWORD PTR, [Rbase+n] ; opcode = 0xFF / 0
         uword_t disp = index * 8;
-        uword_t new_inst1 =
-          0xF0 | (0x49 << 8) | (0xFF << 16) | (0x83L << 24) | (disp << 32);
-        //  LOCK ADD [R11+n], Rxx ; opcode = 0x01
-        prefix = 0x49 | ((prefix & 1) << 2); // 'b' bit becomes 'r' bit
-        modrm  = 0x83 | (modrm & (7<<3)); // copy 'reg' into new modrm byte
+        uword_t new_inst1 = 0xF0 | ((0x48 | (base_reg>>3)) << 8) // w + b
+            | (0xFF << 16) | ((0x80L+(base_reg&7)) << 24) | (disp << 32);
+        //  LOCK ADD [Rbase+n+8], Rsize ; opcode = 0x01
+        int prefix = 0x48 | ((size_reg >> 3) << 2) | (base_reg >> 3); // w + r + b
+        int modrm  = 0x80 | ((size_reg & 7) << 3) | (base_reg & 7);
         disp = (1 + index) * 8;
         uword_t new_inst2 =
           0xF0 | (prefix << 8) | (0x01 << 16) | ((long)modrm << 24) | (disp << 32);
@@ -780,3 +790,5 @@ allocation_tracker_sized(uword_t* sp)
     int __attribute__((unused)) ret = thread_mutex_unlock(&alloc_profiler_lock);
     gc_assert(ret == 0);
 }
+
+#include "x86-arch-shared.inc"

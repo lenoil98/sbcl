@@ -24,14 +24,9 @@
 ;;; Set to NIL to disable loop analysis for register allocation.
 (defvar *loop-analyze* t)
 
-;;; The current non-macroexpanded toplevel form as printed when
-;;; *compile-print* is true.
-;;; FIXME: should probably have no value outside the compiler.
-(defvar *top-level-form-noted* nil)
-
 (defvar *compile-verbose* t
   "The default for the :VERBOSE argument to COMPILE-FILE.")
-(defvar *compile-print* t
+(defvar *compile-print* nil
   "The default for the :PRINT argument to COMPILE-FILE.")
 (defvar *compile-progress* nil
   "When this is true, the compiler prints to *STANDARD-OUTPUT* progress
@@ -65,9 +60,7 @@
 ;;; Mumble conditional on *COMPILE-PROGRESS*.
 (defun maybe-mumble (&rest foo)
   (when *compile-progress*
-    (compiler-mumble "~&")
-    (pprint-logical-block (*standard-output* nil :per-line-prefix "; ")
-       (apply #'compiler-mumble foo))))
+    (apply #'compiler-mumble foo)))
 
 
 (deftype object () '(or fasl-output core-object null))
@@ -190,6 +183,8 @@ Examples:
                        (*compiler-style-warning-count* 0)
                        (*compiler-note-count* 0)
                        (*undefined-warnings* nil)
+                       *argument-mismatch-warnings*
+                       *methods-in-compilation-unit*
                        (*in-compilation-unit* t))
                    (handler-bind ((parse-unknown-type
                                     (lambda (c)
@@ -242,6 +237,7 @@ Examples:
             (*last-error-context* nil))
         (handler-bind ((style-warning #'compiler-style-warning-handler)
                        (warning #'compiler-warning-handler))
+          (report-key-arg-mismatches)
           (dolist (kind '(:variable :function :type))
             (let ((names (mapcar #'undefined-warning-name
                                  (remove kind undefs :test #'neq
@@ -411,37 +407,37 @@ necessary, since type inference may take arbitrarily long to converge.")
         (cleared-reanalyze nil)
         (fastp nil))
     (loop
-     (when (component-reanalyze component)
-       (setf count 0
-             fastp nil
-             cleared-reanalyze t
-             (component-reanalyze component) nil))
-     (setf (component-reoptimize component) nil)
-     (ir1-optimize component fastp)
-     (cond ((component-reoptimize component)
-            (incf count)
-            (when (and (>= count *max-optimize-iterations*)
-                       (not (component-reanalyze component))
-                       (eq (component-reoptimize component) :maybe))
-              (maybe-mumble "*")
-              (cond ((retry-delayed-ir1-transforms :optimize)
-                     (maybe-mumble "+")
-                     (setq count 0))
-                    (t
-                     (event ir1-optimize-maxed-out)
-                     (ir1-optimize-last-effort component)
-                     (return)))))
-           ((retry-delayed-ir1-transforms :optimize)
-            (setf count 0)
-            (maybe-mumble "+"))
-           (t
-            (maybe-mumble " ")
-            (return)))
-     (when (setq fastp (>= count *max-optimize-iterations*))
-       (ir1-optimize-last-effort component))
-     (maybe-mumble (if fastp "-" ".")))
+      (when (component-reanalyze component)
+        (setf count 0
+              fastp nil
+              cleared-reanalyze t
+              (component-reanalyze component) nil))
+      (setf (component-reoptimize component) nil)
+      (ir1-optimize component fastp)
+      (cond ((component-reoptimize component)
+             (incf count)
+             (when (and (>= count *max-optimize-iterations*)
+                        (not (component-reanalyze component))
+                        (eq (component-reoptimize component) :maybe))
+               (maybe-mumble "*")
+               (cond ((retry-delayed-ir1-transforms :optimize)
+                      (maybe-mumble "+")
+                      (setq count 0))
+                     (t
+                      (event ir1-optimize-maxed-out)
+                      (ir1-optimize-last-effort component)
+                      (return)))))
+            ((retry-delayed-ir1-transforms :optimize)
+             (setf count 0)
+             (maybe-mumble "+"))
+            (t
+             (return)))
+      (when (setq fastp (>= count *max-optimize-iterations*))
+        (ir1-optimize-last-effort component))
+      (maybe-mumble (if fastp "-" ".")))
     (when cleared-reanalyze
-      (setf (component-reanalyze component) t)))
+      (setf (component-reanalyze component) t))
+    (maybe-mumble " "))
   (values))
 
 (defparameter *constraint-propagate* t)
@@ -577,6 +573,8 @@ necessary, since type inference may take arbitrarily long to converge.")
     (maybe-mumble "Control ")
     (control-analyze component)
 
+    (report-code-deletion)
+
     (when (or (ir2-component-values-receivers (component-info component))
               (component-dx-lvars component))
       (maybe-mumble "Stack ")
@@ -601,12 +599,15 @@ necessary, since type inference may take arbitrarily long to converge.")
             (maybe-mumble "Copy ")
             (copy-propagate component))
 
-          (when *compiler-trace-output*
-            (format *compiler-trace-output*
-                    "~|~%;;;; component: ~S~2%" (component-name component)))
           (ir2-optimize component)
 
           (select-representations component)
+          ;; Try to combine consecutive uses of %INSTANCE-SET.
+          ;; This can't be done prior to selecting representations
+          ;; because SELECT-REPRESENTATIONS might insert some
+          ;; things like MOVE-FROM-DOUBLE which makes the
+          ;; "consecutive" vops no longer consecutive.
+          (ir2-optimize-stores component)
 
           (when *check-consistency*
             (maybe-mumble "Check2 ")
@@ -637,14 +638,13 @@ necessary, since type inference may take arbitrarily long to converge.")
           (optimize-constant-loads component)
           (when *compiler-trace-output*
             (when (memq :ir1 *compile-trace-targets*)
-              (let ((*standard-output* *compiler-trace-output*))
-                (print-all-blocks component)))
+              (describe-component component *compiler-trace-output*))
             (when (memq :ir2 *compile-trace-targets*)
-             (describe-ir2-component component *compiler-trace-output*)))
+              (describe-ir2-component component *compiler-trace-output*)))
 
           (maybe-mumble "Code ")
           (multiple-value-bind (segment text-length fun-table
-                                elsewhere-label fixup-notes)
+                                elsewhere-label fixup-notes alloc-points)
               (let ((*compiler-trace-output*
                       (and (memq :vop *compile-trace-targets*)
                            *compiler-trace-output*)))
@@ -676,7 +676,8 @@ necessary, since type inference may take arbitrarily long to converge.")
                          (core-object (maybe-mumble "Core") #'make-core-component)
                          (null (lambda (&rest dummies)
                                  (declare (ignore dummies)))))
-                       component segment (length bytes) fixup-notes
+                       component segment (length bytes)
+                       fixup-notes alloc-points
                        object))))))
 
   ;; We're done, so don't bother keeping anything around.
@@ -720,9 +721,11 @@ necessary, since type inference may take arbitrarily long to converge.")
     (aver (eql (node-component (lambda-bind lambda)) component)))
 
   (let* ((*component-being-compiled* component))
-    (when (and *compile-print* (block-compile *compilation*))
-      (with-compiler-io-syntax
-        (compiler-mumble "~&; compiling ~A" (component-name component))))
+
+    (when *compile-progress*
+      (compiler-mumble "~&")
+      (pprint-logical-block (*standard-output* nil :per-line-prefix "; ")
+        (compiler-mumble "Compiling ~A: " (component-name component))))
 
     ;; Record xref information before optimization. This way the
     ;; stored xref data reflects the real source as closely as
@@ -731,9 +734,9 @@ necessary, since type inference may take arbitrarily long to converge.")
 
     (ir1-phases component)
 
-    ;; This should happen at some point before PHYSENV-ANALYZE, and
-    ;; after RECORD-COMPONENT-XREFS.  Beyond that, I haven't really
-    ;; thought things through.  -- AJB, 2014-Jun-08
+    ;; This should happen at some point before ENVIRONMENT-ANALYZE,
+    ;; and after RECORD-COMPONENT-XREFS.  Beyond that, I haven't
+    ;; really thought things through.  -- AJB, 2014-Jun-08
     (eliminate-dead-code component)
 
     (when *loop-analyze*
@@ -758,14 +761,15 @@ necessary, since type inference may take arbitrarily long to converge.")
     |#
 
     (maybe-mumble "Env ")
-    (physenv-analyze component)
+    (environment-analyze component)
     (dfo-as-needed component)
 
     (delete-if-no-entries component)
 
-    (unless (eq (block-next (component-head component))
-                (component-tail component))
-      (%compile-component component))
+    (if (eq (block-next (component-head component))
+            (component-tail component))
+        (report-code-deletion)
+        (%compile-component component))
     (when *compile-component-hook*
       (funcall *compile-component-hook* component)))
 
@@ -821,6 +825,13 @@ necessary, since type inference may take arbitrarily long to converge.")
   (values))
 
 ;;;; trace output
+
+;;; Print out some useful info about COMPONENT to STREAM.
+(defun describe-component (component *standard-output*)
+  (declare (type component component))
+  (format t "~|~%;;;; component: ~S~2%" (component-name component))
+  (print-all-blocks component)
+  (values))
 
 (defun describe-ir2-component (component *standard-output*)
   (format t "~%~|~%;;;; IR2 component: ~S~2%" (component-name component))
@@ -1032,34 +1043,33 @@ necessary, since type inference may take arbitrarily long to converge.")
   #+sb-xc-host
   (when sb-cold::*compile-for-effect-only*
     (return-from convert-and-maybe-compile))
-  (let ((*top-level-form-noted* (note-top-level-form form t)))
-    ;; Don't bother to compile simple objects that just sit there.
-    (when (and form (or (symbolp form) (consp form)))
-      (if (and #-sb-xc-host
-               (policy *policy*
-                   ;; FOP-compiled code is harder to debug.
-                   (or (< debug 2)
-                       (> space debug)))
-               (not (eq (block-compile *compilation*) t))
-               (fopcompilable-p form expand))
-          (let ((*fopcompile-label-counter* 0))
-            (fopcompile form path nil expand))
-          (let ((*lexenv* (make-lexenv
-                           :policy *policy*
-                           :handled-conditions *handled-conditions*
-                           :disabled-package-locks *disabled-package-locks*))
-                (tll (ir1-toplevel form path nil)))
-            (if (eq (block-compile *compilation*) t)
-                (push tll (toplevel-lambdas *compilation*))
-                (compile-toplevel (list tll) nil))
-            (when (consp form)
-              (case (car form)
-                ;; Block compilation can cause packages to be defined after
-                ;; they are referenced at load time, so we have to delimit the
-                ;; current block compilation.
-                ((sb-impl::%defpackage)
-                 (delimit-block-compilation))))
-            nil)))))
+  ;; Don't bother to compile simple objects that just sit there.
+  (when (and form (or (symbolp form) (consp form)))
+    (if (and #-sb-xc-host
+             (policy *policy*
+                 ;; FOP-compiled code is harder to debug.
+                 (or (< debug 2)
+                     (> space debug)))
+             (not (eq (block-compile *compilation*) t))
+             (fopcompilable-p form expand))
+        (let ((*fopcompile-label-counter* 0))
+          (fopcompile form path nil expand))
+        (let ((*lexenv* (make-lexenv
+                         :policy *policy*
+                         :handled-conditions *handled-conditions*
+                         :disabled-package-locks *disabled-package-locks*))
+              (tll (ir1-toplevel form path nil)))
+          (if (eq (block-compile *compilation*) t)
+              (push tll (toplevel-lambdas *compilation*))
+              (compile-toplevel (list tll) nil))
+          (when (consp form)
+            (case (car form)
+              ;; Block compilation can cause packages to be defined after
+              ;; they are referenced at load time, so we have to delimit the
+              ;; current block compilation.
+              ((sb-impl::%defpackage)
+               (delimit-block-compilation))))
+          nil))))
 
 ;;; Macroexpand FORM in the current environment with an error handler.
 ;;; We only expand one level, so that we retain all the intervening
@@ -1279,26 +1289,14 @@ necessary, since type inference may take arbitrarily long to converge.")
             (mapc #'clear-ir1-info components-from-dfo)
             result))))))
 
-(defun note-top-level-form (form &optional finalp)
+;;; Print some noise about FORM if *COMPILE-PRINT* is true.
+(defun note-top-level-form (form)
   (when *compile-print*
-    (cond ((not *top-level-form-noted*)
-           (let ((*print-length* 2)
-                 (*print-level* 2)
-                 (*print-pretty* nil))
-             (with-compiler-io-syntax
-               (compiler-mumble "~&; processing ~S" form)))
-           form)
-          ((and finalp
-                (eq :top-level-forms *compile-print*)
-                (neq form *top-level-form-noted*))
-           (let ((*print-length* 1)
-                 (*print-level* 1)
-                 (*print-pretty* nil))
-             (with-compiler-io-syntax
-               (compiler-mumble "~&; ... top level ~S" form)))
-           form)
-          (t
-           *top-level-form-noted*))))
+    (let ((*print-length* 2)
+          (*print-level* 2)
+          (*print-pretty* nil))
+      (with-compiler-io-syntax
+        (compiler-mumble "~&; processing ~S" form)))))
 
 ;;; Handle the evaluation the a :COMPILE-TOPLEVEL body during
 ;;; compilation. Normally just evaluate in the appropriate
@@ -1401,8 +1399,7 @@ necessary, since type inference may take arbitrarily long to converge.")
         ((progn)
          (process-toplevel-progn (rest form) path compile-time-too))
         (t
-         (let ((*top-level-form-noted* (note-top-level-form form))
-               (expanded (preprocessor-macroexpand-1 form)))
+         (let ((expanded (preprocessor-macroexpand-1 form)))
            (cond ((neq expanded form) ; macro -> take it from the top
                   (process-toplevel-form expanded path compile-time-too))
                  (t
@@ -1727,7 +1724,7 @@ necessary, since type inference may take arbitrarily long to converge.")
                   (compiler-error-context-handled-conditions ctxt))
                  ;; Is this right? I would think that if lexenv is null
                  ;; we should look at *HANDLED-CONDITIONS*.
-                 (null (lexenv-handled-conditions *lexenv*))))
+                 ((or ctran null) (lexenv-handled-conditions *lexenv*))))
              *handled-conditions*))
        (handle-p (condition type)
          #+sb-xc-host (cl:typep condition type) ; TYPE is a sexpr
@@ -1813,6 +1810,8 @@ necessary, since type inference may take arbitrarily long to converge.")
                     (with-source-paths
                       (find-source-paths form current-index)
                       (let ((*gensym-counter* 0))
+                        (when *compile-print*
+                          (note-top-level-form form))
                         (process-toplevel-form
                          form `(original-source-start 0 ,current-index) nil))))
                   (let ((*source-info* info))

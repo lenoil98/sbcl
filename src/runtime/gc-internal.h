@@ -84,28 +84,36 @@ extern struct weak_pointer *weak_pointer_chain; /* in gc-common.c */
  * - With smarter macros it ought to be possible to avoid 8-byte loads and shifts.
  *   They would need to be endian-aware, which I didn't want to do just yet.
  */
-#define vector_flagp(header, val) ((int)header & (flag_##val << N_WIDETAG_BITS))
-#define vector_flags_zerop(header) ((int)(header) & 0x0700) == 0
+#define vector_flagp(header, val) ((int)header & (flag_##val << ARRAY_FLAGS_POSITION))
+#define vector_flags_zerop(header) ((int)(header) & 0x07 << ARRAY_FLAGS_POSITION) == 0
 // True if flags are zero, also testing the widetag at the same time.
-#define ordinary_simple_vector_p(header) ((int)(header) & 0x07ff) == SIMPLE_VECTOR_WIDETAG
+#define ordinary_simple_vector_p(header) \
+    ((int)(header) & (0x07 << ARRAY_FLAGS_POSITION | 0xffff >> (16-ARRAY_FLAGS_POSITION))) \
+    == SIMPLE_VECTOR_WIDETAG
 // Return true if vector is a weak vector that is not a hash-table <k,v> vector.
 #define vector_is_weak_not_hashing_p(header) \
-  ((int)(header) & ((flag_VectorWeak|flag_VectorHashing) << N_WIDETAG_BITS)) == \
-    (flag_VectorWeak << N_WIDETAG_BITS)
+  ((int)(header) & ((flag_VectorWeak|flag_VectorHashing) << ARRAY_FLAGS_POSITION)) == \
+    (flag_VectorWeak << ARRAY_FLAGS_POSITION)
 
-// Mask out the fullcgc mark bit when asserting header validity
+// This bit can be anything that doesn't conflict with the fullcgc mark bit or a bit
+// seen by lisp. Byte index 0 is the widetag, byte indices 1 and 2 are for the array-rank
+// and vector-flags, depending on how src/compiler/generic/early-objdef assigns them.
+#define WEAK_VECTOR_VISITED_BIT (1<<24)
+
+// Assert that the 'v' is a weak (not hashing) simple-vector and was visited,
+// and then clear the visited bit.
 #define UNSET_WEAK_VECTOR_VISITED(v) \
-  gc_assert((v->header & 0xffff) == \
-    (((flag_VectorWeakVisited|flag_VectorWeak) << N_WIDETAG_BITS) \
-     | SIMPLE_VECTOR_WIDETAG)); \
-  v->header ^= flag_VectorWeakVisited << N_WIDETAG_BITS
+  gc_assert((v->header & (WEAK_VECTOR_VISITED_BIT | 0xff << ARRAY_FLAGS_POSITION | 0xff)) == \
+    (WEAK_VECTOR_VISITED_BIT | flag_VectorWeak << ARRAY_FLAGS_POSITION | SIMPLE_VECTOR_WIDETAG)); \
+  v->header ^= WEAK_VECTOR_VISITED_BIT
 
 /* values for the *_alloc_* parameters, also see the commentary for
  * struct page in gencgc-internal.h. These constants are used in gc-common,
  * so they can't easily be made gencgc-only */
 #define FREE_PAGE_FLAG        0
 #define PAGE_TYPE_MASK        7 // mask out the 'single-object flag'
-/* Note: MAP-ALLOCATED-OBJECTS expects this value to be 1 */
+/* Note: lisp's CLOSE-CURRENT-GC-REGION expects BOXED_PAGE_FLAG = 1.
+ * (probably should do a foreign call rather than kludge it) */
 #define BOXED_PAGE_FLAG       1
 #define UNBOXED_PAGE_FLAG     2
 /* CONS_PAGE_FLAG doesn't get stored in the page table, though I am considering
@@ -132,8 +140,6 @@ static inline lispobj *gc_search_space(lispobj *start, void *pointer) {
                             start,
                             (void*)(1+((lispobj)pointer | LOWTAG_MASK)));
 }
-
-struct vector *symbol_name(lispobj*);
 
 extern void scrub_control_stack(void);
 extern void scrub_thread_control_stack(struct thread *);

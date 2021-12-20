@@ -186,6 +186,19 @@
                  (inst jmp defaulting-done))))))
     (inst mov rsp-tn sp)))
 
+(define-vop (nlx-entry-single)
+  (:args (sp)
+         (start))
+  (:results (res :from :load))
+  (:info label)
+  (:save-p :force-to-stack)
+  (:vop-var vop)
+  (:generator 30
+    (emit-label label)
+    (note-this-location vop :non-local-entry)
+    (inst mov res start)
+    (inst mov rsp-tn sp)))
+
 (define-vop (nlx-entry-multiple)
   (:args (top :target result
               :scs (any-reg))
@@ -258,6 +271,7 @@
   (:temporary (:sc sap-reg) temp)
   (:temporary (:sc descriptor-reg :offset rbx-offset) saved-function)
   (:temporary (:sc unsigned-reg :offset rax-offset) block)
+  (:temporary (:sc unsigned-reg :offset r11-offset) extra-temp-reg)
   (:vop-var vop)
   (:generator 22
     ;; Store the function into a non-stack location, since we'll be
@@ -275,8 +289,8 @@
     (loadw temp ofp sap-pointer-slot other-pointer-lowtag)
     (storew temp block unwind-block-cfp-slot)
 
-    (inst lea temp-reg-tn (rip-relative-ea entry-label))
-    (storew temp-reg-tn block unwind-block-entry-pc-slot)
+    (inst lea extra-temp-reg (rip-relative-ea entry-label))
+    (storew extra-temp-reg block unwind-block-entry-pc-slot)
     (storew bsp block unwind-block-bsp-slot)
     (storew catch-block block unwind-block-current-catch-slot)
 

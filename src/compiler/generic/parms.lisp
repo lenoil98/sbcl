@@ -131,7 +131,20 @@
            (or ,(or (!read-dynamic-space-size) dynamic-space-size*)
                (ecase n-word-bits
                  (32 (expt 2 29))
-                 (64 (expt 2 30)))))))))
+                 (64 (expt 2 30)))))
+         (defconstant gencgc-card-shift
+           (integer-length (1- sb-vm:gencgc-card-bytes)))
+         ;; This is a constant during build, but a different value
+         ;; can be patched directly into the affected machine code
+         ;; when the core is loaded based on dynamic-space-size.
+         ;; I think the C runtime does a floor operation rather than ceiling,
+         ;; but firstly there's probably no difference, and secondly it's better
+         ;; to be safe than sorry - using too many bits rather than too few.
+         (defconstant gencgc-card-table-index-nbits
+           (integer-length (1- (ceiling sb-vm::default-dynamic-space-size
+                                        sb-vm::gencgc-card-bytes))))
+         (defconstant gencgc-card-table-index-mask
+           (1- (ash 1 gencgc-card-table-index-nbits)))))))
 
 (defconstant-eqx +c-callable-fdefns+
   '(sub-gc
@@ -172,8 +185,7 @@
     *gc-pending*
     #+sb-safepoint sb-impl::*in-safepoint*
     #+sb-thread *stop-for-gc-pending*
-    ;; non-x86oid gencgc object pinning
-    #+(and gencgc (not (or x86 x86-64))) *pinned-objects*
+    *pinned-objects*
     #+gencgc (*gc-pin-code-pages* 0)
     ;; things needed for non-local-exit
     (*current-catch-block* 0)
@@ -247,12 +259,11 @@
   #-sb-thread 1024) ; crazy value
 
 ;;; Thread slots accessed at negative indices relative to struct thread.
-;;; This number could be 16 for non-safepoint, or for safepoint, 15, so that -16
-;;; would be on the safepoint page. I had trouble with an odd number of slots
-;;; as there seems to be an alignment requirement. 14 works in general, and the
-;;; safepoint slot is -15 which presents no problem.
 (defconstant thread-header-slots
-  #+x86-64 14
+  ;; This seems to need to be an even number.
+  ;; I'm not sure what the constraint on that stems from.
+  #+(and x86-64 sb-safepoint) 14 ; the safepoint trap page is at word index -15
+  #+(and x86-64 (not sb-safepoint)) 16
   #-x86-64 0)
 
 #+gencgc

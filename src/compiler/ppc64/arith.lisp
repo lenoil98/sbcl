@@ -300,7 +300,7 @@
       (inst cmpdi amount 0)
       (inst neg ndesc amount)
       (inst bge positive)
-      (inst cmpdi ndesc 63)
+      (inst cmpldi ndesc 63)
       (inst srd result number ndesc)
       (inst ble done)
       (inst li result 0)
@@ -347,7 +347,7 @@
          (inst cmpdi amount 0)
          (inst neg ndesc amount)
          (inst bge positive)
-         (inst cmpdi ndesc 63)
+         (inst cmpldi ndesc 63)
          (inst srad result number ndesc)
          (inst ble done)
          ;; smear the sign bit into all bits
@@ -497,7 +497,7 @@
              fast-ash-left/unsigned=>unsigned))
 (deftransform ash-left-mod64 ((integer count)
                               ((unsigned-byte 64) (unsigned-byte 6)))
-  (when (sb-c::constant-lvar-p count)
+  (when (sb-c:constant-lvar-p count)
     (sb-c::give-up-ir1-transform))
   '(%primitive fast-ash-left-mod64/unsigned=>unsigned integer count))
 
@@ -805,7 +805,7 @@
 ;;;
 
 (define-vop (fast-eql/fixnum fast-conditional)
-  (:args (x :scs (any-reg descriptor-reg))
+  (:args (x :scs (any-reg))
          (y :scs (any-reg)))
   (:arg-types tagged-num tagged-num)
   (:note "inline fixnum comparison")
@@ -815,11 +815,13 @@
     (inst b? (if not-p :ne :eq) target)))
 ;;;
 (define-vop (generic-eql/fixnum fast-eql/fixnum)
+  (:args (x :scs (any-reg descriptor-reg))
+         (y :scs (any-reg)))
   (:arg-types * tagged-num)
   (:variant-cost 7))
 
 (define-vop (fast-eql-c/fixnum fast-conditional/fixnum)
-  (:args (x :scs (any-reg descriptor-reg)))
+  (:args (x :scs (any-reg)))
   (:arg-types tagged-num (:constant (signed-byte #.(- 16 n-fixnum-tag-bits))))
   (:info target not-p y)
   (:translate eql)
@@ -867,7 +869,7 @@
   (:results (value :scs (unsigned-reg)))
   (:result-types unsigned-num))
 
-(define-vop (bignum-set word-index-set-nr)
+(define-vop (bignum-set word-index-set)
   (:variant bignum-digits-offset other-pointer-lowtag)
   (:translate sb-bignum:%bignum-set)
   (:args (object :scs (descriptor-reg))

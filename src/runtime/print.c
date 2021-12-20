@@ -26,6 +26,7 @@
 #include "code.h"
 #include "gc-internal.h"
 #include "gc-private.h"
+#include "genesis/gc-tables.h"
 #include <stdarg.h>
 #include "thread.h"              /* genesis/primitive-objects.h needs this */
 #include <errno.h>
@@ -421,7 +422,7 @@ char * simple_base_stringize(struct vector * string)
 
 static void brief_struct(lispobj obj)
 {
-    struct instance *instance = (struct instance *)native_pointer(obj);
+    struct instance *instance = INSTANCE(obj);
     extern struct vector * instance_classoid_name(lispobj*);
     struct vector * classoid_name;
     classoid_name = instance_classoid_name((lispobj*)instance);
@@ -464,7 +465,7 @@ static boolean tagged_slot_p(struct layout *layout, int slot_index)
 
 static void print_struct(lispobj obj)
 {
-    struct instance *instance = (struct instance *)native_pointer(obj);
+    struct instance *instance = INSTANCE(obj);
     short int i;
     char buffer[16];
     lispobj layout = instance_layout(native_pointer(obj));
@@ -515,7 +516,6 @@ void show_lstring(struct vector * string, int quotes, FILE *s)
 
 static void brief_fun_or_otherptr(lispobj obj)
 {
-    extern void safely_show_lstring(struct vector*, int, FILE*);
     lispobj *ptr, header;
     int type;
     struct symbol *symbol;
@@ -526,9 +526,10 @@ static void brief_fun_or_otherptr(lispobj obj)
     switch (type) {
         case SYMBOL_WIDETAG:
             symbol = (struct symbol *)ptr;
-            if (symbol->package == NIL)
+            lispobj package = symbol_package(symbol);
+            if (package == NIL)
                 printf("#:");
-            show_lstring(VECTOR(symbol->name), 0, stdout);
+            show_lstring(symbol_name(symbol), 0, stdout);
             break;
 
         case SIMPLE_BASE_STRING_WIDETAG:
@@ -547,7 +548,7 @@ static void brief_fun_or_otherptr(lispobj obj)
                 if (lowtag_of(name) == OTHER_POINTER_LOWTAG
                     && widetag_of(native_pointer(name)) == SYMBOL_WIDETAG) {
                   printf(" for ");
-                  struct vector* str = symbol_name(native_pointer(name));
+                  struct vector* str = symbol_name(SYMBOL(name));
                   safely_show_lstring(str, 0, stdout);
                 }
             }
@@ -559,10 +560,14 @@ static void print_slots(char **slots, int count, lispobj *ptr)
 {
     while (count-- > 0) {
         if (*slots) {
-            // kludge for half-lispword sized slot
-            print_obj(*slots,
-                      (N_WORD_BYTES == 8 && !strcmp(*slots, "boxed_size: "))
-                      ? *ptr & 0xFFFFFFFF : *ptr);
+            // kludge for encoded slots
+            lispobj word = *ptr;
+            char* slot_name = *slots;
+            if (N_WORD_BYTES == 8 && !strcmp(slot_name, "boxed_size: ")) word = word & 0xFFFFFFFF;
+#ifdef LISP_FEATURE_COMPACT_SYMBOL
+            else if (!strcmp(slot_name, "name: ")) word = decode_symbol_name(word);
+#endif
+            print_obj(slot_name, word);
             slots++;
         } else {
             print_obj("???: ", *ptr);
@@ -571,23 +576,9 @@ static void print_slots(char **slots, int count, lispobj *ptr)
     }
 }
 
-lispobj symbol_function(lispobj* symbol)
+lispobj symbol_function(struct symbol* symbol)
 {
-    lispobj info = ((struct symbol*)symbol)->info;
-    if (listp(info))
-        info = CONS(info)->cdr;
-    if (lowtag_of(info) == OTHER_POINTER_LOWTAG) {
-        struct vector* v = VECTOR(info);
-        int len = vector_len(v);
-        if (len != 0) {
-            lispobj elt = v->data[0];  // Just like INFO-VECTOR-FDEFN
-            if (fixnump(elt) && (fixnum_value(elt) & 07777) >= 07701) {
-                lispobj fdefn = v->data[len-1];
-                if (lowtag_of(fdefn) == OTHER_POINTER_LOWTAG)
-                    return FDEFN(fdefn)->fun;
-            }
-        }
-    }
+    if (symbol->fdefn) return FDEFN(symbol->fdefn)->fun;
     return NIL;
 }
 
@@ -643,15 +634,20 @@ static void print_fun_or_otherptr(lispobj obj)
         // Only 1 byte of a symbol header conveys its size.
         // The other bytes may be freely used by the backend.
         print_slots(symbol_slots, count & 0xFF, ptr);
-        if (symbol_function(ptr-1) != NIL)
-            print_obj("fun: ", symbol_function(ptr-1));
+        struct symbol* sym = (void*)(ptr - 1);
+        if (symbol_function(sym) != NIL) print_obj("fun: ", symbol_function(sym));
 #ifdef LISP_FEATURE_SB_THREAD
-        int tlsindex = tls_index_of((struct symbol*)(ptr-1));
+        int tlsindex = tls_index_of(sym);
         struct thread*th = get_sb_vm_thread();
         if (th != 0 && tlsindex != 0) {
             lispobj v = *(lispobj*)(tlsindex + (char*)th);
             print_obj("tlsval: ", v);
         }
+#endif
+#ifdef LISP_FEATURE_COMPACT_SYMBOL
+        // print_obj doesn't understand raw words, so make it a fixnum
+        int pkgid = symbol_package_id(sym) << N_FIXNUM_TAG_BITS;
+        print_obj("package_id: ", pkgid);
 #endif
         break;
 
@@ -821,9 +817,8 @@ static void print_fun_or_otherptr(lispobj obj)
         break;
     default:
         NEWLINE_OR_RETURN;
-        if (type >= SIMPLE_ARRAY_UNSIGNED_BYTE_2_WIDETAG &&
-            type <= SIMPLE_BIT_VECTOR_WIDETAG) // ASSUMPTION: widetag ordering
-            printf("length = %ld", vector_len(VECTOR(obj)));
+        if (specialized_vector_widetag_p(type))
+            printf("length = %"OBJ_FMTd, vector_len(VECTOR(obj)));
         else
             printf("Unknown header object?");
         break;
@@ -924,21 +919,22 @@ void brief_print(lispobj obj)
 
 #include "forwarding-ptr.h"
 #include "genesis/classoid.h"
-struct vector * symbol_name(lispobj * sym)
+struct vector * symbol_name(struct symbol* sym)
 {
-  if (forwarding_pointer_p(sym))
-    sym = native_pointer(forwarding_pointer_value(sym));
-  if (lowtag_of(((struct symbol*)sym)->name) != OTHER_POINTER_LOWTAG)
-      return NULL;
-  return VECTOR(follow_maybe_fp(((struct symbol*)sym)->name));
+  if (forwarding_pointer_p((lispobj*)sym))
+    sym = (void*)native_pointer(forwarding_pointer_value((lispobj*)sym));
+  lispobj name = sym->name;
+  if (lowtag_of(name) != OTHER_POINTER_LOWTAG) return NULL;
+  lispobj string = decode_symbol_name(name);
+  return VECTOR(follow_maybe_fp(string));
 }
 struct vector * classoid_name(lispobj * classoid)
 {
   if (forwarding_pointer_p(classoid))
       classoid = native_pointer(forwarding_pointer_value(classoid));
+  // Classoids are named by symbols even though a CLASS name is arbitrary (theoretically)
   lispobj sym = ((struct classoid*)classoid)->name;
-  return lowtag_of(sym) != OTHER_POINTER_LOWTAG ? NULL
-    : symbol_name(native_pointer(sym));
+  return lowtag_of(sym) != OTHER_POINTER_LOWTAG ? NULL : symbol_name(SYMBOL(sym));
 }
 struct vector * layout_classoid_name(lispobj * layout)
 {

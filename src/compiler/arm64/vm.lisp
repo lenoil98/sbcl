@@ -219,7 +219,8 @@
                       :alternate-scs (complex-double-stack))
 
   (catch-block control-stack :element-size catch-block-size)
-  (unwind-block control-stack :element-size unwind-block-size))
+  (unwind-block control-stack :element-size unwind-block-size)
+  (zero immediate-constant))
 
 ;;;; Make some random tns for important registers.
 
@@ -336,10 +337,10 @@
                      (destructuring-bind (size posn integer)
                          (sb-c::basic-combination-args node)
                        (declare (ignore integer))
-                       (and (plusp (sb-c::lvar-value posn))
-                            (or (= (sb-c::lvar-value size) 1)
-                                (<= (+ (sb-c::lvar-value size)
-                                       (sb-c::lvar-value posn))
+                       (and (plusp (sb-c:lvar-value posn))
+                            (or (= (sb-c:lvar-value size) 1)
+                                (<= (+ (sb-c:lvar-value size)
+                                       (sb-c:lvar-value posn))
                                     n-word-bits)))))))
          (if (or (validp 'word)
                  (validp 'signed-word))
@@ -387,4 +388,6 @@
         sb-arm64-asm::encode-logical-immediate
         sb-arm64-asm::fixnum-encode-logical-immediate
         bic-encode-immediate
-        bic-fixnum-encode-immediate))
+        bic-fixnum-encode-immediate
+        logical-immediate-or-word-mask
+        sb-arm64-asm::ldr-str-offset-encodable))

@@ -100,6 +100,19 @@
           (error "Lambda list keyword ~S is not supported for modular ~
                 function lambda lists." arg))))))
 
+(defun make-modular-fun-type-deriver (prototype width signedp)
+  (let ((info (fun-info-or-lose prototype))
+        (mask-type (specifier-type
+                    (if signedp
+                        `(signed-byte ,width)
+                        `(unsigned-byte ,width)))))
+    (lambda (call)
+      (let ((res (funcall (fun-info-derive-type info) call)))
+        (when res
+          (if (csubtypep res mask-type)
+              res
+              mask-type))))))
+
 (defmacro define-modular-fun (name lambda-list prototype kind signedp width)
   (%check-modular-fun-macro-arguments name kind lambda-list)
   (check-type prototype symbol)
@@ -107,13 +120,12 @@
   `(progn
      (%define-modular-fun ',name ',lambda-list ',prototype ',kind ',signedp ,width)
      (defknown ,name ,(mapcar (constantly 'integer) lambda-list)
-               (,(ecase signedp
-                   ((nil) 'unsigned-byte)
-                   ((t) 'signed-byte))
-                 ,width)
-               (foldable flushable movable)
-               :derive-type (make-modular-fun-type-deriver
-                             ',prototype ',kind ,width ',signedp))))
+         (,(ecase signedp
+             ((nil) 'unsigned-byte)
+             ((t) 'signed-byte))
+          ,width)
+         (foldable flushable movable)
+       :derive-type (make-modular-fun-type-deriver ',prototype ,width ',signedp))))
 
 (defun %define-good-modular-fun (name kind signedp)
   (setf (gethash name (modular-class-funs (find-modular-class kind signedp))) :good)
@@ -441,32 +453,59 @@
                          ,(1- (ash 1 (+ width (lvar-value amount))))))
               `(lambda (value amount1 amount2)
                  (ash value (+ amount1 amount2)))))))))
-
 (macrolet
-    ((def (name kind width signedp)
+    ((def (left-name name kind width signedp)
+       (declare (ignorable name))
        (let ((type (ecase signedp
                      ((nil) 'unsigned-byte)
                      ((t) 'signed-byte))))
          `(progn
-            (defknown ,name (integer (integer 0)) (,type ,width)
-                      (foldable flushable movable))
+            (defknown ,left-name (integer (integer 0)) (,type ,width)
+                (foldable flushable movable)
+              :derive-type (make-modular-fun-type-deriver 'ash ',width ',signedp))
             (define-modular-fun-optimizer ash ((integer count) ,kind ,signedp :width width)
-              (when (and (<= width ,width)
-                         (or (and (constant-lvar-p count)
+              (let ((integer-type (lvar-type integer))
+                    (count-type (lvar-type count)))
+                (declare (ignorable integer-type))
+                (when (<= width ,width)
+                  (cond ((or (and (constant-lvar-p count)
                                   (plusp (lvar-value count)))
-                             (csubtypep (lvar-type count)
-                                        (specifier-type '(and unsigned-byte fixnum)))))
-                (cut-to-width integer ,kind width ,signedp)
-                ',name))
-            (setf (gethash ',name (modular-class-versions (find-modular-class ',kind ',signedp)))
-                  `(ash ,',width))))))
-  ;; This should really be dependent on SB-VM:N-WORD-BITS, but since we
-  ;; don't have a true Alpha64 port yet, we'll have to stick to
-  ;; SB-VM:N-MACHINE-WORD-BITS for the time being.  --njf, 2004-08-14
-  #.`(progn
-       #+(or x86 x86-64 arm arm64)
-       (def sb-vm::ash-left-modfx
-           :tagged ,(- sb-vm:n-word-bits sb-vm:n-fixnum-tag-bits) t)
-       (def ,(intern (format nil "ASH-LEFT-MOD~D" sb-vm:n-machine-word-bits)
-                     "SB-VM")
-           :untagged ,sb-vm:n-machine-word-bits nil)))
+                             (csubtypep count-type
+                                        (specifier-type '(and unsigned-byte fixnum))))
+                         (cut-to-width integer ,kind width ,signedp)
+                         ',left-name)
+                        #+(or arm64 x86-64)
+                        ((and (not (constant-lvar-p count))
+                              (csubtypep count-type (specifier-type 'fixnum))
+                              ;; Unknown sign
+                              (not (csubtypep count-type (specifier-type '(integer * 0))))
+                              (not (csubtypep count-type (specifier-type '(integer 0 *))))
+                              (or (csubtypep integer-type (specifier-type `(unsigned-byte ,sb-vm:n-word-bits)))
+                                  (csubtypep integer-type (specifier-type `(signed-byte ,sb-vm:n-word-bits)))))
+                         ',name)))))
+            (setf (gethash ',left-name (modular-class-versions (find-modular-class ',kind ',signedp)))
+                  `(ash ,',width))
+            (deftransform ,left-name ((integer count) (t (constant-arg (eql 0))))
+              'integer)
+            #+(or arm64 x86-64)
+            (progn
+              (defknown ,name (integer integer) (,type ,width)
+                  (foldable flushable movable)
+                :derive-type (make-modular-fun-type-deriver 'ash ',width ',signedp))
+              (setf (gethash ',name (modular-class-versions (find-modular-class ',kind ',signedp)))
+                    `(ash ,',width))
+              ;; Go back to ASH if the sign becomes known
+              (flet ((cut (x)
+                       (if ,signedp
+                           `(mask-signed-field ,',width ,x)
+                           `(logand ,x (ldb (byte ,',width 0) -1)))))
+                (deftransform ,name ((integer count) (t (integer * 0)) * :important nil)
+                  `,(cut '(ash integer count)))
+                (deftransform ,name ((integer count) (t (integer 0 *)) * :important nil)
+                  `(,',left-name ,(cut 'integer) count))))))))
+  #+(or x86 x86-64 arm arm64)
+  (def sb-vm::ash-left-modfx sb-vm::ash-modfx :tagged #.sb-vm:n-fixnum-bits t)
+  (def #.(intern (format nil "ASH-LEFT-MOD~D" sb-vm:n-machine-word-bits) "SB-VM")
+    #.(intern (format nil "ASH-MOD~D" sb-vm:n-machine-word-bits) "SB-VM")
+    :untagged #.sb-vm:n-machine-word-bits nil))
+

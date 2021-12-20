@@ -11,7 +11,7 @@
 
 (in-package "SB-IMPL")
 
-(defparameter *eval-calls* 0) ; initialized by genesis
+(defparameter *eval-calls* 0)
 
 ;;;; Turns EXPR into a lambda-form we can pass to COMPILE. Returns
 ;;;; a secondary value of T if we must call the resulting function
@@ -100,7 +100,8 @@
            ;; 2002-10-24
            (let* ((sb-c:*lexenv* lexenv)
                   (sb-c::*ir1-namespace* (sb-c::make-ir1-namespace))
-                  (sb-c::*undefined-warnings* nil))
+                  (sb-c::*undefined-warnings* nil)
+                  sb-c::*argument-mismatch-warnings*)
              ;; FIXME: VALUES declaration
              (sb-c::process-decls decls
                                   vars

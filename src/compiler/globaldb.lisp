@@ -51,9 +51,9 @@
 ;;; sources partway through bootstrapping, tch tch, overwriting its
 ;;; version with our version would be unlikely to help, because that
 ;;; would make the cross-compiler very confused.)
-(defun !register-meta-info (metainfo)
+(defun register-meta-info (metainfo)
   (let* ((name (meta-info-kind metainfo))
-         (list (!get-meta-infos name)))
+         (list (get-meta-infos name)))
     (set-info-value name +info-metainfo-type-num+
                     (cond ((not list) metainfo) ; unique, just store it
                           ((listp list) (cons metainfo list)) ; prepend to the list
@@ -67,7 +67,7 @@
     (return-from !%define-info-type it)) ; do nothing
   (let ((id (or id (position nil *info-types* :start 1)
                    (error "no more INFO type numbers available"))))
-    (!register-meta-info
+    (register-meta-info
      (setf (aref *info-types* id)
            (!make-meta-info id category kind type-spec type-checker
                             validate-function default)))))
@@ -107,7 +107,7 @@
           '#'identity
           `(named-lambda "check-type" (x) (the ,type-spec x)))
      ,validate-function ,default
-     ;; Rationale for hardcoding here is explained at INFO-VECTOR-FDEFN.
+     ;; Rationale for hardcoding here is explained at PACKED-INFO-FDEFN.
      ,(or (and (eq category :function) (eq kind :definition)
                +fdefn-info-num+)
           #+sb-xc (meta-info-number (meta-info category kind))))))
@@ -182,7 +182,7 @@
 ;;; If non-nil, *GLOBALDB-OBSERVER*'s CAR is a bitmask over info numbers
 ;;; for which you'd like to call the function in the CDR whenever info
 ;;; of that number is queried.
-(defparameter *globaldb-observer* nil)
+(defvar *globaldb-observer* nil)
 (declaim (type (or (cons (unsigned-byte #.(ash 1 info-number-bits)) function)
                    null) *globaldb-observer*))
 #-sb-xc-host (declaim (always-bound *globaldb-observer*))
@@ -204,18 +204,18 @@
          (hookp (and (and hook
                           (not (eql 0 (car hook)))
                           (logbitp info-number (car hook))))))
-    (multiple-value-bind (vector aux-key)
+    (multiple-value-bind (packed-info aux-key)
         (let ((name (uncross name)))
           (with-globaldb-name (key1 key2) name
            ;; In the :simple branch, KEY1 is no doubt a symbol,
            ;; but constraint propagation isn't informing the compiler here.
-           :simple (values (symbol-info-vector (truly-the symbol key1)) key2)
+           :simple (values (symbol-dbinfo (truly-the symbol key1)) key2)
            :hairy (values (info-gethash name *info-environment*)
                           +no-auxiliary-key+)))
-      (when vector
-        (let ((index (packed-info-value-index vector aux-key info-number)))
+      (when packed-info
+        (let ((index (packed-info-value-index packed-info aux-key info-number)))
           (when index
-            (let ((answer (svref vector index)))
+            (let ((answer (%info-ref packed-info index)))
               (when hookp
                 (funcall (truly-the function (cdr hook))
                          name info-number answer t))
@@ -570,6 +570,13 @@
 (define-info-type (:source-location :declaration) :type-spec t)
 (define-info-type (:source-location :alien-type) :type-spec t)
 
+;;; If we used the maximum number of IDs available, a package gets no ID.
+;;; Any symbols in that package must use SYMBOL-DBINFO for their package.
+;;; Technically we can't store NIL, because that would be package ID 0,
+;;; i.e. directly represented in the symbol, but this type spec has to be
+;;; correct for what INFO can return, not what it may store.
+(define-info-type (:symbol :package) :type-spec (or package null))
+
 (!defun-from-collected-cold-init-forms !info-type-cold-init)
 
 #-sb-xc-host
@@ -577,12 +584,13 @@
   (let ((h (make-info-hashtable)))
     (setf (sb-thread:mutex-name (info-env-mutex h)) "globaldb")
     (setq *info-environment* h))
+  (setq *globaldb-observer* nil)
   (setq *info-types* (make-array (ash 1 info-number-bits) :initial-element nil))
   (!info-type-cold-init))
 
 ;; This is for the SB-INTROSPECT contrib module, and debugging.
 (defun call-with-each-info (function symbol)
-  (awhen (symbol-info-vector symbol)
+  (awhen (symbol-dbinfo symbol)
     (%call-with-each-info function it symbol)))
 
 ;; This is for debugging at the REPL.

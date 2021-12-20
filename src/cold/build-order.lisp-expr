@@ -40,9 +40,7 @@
 (
  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
  ;;; miscellaneous
- ;; This comes as early as possible, so that we catch the source locations
- ;; for everything.
- ("src/code/early-source-location" :c-headers)
+
  ("src/code/cross-early" :c-headers :not-target)
 
  ;; This comes early because it's useful for debugging everywhere.
@@ -50,7 +48,7 @@
  ("src/compiler/early-constantp" :c-headers)
  ("src/code/defsetfs" :not-host)
 
- ;; Declare all target special variables defined by ANSI
+  ;; Declare all target special variables defined by ANSI
  ("src/code/cl-specials" :not-host)
 
  ;; Things like DX-FLET and AWHEN are available for use in both the
@@ -120,9 +118,6 @@
  ("src/code/parse-body" :c-headers)       ; on host for PARSE-BODY
  ("src/compiler/policy" :c-headers)
  #+sb-fasteval ("src/interpreter/basic-env")
- ;; PARSE-{UNKNOWN,DEPRECATED}-TYPE and other things should be known
- ;; condition subtypes as soon as possible
- ("src/code/condition-boot" :not-host)
 
  ("src/code/early-extensions" :c-headers) ; on host for COLLECT, SYMBOLICATE, etc.
 
@@ -137,8 +132,6 @@
  ("src/code/early-pprint" :not-host)
  ("src/code/early-impl" :not-host)
 
- ("src/code/target-extensions" :not-host)
-
  ;; Needed before the first use of WITH-SINGLE-PACKAGE-LOCKED-ERROR.
  ("src/code/early-package" :not-host)
 
@@ -152,14 +145,13 @@
  ("src/code/type-class" :c-headers)
 
  ("src/code/cas" :not-host)
- ("src/code/thread-structs" :c-headers :block-compile) ; some defstructs for genesis
+ ("src/code/thread-structs" :c-headers #-sb-devel :block-compile) ; some defstructs for genesis
  ("src/compiler/early-c" :c-headers)
  ("src/pcl/slot-name")
 
  ("src/code/sysmacs" :not-host)
  ("src/code/early-classoid" :c-headers)
 
- ("src/code/string-hash" :c-headers)
  ("src/compiler/generic/pinned-objects" :not-host)
  ("src/compiler/generic/layout-ids" :c-headers)
 
@@ -170,7 +162,6 @@
  #+sb-fasteval ("src/interpreter/function" :not-host)
 
  ("src/code/debug-var-io")
- ("src/code/target-error" :not-host)
 
  ("src/code/early-float")
 
@@ -180,8 +171,9 @@
  ("src/code/early-time" :c-headers)
 
  ("src/code/misc" :c-headers)
-
- ("src/code/early-format")
+ ("src/code/early-defclass")
+ ("src/code/target-error" :not-host)
+ ("src/code/target-extensions" :not-host)
 
  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
  ;;; compiler (and a few miscellaneous files whose dependencies make it
@@ -200,6 +192,7 @@
  ("src/compiler/generic/objdef" :c-headers)
 
  ("src/compiler/generic/vm-array" :c-headers)
+ ("src/code/string-hash" :c-headers)
  ("src/code/primordial-type" :c-headers)
  ("src/code/specializable-array" :not-target)
 
@@ -234,8 +227,8 @@
  ("src/compiler/{arch}/vm" :c-headers)
 
  ("src/code/alieneval" :c-headers)
- ;; "src/code/toplevel.lisp" is the first to need this. It's generated
- ;; automatically by grovel_headers.c, i.e. it's not under source control.
+ ;; This is generated automatically by grovel_headers.c, i.e. it's not
+ ;; under source control.
  ("output/stuff-groveled-from-headers" :not-host)
  ("src/code/target-alieneval" :not-host)
  ("src/code/target-c-call"    :not-host)
@@ -250,7 +243,7 @@
 
  ;; This needs DEFINE-ALIEN-ROUTINE from target-alieneval.
  ("src/code/misc-aliens" :not-host)
- ("src/code/thread" :not-host :block-compile) ; provides *CURRENT-THREAD* for target-signal
+ ("src/code/thread" :not-host #-sb-devel :block-compile) ; provides *CURRENT-THREAD* for target-signal
 
  ;; RANDOM-LAYOUT-CLOS-HASH (in 'class') uses RANDOM, the transform for which
  ;; uses GENERATE-RANDOM-EXPR-FOR-POWER-OF-2 which becomes BIG-RANDOM-CHUNK,
@@ -268,10 +261,6 @@
  ("src/code/debug-info" :c-headers)
 
  ("src/code/source-location")
- ("src/code/early-class")
- ("src/code/condition" :not-host)
- ("src/code/parse-defmacro-errors")
- ("src/code/format-directive")
 
  ("src/compiler/proclaim" :c-headers)
  ("src/compiler/deftype" :c-headers)     ; on host for SB-XC:DEFTYPE
@@ -288,7 +277,7 @@
  ;; and all type-classes are defined.
  ("src/code/deftypes-for-target" :c-headers)
 
- ("src/code/class-init" :c-headers :not-target)
+ ("src/code/type-init" :c-headers)
 
  ;; The DEFSTRUCT machinery needs SUBTYPEP, defined in
  ;; "code/type", and SB-XC:TYPEP, defined in "code/cross-type",
@@ -308,7 +297,6 @@
 
  ("src/compiler/compiler-error")
 
- ("src/code/type-init")
  ;; Now that the type system is initialized, fix up UNKNOWN types that
  ;; have crept in.
  ("src/compiler/fixup-type")
@@ -337,7 +325,7 @@
  ("src/code/foreign"         :not-host)
  ("src/code/unix"            :not-host)
  ("src/code/symbol"          :not-host)
- ("src/code/bignum"          :not-host #-bignum-assertions :block-compile)
+ ("src/code/bignum"          :not-host #-(or bignum-assertions sb-devel) :block-compile)
  ("src/code/number-dispatch" :not-host)
  ("src/code/float-inf-nan"   :not-host)
  ("src/code/numbers"         :not-host)
@@ -350,8 +338,9 @@
  ("src/code/stream"          :not-host)
  ("src/code/load")
  ("src/code/deadline"  :not-host)
- ("src/code/toplevel"  :not-host)
  ("src/code/common-os" :not-host)
+
+ ("src/code/format-directive")
 
  ("src/code/host-c-call")
 
@@ -374,12 +363,7 @@
  ("src/compiler/target-main" :not-host)
  ("src/compiler/ir1tran")
  ("src/compiler/ir1tran-lambda")
- ("src/compiler/ir1-translators"
-  ;; workaround for ABCL warnings that are not of type STYLE-WARNING:
-  ;;  "Unable to compile function IR1-CONVERT-TAGBODY.  Using interpreted form instead."
-  #.(cl:if (and (cl:find :sb-xc-host cl:*features*)
-                (cl:find :abcl cl:*features*))
-        :ignore-failure-p))
+ ("src/compiler/ir1-translators")
  ("src/compiler/ir1util")
  ("src/compiler/callable-args")
  ("src/compiler/locall")
@@ -425,25 +409,7 @@
  ("src/compiler/{arch}/system")
  ("src/compiler/{arch}/char")
  ("src/compiler/{arch}/memory")
- ("src/compiler/{arch}/arith"
-  ;; KLUDGE: for ppc and sparc this appears to be necessary, as it
-  ;; used to be for array VOPs for X86 until ca. 0.8.5.24 when CSR's
-  ;; patch for that architecture was finally committed
-  ;;
-  ;; old (0.8.5.23) comment on the array-VOP hack for X86:
-  ;; x Compiling this file for X86 raises alarming warnings of
-  ;; x the form
-  ;; x    Argument FOO to VOP CHECK-BOUND has SC restriction
-  ;; x    DESCRIPTOR-REG which is not allowed by the operand type:
-  ;; x      (:OR POSITIVE-FIXNUM)
-  ;; x This seems not to be something that I broke, but rather a "feature"
-  ;; x inherited from classic CMU CL. (Debian cmucl_2.4.8.deb compiling
-  ;; x Debian cmucl_2.4.8.tar.gz raises the same warning). Thus, even though
-  ;; x these warnings are severe enough that they would ordinarily abort
-  ;; x compilation, for now we blithely ignore them and press on to more
-  ;; x pressing problems. Someday, though, it would be nice to figure out
-  ;; x what the problem is and fix it.
-  #+(or ppc ppc64) :ignore-failure-p)
+ ("src/compiler/{arch}/arith")
  ("src/compiler/{arch}/pred")
 
  ;; this file defines the INTERVAL struct which is also used in 'srctran'
@@ -470,7 +436,7 @@
  ("src/compiler/{arch}/show")
  ("src/compiler/{arch}/array")
  ("src/compiler/generic/type-error")
- ("src/compiler/physenvanal")
+ ("src/compiler/envanal")
 
  ;; KLUDGE: The assembly files need to be compiled twice: once as
  ;; normal lisp files, and once by sb-c:assemble-file.  We use a
@@ -513,6 +479,7 @@
 
  ;; needed by various unhappy-path cases in the cross-compiler
  ("src/code/error")
+ ("src/code/parse-defmacro-errors")
 
  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
  ;; files which depend in some way (directly or indirectly) on stuff
@@ -549,11 +516,6 @@
  #+unix ("src/code/target-signal" :not-host) ; needs OS-CONTEXT-T from share-vm
  #+win32 ("src/code/target-exception" :not-host)
  ("src/code/serve-event" :not-host)
- ;; Target-only stuff should usually be compiled late unless it has
- ;; compile-time side-effects. This file could probably be later,
- ;; but should certainly be no earlier than the definitions
- ;; of FORMAT-ERROR and FORMAT-DIRECTIVE.
- ("src/code/target-format" :not-host)
 
  ("src/code/late-extensions") ; needs condition system
  ("src/compiler/generic/target-core" :not-host) ; uses stuff from
@@ -563,6 +525,7 @@
  #+metaspace ("src/code/metaspace" :not-host)
  ("src/code/simple-fun"        :not-host) ; function slot accessors
  ("src/code/eval"              :not-host) ; uses INFO, wants compiler macro
+ ("src/code/toplevel"          :not-host)
  ("src/code/time"              :not-host)
  ("src/code/target-package"    :not-host) ; needs "code/package"
  ("src/code/bignum-random"     :not-host) ; needs "code/random" and
@@ -632,7 +595,8 @@
  ;; other target-code-building stuff which can't be processed until
  ;; machinery like SB-XC:DEFMACRO exists
 
- ("src/code/late-format") ; needs SB-XC:DEFMACRO
+ ("src/code/format") ; needs SB-XC:DEFMACRO
+ ("src/code/target-format" :not-host)
 
  ("src/code/late-globaldb" :not-host)
  ("src/code/redblack" :not-host)
@@ -748,7 +712,7 @@
   "src/code/describe-policy"
   "src/code/inspect"
   "src/code/profile"
-  #+(and x86-64 sb-thread) "src/code/aprof" ; precise allocation profiler
+  #+(and x86-64 sb-thread (not gs-seg)) "src/code/aprof" ; precise allocation profiler
   "src/code/step"
   "src/code/warm-lib"
   "src/code/alien-callback"

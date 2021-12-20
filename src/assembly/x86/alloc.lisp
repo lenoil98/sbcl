@@ -50,14 +50,14 @@
                          `((inst mov ,scratch-tn
                                  (make-ea :dword :disp +win32-tib-arbitrary-field-offset+)
                                  :fs)
-                           (inst sub ,reg (make-ea :dword :disp (ash thread-boxed-tlab-slot 2)
+                           (inst sub ,reg (make-ea :dword :disp (ash thread-mixed-tlab-slot 2)
                                                           :base ,scratch-tn))))
                        #-win32
                        `(#+sb-thread (inst sub ,reg
-                                           (make-ea :dword :disp (ash thread-boxed-tlab-slot 2))
+                                           (make-ea :dword :disp (ash thread-mixed-tlab-slot 2))
                                            :fs)
                          #-sb-thread (inst sub ,reg
-                                           (make-ea :dword :disp boxed-region))))))
+                                           (make-ea :dword :disp mixed-region))))))
              (case reg
                ;; Now that we're using lisp asm code instead of a .S file
                ;; this could be done more intelligently - the macro can decide
@@ -138,16 +138,6 @@
   (def edx)
   (def edi)
   (def esi))
-
-#+sb-assembling
-(macrolet ((def (tn-name &aux (reg (subseq (string tn-name) 0 3)))
-             `(define-assembly-routine (,(symbolicate "ALLOCATE-CONS-TO-" reg))
-                  ((:temp result descriptor-reg ,(tn-offset (symbol-value tn-name))))
-                (pseudo-atomic ()
-                 (allocation 'list (* 2 n-word-bytes)
-                             list-pointer-lowtag nil nil result)))))
-  (progn (def eax-tn) (def ebx-tn) (def ecx-tn)
-         (def edx-tn) (def esi-tn) (def edi-tn)))
 
 #+sb-thread
 (define-assembly-routine (alloc-tls-index

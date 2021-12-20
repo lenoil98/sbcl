@@ -36,7 +36,7 @@
        (aver (xmm-tn-p src))
        (inst movaps dst src))
       #+sb-simd-pack-256
-      ((int-avx2-reg avx2-reg)
+      ((ymm-reg int-avx2-reg)
        (aver (xmm-tn-p src))
        (inst vmovdqa dst src))
       #+sb-simd-pack-256
@@ -56,7 +56,7 @@
 (defmacro loadw (value ptr &optional (slot 0) (lowtag 0))
   `(inst mov ,value (object-slot-ea ,ptr ,slot ,lowtag)))
 
-(defun storew (value ptr &optional (slot 0) (lowtag 0))
+(defun storew (value ptr &optional (slot 0) (lowtag 0) temp)
   (let* ((size (if (tn-p value)
                    (sc-operand-size (tn-sc value))
                    :qword))
@@ -64,8 +64,11 @@
     (aver (eq size :qword))
     (cond ((and (integerp value)
                 (not (typep value '(signed-byte 32))))
-           (inst mov temp-reg-tn value)
-           (inst mov ea temp-reg-tn))
+           (cond (temp
+                  (inst mov temp value)
+                  (inst mov ea temp))
+                 (t
+                  (bug "need temp reg for STOREW of oversized immediate operand"))))
           (t
            (inst mov :qword ea value)))))
 
@@ -90,24 +93,32 @@
           (- other-pointer-lowtag))))
 
 (defun thread-tls-ea (index)
+  #+gs-seg (ea :gs index) ; INDEX is either a DISP or a BASE of the EA
   ;; Whether index is an an integer or a register, the EA constructor
   ;; call is the same.
-  ;; Due to an encoding peculiarity, using thread-base-tn as the index register
+  ;; Due to an encoding peculiarity, using thread-base-reg as the index register
   ;; is better when index is non-constant.
   ;; Base of r13 is reg=5 in ModRegRM, so if mod were 0, it would imply
   ;; RIP-relative addressing. (And attempting to encode an index is illegal)
   ;; So the 'mod' bits must be nonzero, which mandates encoding of an
   ;; explicit displacement of 0.  Using INDEX as base avoids the extra byte.
-  (ea index thread-base-tn))
+  #-gs-seg (ea index thread-tn))
 
 ;;; assert that alloc-region->free_pointer and ->end_addr can be accessed
-;;; using a single byte displacement from thread-base-tn
+;;; using a single byte displacement from thread-tn
 (eval-when (:compile-toplevel)
-  (aver (<= (1+ thread-boxed-tlab-slot) 15))
+  (aver (<= (1+ thread-mixed-tlab-slot) 15))
   (aver (<= (1+ thread-unboxed-tlab-slot) 15)))
 
-(defun thread-slot-ea (slot-index)
-  (ea (ash slot-index word-shift) thread-base-tn))
+;;; Access a thread slot at a fixed index. If GPR-TN is provided,
+;;; then it points to 'struct thread', which is relevant only if
+;;; #+gs-seg.
+(defun thread-slot-ea (slot-index &optional gpr-tn)
+  (if gpr-tn
+      (ea (ash slot-index word-shift) gpr-tn)
+      ;; Otherwise do something depending on #[-+]gs-seg
+      (let (#+gs-seg (thread-tn nil))
+        (ea thread-segment-reg (ash slot-index word-shift) thread-tn))))
 
 #+sb-thread
 (progn
@@ -192,27 +203,47 @@
   ;; (Ideally we'd only do 1 pointer bump, but that's a separate issue)
   (inst test :byte rax-tn (ea (- static-space-start gc-safepoint-trap-offset))))
 
-(defmacro pseudo-atomic ((&key elide-if) &rest forms)
+;;; This macro is purposely unhygienic with respect to THREAD-TN,
+;;; which is either a global symbol macro, or a LET-bound variable,
+;;; depending on #+gs-seg.
+(defmacro pseudo-atomic ((&key ((:thread-tn thread)) elide-if) &rest forms)
+  (declare (ignorable thread))
   #+sb-safepoint
   `(progn ,@forms (unless ,elide-if (emit-safepoint)))
   #-sb-safepoint
   (with-unique-names (label pa-bits-ea)
+   (let ((true
+          ;; TRUE is anything nonzero. Moving a register to memory is
+          ;; allegedly faster than reading an imm8 operand. I don't know,
+          ;; but I'm not going to debate it. However THREAD-TN is a better
+          ;; choice than RBP-TN since it's never written to.
+          #+(and sb-thread (not gs-seg)) 'thread-tn
+          #-(and sb-thread (not gs-seg)) 'rbp-tn))
     `(let ((,label (gen-label))
            (,pa-bits-ea
-            #+sb-thread (thread-slot-ea thread-pseudo-atomic-bits-slot)
+            #+sb-thread (thread-slot-ea
+                         thread-pseudo-atomic-bits-slot
+                         #+gs-seg ,@(if thread (list thread)))
             #-sb-thread (static-symbol-value-ea '*pseudo-atomic-bits*)))
        (unless ,elide-if
-         (inst mov ,pa-bits-ea rbp-tn))
+         (inst mov ,pa-bits-ea ,true))
        ,@forms
        (unless ,elide-if
-         (inst xor ,pa-bits-ea rbp-tn)
+         (inst xor ,pa-bits-ea ,true)
          (inst jmp :z ,label)
          ;; if PAI was set, interrupts were disabled at the same time
          ;; using the process signal mask.
-         (inst break pending-interrupt-trap)
-         (emit-label ,label)))))
+         #+linux (inst icebp)
+         #-linux (inst break pending-interrupt-trap)
+         (emit-label ,label))))))
 
 ;;;; indexed references
+
+(defun index-scale (element-size index-tn)
+  (if (sc-is index-tn immediate)
+      1
+      (ash element-size
+           (if (sc-is index-tn any-reg) (- n-fixnum-tag-bits) 0))))
 
 (sb-xc:deftype load/store-index (scale lowtag min-offset
                                  &optional (max-offset min-offset))
@@ -228,30 +259,41 @@
     (name type offset lowtag scs el-type &optional translate)
   `(progn
      (define-vop (,name)
-         ,@(when translate `((:translate ,translate)))
+       (:translate ,translate)
        (:policy :fast-safe)
        (:args (object :scs (descriptor-reg) :to :eval)
               (index :scs (,@(when (member translate '(%instance-cas %raw-instance-cas/word))
                                '(immediate))
-                           any-reg) :to :eval)
-              (old-value :scs ,scs :target rax)
+                           any-reg signed-reg unsigned-reg) :to :eval)
+              (old-value :scs ,scs #|:target rax|#)
               (new-value :scs ,scs))
+       (:vop-var vop)
        (:arg-types ,type tagged-num ,el-type ,el-type)
+       ;; if OLD-VALUE were LOCATION= to RAX then we'd clobber it
+       ;; while computing the EA for the barrier, or else we could use
+       ;; a separate temp.
        (:temporary (:sc descriptor-reg :offset rax-offset
-                        :from (:argument 2) :to :result :target value)  rax)
+                        #|:from (:argument 2)|# :to :result :target value)  rax)
        (:results (value :scs ,scs))
        (:result-types ,el-type)
        (:generator 5
-         (move rax old-value)
-         (inst cmpxchg :lock
-               (ea (- (* (+ (if (sc-is index immediate) (tn-value index) 0) ,offset)
+         (let ((ea (ea (- (* (+ (if (sc-is index immediate) (tn-value index) 0) ,offset)
                          n-word-bytes)
                       ,lowtag)
                    object
                    (unless (sc-is index immediate) index)
-                   (ash 1 (- word-shift n-fixnum-tag-bits)))
-               new-value)
-         (move value rax)))))
+                   (index-scale n-word-bytes index))))
+           ,@(ecase name
+               (%compare-and-swap-svref
+                ;; store barrier needs the EA of the affected element
+                '((emit-gc-store-barrier object ea rax (vop-nth-arg 3 vop) new-value)))
+               (%instance-cas
+                ;; store barrier affects only the object's base address
+                '((emit-gc-store-barrier object nil rax (vop-nth-arg 3 vop) new-value)))
+               (%raw-instance-cas/word))
+           (move rax old-value)
+           (inst cmpxchg :lock ea new-value)
+           (move value rax))))))
 
 (defun bignum-index-check (bignum index addend vop)
   (declare (ignore bignum index addend vop))
@@ -272,11 +314,10 @@
 (defmacro define-full-reffer (name type offset lowtag scs el-type &optional translate)
   `(progn
      (define-vop (,name)
-       ,@(when translate
-           `((:translate ,translate)))
+       (:translate ,translate)
        (:policy :fast-safe)
        (:args (object :scs (descriptor-reg))
-              (index :scs (any-reg)))
+              (index :scs (any-reg signed-reg unsigned-reg)))
        (:arg-types ,type tagged-num)
        (:results (value :scs ,scs))
        (:result-types ,el-type)
@@ -285,10 +326,9 @@
          ,@(when (eq translate 'sb-bignum:%bignum-ref)
              '((bignum-index-check object index 0 vop)))
          (inst mov value (ea (- (* ,offset n-word-bytes) ,lowtag)
-                             object index (ash 1 (- word-shift n-fixnum-tag-bits))))))
+                             object index (index-scale n-word-bytes index)))))
      (define-vop (,(symbolicate name "-C"))
-       ,@(when translate
-           `((:translate ,translate)))
+       (:translate ,translate)
        (:policy :fast-safe)
        (:args (object :scs (descriptor-reg)))
        (:info index)
@@ -323,10 +363,10 @@
                                ,index-to-encode)))))))
   `(progn
      (define-vop (,name)
-       ,@(when translate `((:translate ,translate)))
+       (:translate ,translate)
        (:policy :fast-safe)
        (:args (object :scs (descriptor-reg))
-              (index :scs (any-reg)))
+              (index :scs (any-reg signed-reg unsigned-reg)))
        (:info addend)
        (:arg-types ,type tagged-num
                    (:constant (constant-displacement other-pointer-lowtag
@@ -338,13 +378,13 @@
          ,@(when (eq translate 'sb-bignum:%bignum-ref-with-offset)
              '((bignum-index-check object index addend vop)))
          (let ((ea (ea (- (* (+ ,offset addend) n-word-bytes) ,lowtag)
-                       object index (ash 1 (- word-shift n-fixnum-tag-bits)))))
+                       object index (index-scale n-word-bytes index))))
            ,@(trap 'index)
            (inst mov value ea))))
      ;; This vop is really not ideal to have.  Couldn't we recombine two constants
      ;; and use a vop that only takes the object and just ONE index?
      (define-vop (,(symbolicate name "-C"))
-       ,@(when translate `((:translate ,translate)))
+       (:translate ,translate)
        (:policy :fast-safe)
        (:args (object :scs (descriptor-reg)))
        (:info index addend)
@@ -363,17 +403,18 @@
            ,@(trap '(emit-constant (+ index addend)))
            (inst mov value ea)))))))
 
-;;; used for (SB-BIGNUM:%BIGNUM-SET %SET-FUNCALLABLE-INSTANCE-INFO
-;;;           %SET-ARRAY-DIMENSION %SET-VECTOR-RAW-BITS)
+;;; used for: INSTANCE-INDEX-SET %CLOSURE-INDEX-SET
+;;;           SB-BIGNUM:%BIGNUM-SET %SET-ARRAY-DIMENSION %SET-VECTOR-RAW-BITS
 (defmacro define-full-setter (name type offset lowtag scs el-type translate)
   `(define-vop (,name)
-       ,@(when translate `((:translate ,translate)))
+       (:translate ,translate)
        (:policy :fast-safe)
        (:args (object :scs (descriptor-reg))
-              (index :scs (any-reg immediate))
+              (index :scs (any-reg immediate signed-reg unsigned-reg))
               (value :scs ,scs))
        (:arg-types ,type tagged-num ,el-type)
        (:vop-var vop)
+       (:temporary (:sc unsigned-reg) val-temp)
        (:generator 4
          ,@(when (eq translate 'sb-bignum:%bignum-set)
              '((bignum-index-check object index 0 vop)))
@@ -381,10 +422,7 @@
                        (ea (- (* (+ ,offset (tn-value index)) n-word-bytes) ,lowtag)
                            object)
                        (ea (- (* ,offset n-word-bytes) ,lowtag)
-                           object index (ash 1 (- word-shift n-fixnum-tag-bits))))))
-           ,(if (eq name 'set-funcallable-instance-info)
-                '(pseudo-atomic () ; if immobile space, need to touch a card mark bit
-                  (inst push object)
-                  (invoke-asm-routine 'call 'touch-gc-card vop)
-                  (gen-cell-set ea value))
-                '(gen-cell-set ea value))))))
+                           object index (index-scale n-word-bytes index)))))
+           ,@(when (member name '(instance-index-set %closure-index-set))
+               '((emit-gc-store-barrier object nil val-temp (vop-nth-arg 2 vop) value)))
+           (gen-cell-set ea value val-temp)))))

@@ -24,16 +24,12 @@
 
 (define-vop (set-slot)
   (:args (object :scs (descriptor-reg))
-         (value :scs (descriptor-reg any-reg)))
+         (value :scs (descriptor-reg any-reg zero)))
   (:info name offset lowtag)
   (:ignore name)
   (:results)
   (:generator 1
     (storew value object offset lowtag)))
-
-(define-vop (init-slot set-slot)
-  (:info name dx-p offset lowtag)
-  (:ignore name dx-p))
 
 (define-vop (compare-and-swap-slot)
   (:args (object :scs (descriptor-reg))
@@ -71,13 +67,6 @@
   (:policy :fast-safe)
   (:vop-var vop)
   (:save-p :compute-only))
-;;; Like CHECKED-CELL-REF, only we are a predicate to see if the cell is bound.
-(define-vop (boundp-frob)
-  (:args (object :scs (descriptor-reg)))
-  (:conditional)
-  (:info target not-p)
-  (:policy :fast-safe)
-  (:temporary (:scs (descriptor-reg)) value))
 
 ;;; With Symbol-Value, we check that the value isn't the trap object.  So
 ;;; Symbol-Value of NIL is NIL.
@@ -85,7 +74,7 @@
 (progn
   (define-vop (set)
     (:args (object :scs (descriptor-reg))
-           (value :scs (descriptor-reg any-reg)))
+           (value :scs (descriptor-reg any-reg zero)))
     (:temporary (:sc any-reg) tls-index)
     (:generator 4
       (inst ldr (32-bit-reg tls-index) (tls-index-of object))
@@ -135,27 +124,17 @@
              LOCAL))))
 
       (when check-boundp
-        (let ((err-lab (generate-error-code vop 'unbound-symbol-error symbol)))
-          (inst cmp value unbound-marker-widetag)
-          (inst b :eq err-lab)))))
+        (assemble ()
+          (let* ((*location-context* (make-restart-location RETRY value))
+                 (err-lab (generate-error-code vop 'unbound-symbol-error symbol)))
+            (inst cmp value unbound-marker-widetag)
+            (inst b :eq err-lab))
+          RETRY))))
 
   (define-vop (fast-symbol-value symbol-value)
     (:policy :fast)
     (:variant nil)
-    (:variant-cost 5))
-
-  (define-vop (boundp boundp-frob)
-    (:translate boundp)
-    (:temporary (:sc any-reg) tls-index)
-    (:generator 9
-      (inst ldr (32-bit-reg tls-index) (tls-index-of object))
-      (inst ldr value (@ thread-tn tls-index))
-      (inst cmp value no-tls-value-marker-widetag)
-      (inst b :ne LOCAL)
-      (loadw value object symbol-value-slot other-pointer-lowtag)
-      LOCAL
-      (inst cmp value unbound-marker-widetag)
-      (inst b (if not-p :eq :ne) target))))
+    (:variant-cost 5)))
 
 #-sb-thread
 (progn
@@ -171,14 +150,30 @@
   (define-vop (fast-symbol-value cell-ref)
     (:variant symbol-value-slot other-pointer-lowtag)
     (:policy :fast)
-    (:translate symeval))
+    (:translate symeval)))
 
-  (define-vop (boundp boundp-frob)
-    (:translate boundp)
-    (:generator 9
+(define-vop (boundp)
+  (:args (object :scs (descriptor-reg)))
+  (:conditional)
+  (:info target not-p)
+  (:policy :fast-safe)
+  (:temporary (:scs (descriptor-reg)) value)
+  (:translate boundp)
+  #+sb-thread
+  (:generator 9
+      (inst ldr (32-bit-reg value) (tls-index-of object))
+      (inst ldr value (@ thread-tn value))
+      (inst cmp value no-tls-value-marker-widetag)
+      (inst b :ne LOCAL)
+      (loadw value object symbol-value-slot other-pointer-lowtag)
+      LOCAL
+      (inst cmp value unbound-marker-widetag)
+      (inst b (if not-p :eq :ne) target))
+  #-sb-thread
+  (:generator 9
       (loadw value object symbol-value-slot other-pointer-lowtag)
       (inst cmp value unbound-marker-widetag)
-      (inst b (if not-p :eq :ne) target))))
+      (inst b (if not-p :eq :ne) target)))
 
 (define-vop (%set-symbol-global-value cell-set)
   (:variant symbol-value-slot other-pointer-lowtag))
@@ -205,7 +200,7 @@
   (:policy :fast-safe)
   (:translate symbol-hash)
   (:args (symbol :scs (descriptor-reg)))
-  (:temporary (:scs (non-descriptor-reg)) temp)
+  (:args-var args)
   (:results (res :scs (any-reg)))
   (:result-types positive-fixnum)
   (:generator 2
@@ -213,8 +208,30 @@
     ;; car slot, so we have to strip off the fixnum-tag-mask to make sure
     ;; it is a fixnum.  The lowtag selection magic that is required to
     ;; ensure this is explained in the comment in objdef.lisp
-    (loadw temp symbol symbol-hash-slot other-pointer-lowtag)
-    (inst and res temp (bic-mask fixnum-tag-mask))))
+    (loadw res symbol symbol-hash-slot other-pointer-lowtag)
+    (unless (not-nil-tn-ref-p args)
+      (inst and res res (bic-mask fixnum-tag-mask)))))
+
+(define-vop ()
+  (:args (symbol :scs (descriptor-reg)))
+  (:results (result :scs (unsigned-reg)))
+  (:result-types positive-fixnum)
+  (:translate sb-impl::symbol-package-id)
+  (:policy :fast-safe)
+  (:generator 1 ; ASSUMPTION: symbol-package-bits = 16
+   (inst ldrh result (@ symbol (+ (ash symbol-name-slot word-shift)
+                                  (- other-pointer-lowtag)
+                                  6))))) ; little-endian
+(define-vop ()
+  (:policy :fast-safe)
+  (:translate symbol-name)
+  (:args (symbol :scs (descriptor-reg)))
+  (:results (result :scs (descriptor-reg)))
+  (:temporary (:sc non-descriptor-reg) pa-flag)
+  (:generator 5
+    (pseudo-atomic (pa-flag :sync nil)
+      (loadw result symbol symbol-name-slot other-pointer-lowtag)
+      (inst and result result (1- (ash 1 sb-impl::symbol-name-bits))))))
 
 (define-vop (%compare-and-swap-symbol-value)
   (:translate %compare-and-swap-symbol-value)
@@ -335,16 +352,13 @@
 (define-vop (fdefn-makunbound)
   (:policy :fast-safe)
   (:translate fdefn-makunbound)
-  (:args (fdefn :scs (descriptor-reg) :target result))
+  (:args (fdefn :scs (descriptor-reg)))
   (:temporary (:scs (non-descriptor-reg)) temp)
   (:temporary (:scs (interior-reg)) lip)
-  (:results (result :scs (descriptor-reg)))
   (:generator 38
     (storew null-tn fdefn fdefn-fun-slot other-pointer-lowtag)
     (load-inline-constant temp '(:fixup undefined-tramp :assembly-routine) lip)
-    (storew temp fdefn fdefn-raw-addr-slot other-pointer-lowtag)
-    (move result fdefn)))
-
+    (storew temp fdefn fdefn-raw-addr-slot other-pointer-lowtag)))
 
 
 ;;;; Binding and Unbinding.
@@ -355,15 +369,13 @@
 #+sb-thread
 (progn
   (define-vop (dynbind)
-    (:args (value :scs (any-reg descriptor-reg) :to :save)
+    (:args (value :scs (any-reg descriptor-reg zero) :to :save)
            (symbol :scs (descriptor-reg)
                    :load-if (not (and (sc-is symbol constant)
                                       (or (symbol-always-has-tls-value-p (tn-value symbol))
-                                           (symbol-always-has-tls-index-p (tn-value symbol))
-                                          )))
-                   ))
+                                          (symbol-always-has-tls-index-p (tn-value symbol)))))))
     (:temporary (:sc descriptor-reg) value-temp)
-    (:temporary (:sc descriptor-reg :offset r0-offset :from (:argument 1)) alloc-tls-symbol)
+    (:temporary (:sc descriptor-reg :offset r8-offset :from (:argument 1)) alloc-tls-symbol)
     (:temporary (:sc non-descriptor-reg :offset nl0-offset) tls-index)
     (:temporary (:sc non-descriptor-reg :offset nl1-offset) free-tls-index)
     (:temporary (:sc interior-reg) lip)
@@ -485,9 +497,9 @@
   closure-info-offset fun-pointer-lowtag
   (descriptor-reg any-reg) * %closure-index-ref)
 
-(define-full-setter set-funcallable-instance-info *
-  funcallable-instance-info-offset fun-pointer-lowtag
-  (descriptor-reg any-reg) * %set-funcallable-instance-info)
+(define-full-setter %closure-index-set *
+  closure-info-offset fun-pointer-lowtag
+  (descriptor-reg any-reg) * %closure-index-set)
 
 (define-full-reffer funcallable-instance-info *
   funcallable-instance-info-offset fun-pointer-lowtag
@@ -561,8 +573,39 @@
   (descriptor-reg any-reg) * code-header-ref)
 
 #-darwin-jit
-(define-full-setter code-header-set * 0 other-pointer-lowtag
-  (descriptor-reg any-reg) * code-header-set)
+(define-vop (code-header-set)
+  (:translate code-header-set)
+  (:policy :fast-safe)
+  (:args (object :scs (descriptor-reg))
+         (index :scs (any-reg))
+         (value :scs (any-reg descriptor-reg)))
+  (:arg-types * tagged-num *)
+  (:temporary (:scs (non-descriptor-reg)) temp card)
+  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:sc non-descriptor-reg) pa-flag)
+  (:generator 10
+    (load-inline-constant temp `(:fixup "gc_card_table_mask" :foreign-dataref) lip)
+    (inst ldr temp (@ temp))
+    (inst ldr (32-bit-reg temp) (@ temp)) ; 4-byte int
+    (pseudo-atomic (pa-flag)
+      ;; Compute card mark index
+      (inst lsr card object gencgc-card-shift)
+      (inst and card card temp)
+      ;; Load mark table base
+      (load-inline-constant temp `(:fixup "gc_card_mark" :foreign-dataref) lip)
+      (inst ldr temp (@ temp))
+      (inst ldr temp (@ temp))
+      ;; Touch the card mark byte.
+      (inst strb zr-tn (@ temp card))
+      ;; set 'written' flag in the code header
+      ;; If two threads get here at the same time, they'll write the same byte.
+      (let ((byte (- #+big-endian 4 #+little-endian 3 other-pointer-lowtag)))
+        (inst ldrb temp (@ object byte))
+        (inst orr temp temp #x40)
+        (inst strb temp (@ object byte)))
+      (inst lsl temp index (- word-shift n-fixnum-tag-bits))
+      (inst sub temp temp other-pointer-lowtag)
+      (inst str value (@ object temp)))))
 
 ;;;; raw instance slot accessors
 

@@ -17,7 +17,8 @@
 ;;; A list of UNDEFINED-WARNING structures representing references to unknown
 ;;; stuff which came up in a compilation unit.
 (defvar *undefined-warnings*)
-(declaim (list *undefined-warnings*))
+(defvar *argument-mismatch-warnings*)
+(declaim (list *undefined-warnings* *argument-mismatch-warnings*))
 
 ;;; Delete any undefined warnings for NAME and KIND. This is for the
 ;;; benefit of the compiler, but it's sometimes called from stuff like
@@ -105,7 +106,12 @@
 
       (let ((kind (info :function :kind name)))
         ;; scrubbing old data I: possible collision with a macro
-        (when (and (fboundp name) (eq :macro kind))
+        ;; There's a silly little problem with fun names that are not ANSI-legal names,
+        ;; e.g. (CAS mumble). We can't ask the host whether that is FBOUNDP,
+        ;; because it would rightly complain. So, just assume that it is not FBOUNDP.
+        (when (and #+sb-xc-host (symbolp name)
+                   (fboundp name)
+                   (eq :macro kind))
           (assert-it)
           (compiler-style-warn "~S was previously defined as a macro." name)
           (setf (info :function :where-from name) :assumed)
@@ -269,11 +275,7 @@
       (enable-package-locks
        (set-difference old names :test #'equal)))))
 
-;;; This variable really wants to be a DEFVAR, but the "if (boundp)" expression
-;;; is too tricky for genesis. Let's ensure proper behavior by not clobbering
-;;; it in the host, but doing the only thing that genesis can do in the target.
-(#+sb-xc-host defvar #-sb-xc-host defparameter
- *queued-proclaims* nil) ; should this be !*QUEUED-PROCLAIMS* ?
+(defvar *queued-proclaims* nil)
 
 (defun process-variable-declaration (name kind info-value)
   (unless (symbolp name)
@@ -507,10 +509,11 @@
                                     (ftype #'proclaim-ftype))
                             ctype type :declared)))
              (push raw-form *queued-proclaims*)))
-        #-sb-fluid
         (freeze-type
+         #-sb-fluid
          (map-args #'process-freeze-type-declaration))
         ((start-block end-block)
+         #-(and sb-devel sb-xc-host)
          (when (and *compile-time-eval* (boundp '*compilation*))
            (if (eq *block-compile-argument* :specified)
                (process-block-compile-declaration args kind)

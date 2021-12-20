@@ -1,5 +1,114 @@
 ;;;; -*- coding: utf-8; fill-column: 78 -*-
 
+changes in sbcl-2.1.11 relative to sbcl-2.1.10:
+  * minor incompatible change: *COMPILE-PRINT* now defaults to NIL.  T gives
+    the old behavior of echoing top level forms. Users who want to see a
+    report of the phases of compilation can use *COMPILE-PROGRESS* and the
+    corresponding COMPILE-FILE :PROGRESS argument.
+  * optimization: The compiler assignment-converts functions much more
+    aggressively; local or non-entry block-compiled functions
+    which always return to the same place are automatically converted into the
+    equivalent loop or goto control structures.
+  * enhancement: on x86-64 and ppc64 platforms, the system uses inline
+    instructions rather than page protection to implement a store barrier for
+    the garbage collector.
+  * enhancement: improved reporting of code deletion notes.
+  * platform support:
+    ** unbound-variable restarts for amd64 are now supported.
+    ** bug fix: single-floats to foreign functions on 32-bit ARMel.
+       (lp#1950080, reported by Sebastien Villemot)
+    ** bug fix: opening files with names containing non-ASCII characters on
+       Windows works better.  (reported by Nikolay)
+    ** bug fix: use fp_xsave to access the floating point flags and control
+       word in Haiku signal contexts.  (Thanks to Al Hoang)
+    ** bug fix: complex single-float support on riscv64.
+    ** optimization: support for accessing elements of &rest args directly on
+       ppc64, mips, riscv.
+    ** optimization: parse a /proc file rather than executing uname for
+       SOFTWARE-VERSION on Linux
+  * bug fix: fix crash from SB-COVER:RESET-COVERAGE.  (lp#1950059, reported by
+    Gregory Czerniak)
+
+changes in sbcl-2.1.10 relative to sbcl-2.1.9:
+  * incompatible change: simd-pack without a specific element-type is no
+    longer treated as containing integers. A type must be supplied for VOPs to
+    work on such values.
+  * minor incompatible change: the list form of the FUNCTION type specifier
+    does not allow * as any argument type, but does allow * as a placeholder
+    for wholly unspecified arguments when specifying the value(s) type.
+  * minor incompatible change: the default (Lisp) toplevel option parser
+    throws an error if it encounters an option which was intended to be used
+    and removed by the C runtime.  (lp#1945081, reported by Luke Gorrie)
+  * new feature: there is now a defined interface for defining foreign
+    callable functions, which can be used for passing callbacks to foreign
+    functions or for calling Lisp code from the foreign world as a shared
+    library (preliminary support). See the revised manual section "Calling
+    into Lisp From C" for more details.
+  * enhancement: arg-count mismatches in self-calls in defmethod are reported.
+    (lp#1912436, reported by 3b)
+  * enhancement: the SB-CLTL2 contrib now returns type information for
+    generated structure accessors.  (lp#1934859, reported by SATO shinichi)
+  * optimization: code generation is improved for modular arithmetic involving
+    signed operations.
+  * platform support:
+    ** x86-64 machine code emitter crash when attempting to assemble some
+       vector instructions.  (lp#1945975, thanks to Marco Heisig)
+    ** conditional move instructions are now supported on arm64.
+    ** a number of new peephole optimizations have been implemented on arm64.
+    ** arm64 on Darwin now uses gcc-compatible thread-local storage.
+  * bug fix: compiler notes are no longer emitted when compiling FORMATTER
+    forms, including when implicitly triggered on a constant string argument
+    to FORMAT.  (lp#1946246, reported by SATO shinichi)
+  * bug fix: a compiler error when attempting to compile a call to AREF with
+    too many dimensions.  (lp#1902985)
+  * bug fix: harmonize the behaviour of SLOT-BOUNDP on non-standard-objects
+    between the various ways in which it can be called.  (lp#732229, reported
+    by Zach Beane)
+  * bug fix: FTRUNCATE and similar functions are now more careful about
+    deriving facts about the sign of zero they might return.  (lp#1732009,
+    reported by Paul Dietz)
+
+changes in sbcl-2.1.9 relative to sbcl-2.1.8:
+  * minor incompatible change: the experimental DEFCAS macro has been removed.
+  * minor incompatible change: finalizing classes with slots with duplicate
+    symbol-names will only emit a warning if either slot name is an exported
+    symbol.  (lp#1943559)
+  * platform support:
+    ** the debugger is better able to display SIMD packs.  (thanks to Marco
+       Heisig)
+    ** fix a bug in zeroing YMM registers.  (thanks to Marco Heisig)
+    ** fix instruction definitions for SSE blend and shuffle vector
+       instructions.  (thanks to Marco Heisig)
+    ** handle heap corruption exceptions in our exception handler on win64.
+    ** improve WAIT-UNTIL-FD-USABLE on Windows, reducing busy-looping.
+       (thanks to Fabio Almeida)
+  * bug fix: EQUALP hash tables whose keys contain arrays containing floats should
+    behave correctly.  (lp#1942424, reported by Nicolas Neuss)
+
+changes in sbcl-2.1.8 relative to sbcl-2.1.7:
+  * minor incompatible change: the experimental DEFINE-CAS-EXPANDER macro has
+    been removed.
+  * minor incompatible change: the hooks in *INIT-HOOKS* are called before
+    starting the finalizer or other non-user threads.  (thanks to Sean Whitton)
+  * platform support:
+    ** many improvements to code generation on arm64.
+    ** avoid slow forms of the bit test instructions BT, BTS, BTR on x86-64.
+    ** fix a bug in loading large core files on the Apple M1/arm64.  (thanks
+       to Mayank Manjrekar)
+    ** fix a bug in loading core loading on the Apple M1/arm64.  (reported by
+       Eric Timmons)
+  * enhancement: the block-compiler is more robust to files with intermingled
+    compile-time and load-time effects.  The semantics of the block-compiler
+    remain not-entirely ANSI compatible.  (thanks to Sean Maher)
+  * enhancement: (CAS SAP-REF-<x>) and CAS on alien integers is implemented on
+    ppc64 and x86-64, working towards fixing lp#1894057
+  * bug fix: fix OPEN-STREAM-P on streams closed by saving a core.
+    (lp#1938433, reported by Guillaume LE VAILLANT)
+  * bug fix: remove a spurious warning from COERCE.  (lp#1920931, reported by
+    Andrew Berkley)
+  * bug fix: remove a warning from inlining SET-EXCLUSIVE-OR.  (lp#1936470,
+    reported by Jerome Abela)
+
 changes in sbcl-2.1.7 relative to sbcl-2.1.6:
   * incompatible change: on certain platforms (currently just x86-64),
     dynamic-extent arrays specialized on character and numeric types and

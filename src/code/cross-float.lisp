@@ -381,7 +381,7 @@
                  ((null value) ; must not be one of the exceptional symbols
                   (setf (flonum-%value x) (calculate-flonum-value x)))
                  (t ; infinity or minus-zero
-                  (error "~S has no portable value" x)))))
+                  (error "~S (~D) has no portable value" value x)))))
         (t (error "Got host float"))))
 
 (defun realnumify* (args) (mapcar #'realnumify args))
@@ -758,7 +758,13 @@
              `(let ((x (car args)) (y (cadr args)))
                 (and (floatp x) (floatp y) (eql (flonum-%bits x) (flonum-%bits y)))))
            (two-zeros-p ()
-             `(and (eql nargs 2) (zerop (car args)) (zerop (cadr args)))))
+             `(and (eql nargs 2) (zerop (car args)) (zerop (cadr args))))
+           (same-sign-infinities-p ()
+             `(and (eql nargs 2)
+                   (floatp (car args))
+                   (floatp (cadr args))
+                   (member (flonum-%value (car args)) '(:-infinity :+infinity))
+                   (eq (flonum-%value (cadr args)) (flonum-%value (car args))))))
 
   ;; Simple case of using the interceptor to return a boolean.  If
   ;; infinity leaks in, the host will choke since those are
@@ -833,6 +839,7 @@
                          (eql b $2.0d0))))
              nil)
             ((two-zeros-p) t) ; signed zeros are equal
+            ((same-sign-infinities-p) t) ; infinities are =
             ((and (eql nargs 2) (zerop (cadr args)))
              ;; Need this case if the first arg is represented as bits
              (if (rationalp (car args))
@@ -861,6 +868,7 @@
                           (error "Unhandled")))
                    (error "Unhandled"))))
             ((two-zeros-p) t) ; signed zeros are equal
+            ((same-sign-infinities-p) t) ; infinities are =
             ((and (eql nargs 2) (zerop (cadr args)))
              ;; Need this case if the first arg is represented as bits
              (if (floatp (car args))

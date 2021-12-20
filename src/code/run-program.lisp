@@ -307,7 +307,8 @@ PROCESS."
   "Hand SIGNAL to PROCESS. If WHOM is :PID, use the kill Unix system call. If
    WHOM is :PROCESS-GROUP, use the killpg Unix system call. If WHOM is
    :PTY-PROCESS-GROUP deliver the signal to whichever process group is
-   currently in the foreground."
+   currently in the foreground.
+   Returns T if successful, otherwise returns NIL and error number (two values)."
   (let ((pid (ecase whom
                ((:pid :process-group)
                 (process-pid process))
@@ -1327,6 +1328,9 @@ Users Manual for details about the PROCESS structure.
   (or sb-sys::*software-version*
       (setf sb-sys::*software-version*
             (possibly-base-stringize
+             #+linux
+             (with-open-file (f "/proc/sys/kernel/osrelease") (read-line f))
+             #-linux
              (string-trim '(#\newline)
                           (%with-output-to-string (stream)
                            (run-program "/bin/uname"

@@ -14,29 +14,8 @@
 (defconstant arg-count-sc (make-sc+offset immediate-arg-scn nargs-offset))
 (defconstant closure-sc (make-sc+offset descriptor-reg-sc-number lexenv-offset))
 
-;;; Make a passing location TN for a local call return PC.  If
-;;; standard is true, then use the standard (full call) location,
-;;; otherwise use any legal location.  Even in the non-standard case,
-;;; this may be restricted by a desire to use a subroutine call
-;;; instruction.
-(defun make-return-pc-passing-location (standard)
-  (declare (ignore standard))
-  (make-wired-tn *backend-t-primitive-type* control-stack-sc-number
-                 lra-save-offset))
-
 (defconstant return-pc-passing-offset
   (make-sc+offset control-stack-sc-number lra-save-offset))
-
-;;; This is similar to MAKE-RETURN-PC-PASSING-LOCATION, but makes a
-;;; location to pass OLD-FP in.
-;;;
-;;; This is wired in both the standard and the local-call conventions,
-;;; because we want to be able to assume it's always there. Besides,
-;;; the ARM doesn't have enough registers to really make it profitable
-;;; to pass it in a register.
-(defun make-old-fp-passing-location ()
-  (make-wired-tn *fixnum-primitive-type* control-stack-sc-number
-                 ocfp-save-offset))
 
 (defconstant old-fp-passing-offset
   (make-sc+offset control-stack-sc-number ocfp-save-offset))
@@ -44,21 +23,22 @@
 ;;; Make the TNs used to hold OLD-FP and RETURN-PC within the current
 ;;; function. We treat these specially so that the debugger can find
 ;;; them at a known location.
-(defun make-old-fp-save-location (env)
+(defun make-old-fp-save-location ()
   ;; Unlike the other backends, ARM function calling is designed to
   ;; pass OLD-FP within the stack frame rather than in a register.  As
   ;; such, in order for lifetime analysis not to screw up, we need it
   ;; to be a stack TN wired to the save offset, not a normal TN with a
   ;; wired SAVE-TN.
-  (physenv-debug-live-tn (make-wired-tn *fixnum-primitive-type*
-                                        control-stack-arg-scn
-                                        ocfp-save-offset)
-                         env))
-(defun make-return-pc-save-location (physenv)
-  (physenv-debug-live-tn
-   (make-wired-tn *backend-t-primitive-type* control-stack-sc-number
-                  lra-save-offset)
-   physenv))
+  (let ((tn (make-wired-tn *fixnum-primitive-type*
+                           control-stack-arg-scn
+                           ocfp-save-offset)))
+    (setf (tn-kind tn) :environment)
+    tn))
+(defun make-return-pc-save-location ()
+  (let ((tn (make-wired-tn *backend-t-primitive-type* control-stack-sc-number
+                           lra-save-offset)))
+    (setf (tn-kind tn) :environment)
+    tn))
 
 ;;; Make a TN for the standard argument count passing location.  We
 ;;; only need to make the standard location, since a count is never
@@ -143,7 +123,7 @@
     (move res csp-tn)
     (inst add csp-tn csp-tn (add-sub-immediate
                              (* (max 1 (sb-allocated-size 'control-stack)) n-word-bytes)))
-    (when (ir2-physenv-number-stack-p callee)
+    (when (ir2-environment-number-stack-p callee)
       (inst sub nfp nsp-tn (add-sub-immediate
                             (bytes-needed-for-non-descriptor-stack-frame)))
       (inst mov-sp nsp-tn nfp))))
@@ -151,17 +131,21 @@
 ;;; Allocate a partial frame for passing stack arguments in a full call.  Nargs
 ;;; is the number of arguments passed.  If no stack arguments are passed, then
 ;;; we don't have to do anything.
+;;; LR and CFP are always saved on the stack, but it's safe to have two words above CSP.
 (define-vop (allocate-full-call-frame)
   (:info nargs)
   (:results (res :scs (any-reg)))
   (:generator 2
-    (move res csp-tn)
-        (let ((size (add-sub-immediate (* (max 2 nargs) n-word-bytes))))
-      (cond ((typep size '(signed-byte 9))
-             (inst str cfp-tn (@ csp-tn size :post-index)))
-            (t
-             (inst add csp-tn csp-tn size)
-             (storew cfp-tn res ocfp-save-offset))))))
+    (if (<= nargs register-arg-count)
+        ;; Don't touch RES, the call vops would use CSP-TN in this case.
+        (storew cfp-tn csp-tn ocfp-save-offset)
+        (let ((size (add-sub-immediate (* nargs n-word-bytes))))
+          (move res csp-tn)
+          (cond ((typep size '(signed-byte 9))
+                 (inst str cfp-tn (@ csp-tn size :post-index)))
+                (t
+                 (inst add csp-tn csp-tn size)
+                 (storew cfp-tn res ocfp-save-offset)))))))
 
 ;;; Emit code needed at the return-point from an unknown-values call
 ;;; for a fixed number of values.  VALUES is the head of the TN-REF
@@ -189,10 +173,12 @@
 ;;;  -- Reset SP.  This must be done whenever other than 1 value is returned,
 ;;;     regardless of the number of values desired.
 
-(defun default-unknown-values (vop values nvals move-temp)
+(defun default-unknown-values (vop values nvals move-temp node)
   (declare (type (or tn-ref null) values)
            (type unsigned-byte nvals) (type tn move-temp))
-  (let ((expecting-values-on-stack (> nvals register-arg-count)))
+  (let* ((type (sb-c::node-derived-type node))
+         (min-values (values-type-min-value-count type))
+         (expecting-values-on-stack (> nvals register-arg-count)))
     (note-this-location vop (if (<= nvals 1)
                                 :single-value-return
                                 :unknown-return))
@@ -207,13 +193,20 @@
              (val (tn-ref-across values) (tn-ref-across val)))
             ((= i (min nvals register-arg-count)))
           (unless (eq (tn-kind (tn-ref-tn val)) :unused)
-           (inst csel (tn-ref-tn val) null-tn (tn-ref-tn val) :ne))))
+            (cond
+              ((and min-values
+                    (> min-values i)))
+              (t
+               (inst csel (tn-ref-tn val) null-tn (tn-ref-tn val) :ne))))))
 
       ;; If we're not expecting values on the stack, all that
       ;; remains is to clear the stack frame (for the multiple-
       ;; value return case).
-      (unless expecting-values-on-stack
-        (inst csel csp-tn ocfp-tn csp-tn :eq))
+      (unless (or expecting-values-on-stack
+                  (type-single-value-p type))
+        (if (values-type-may-be-single-value-p type)
+            (inst csel csp-tn ocfp-tn csp-tn :eq)
+            (inst mov csp-tn ocfp-tn)))
 
       ;; If we ARE expecting values on the stack, we need to
       ;; either move them to their result location or to set their
@@ -223,9 +216,10 @@
         ;; For the single-value return case, fake up NARGS and
         ;; OCFP so that we don't screw ourselves with the
         ;; defaulting and stack clearing logic.
-        (inst csel ocfp-tn csp-tn ocfp-tn :ne)
-        (inst mov tmp-tn (fixnumize 1))
-        (inst csel nargs-tn tmp-tn nargs-tn :ne)
+        (unless (> min-values 1)
+          (inst csel ocfp-tn csp-tn ocfp-tn :ne)
+          (inst mov tmp-tn (fixnumize 1))
+          (inst csel nargs-tn tmp-tn nargs-tn :ne))
 
         ;; For each expected stack value...
         (do ((i register-arg-count (1+ i))
@@ -236,22 +230,64 @@
                   (tn-ref-across val)))
             ((null val))
           (let ((tn (tn-ref-tn val)))
-            (if (eq (tn-kind tn) :unused)
-                (incf decrement (fixnumize 1))
-                (assemble ()
-                  ;; ... Load it if there is a stack value available, or
-                  ;; default it if there isn't.
-                  (inst subs nargs-tn nargs-tn decrement)
-                  (setf decrement (fixnumize 1))
-                  (inst b :lt NONE)
-                  (loadw move-temp ocfp-tn i 0)
-                  NONE
-                  (sc-case tn
-                    (control-stack
-                     (inst csel move-temp null-tn move-temp :lt)
-                     (store-stack-tn tn move-temp))
-                    (t
-                     (inst csel tn null-tn move-temp :lt)))))))
+            (cond ((eq (tn-kind tn) :unused)
+                   (incf decrement (fixnumize 1)))
+                  ((< i min-values)
+                   (incf decrement (fixnumize 1))
+                   (sc-case tn
+                     (control-stack
+                      (let* ((next (and (< (1+ i) min-values)
+                                        (tn-ref-across val)))
+                             (next-tn (and next
+                                           (tn-ref-tn next))))
+                        (cond ((and next-tn
+                                    (not (sc-is next-tn control-stack))
+                                    (neq (tn-kind next-tn) :unused)
+                                    (ldp-stp-offset-p (* i n-word-bytes) n-word-bits))
+                               (inst ldp move-temp next-tn
+                                     (@ ocfp-tn (* i n-word-bytes)))
+                               (store-stack-tn tn move-temp)
+                               (setf val next)
+                               (incf i)
+                               (incf decrement (fixnumize 1)))
+                              (t
+                               (loadw move-temp ocfp-tn i)
+                               (store-stack-tn tn move-temp)))))
+                     (t
+                      (let* ((next (and (< (1+ i) min-values)
+                                        (tn-ref-across val)))
+                             (next-tn (and next
+                                           (tn-ref-tn next))))
+                        (cond ((and next-tn
+                                    (neq (tn-kind next-tn) :unused)
+                                    (ldp-stp-offset-p (* i n-word-bytes) n-word-bits))
+                               (let ((stack (sc-is next-tn control-stack)))
+                                 (inst ldp tn (if stack
+                                                  move-temp
+                                                  next-tn)
+                                       (@ ocfp-tn (* i n-word-bytes)))
+                                 (when stack
+                                   (store-stack-tn next-tn move-temp)))
+                               (setf val next)
+                               (incf i)
+                               (incf decrement (fixnumize 1)))
+                              (t
+                               (loadw tn ocfp-tn i)))))))
+                  (t
+                   (assemble ()
+                     ;; ... Load it if there is a stack value available, or
+                     ;; default it if there isn't.
+                     (inst subs nargs-tn nargs-tn decrement)
+                     (setf decrement (fixnumize 1))
+                     (inst b :lt NONE)
+                     (loadw move-temp ocfp-tn i)
+                     NONE
+                     (sc-case tn
+                       (control-stack
+                        (inst csel move-temp null-tn move-temp :lt)
+                        (store-stack-tn tn move-temp))
+                       (t
+                        (inst csel tn null-tn move-temp :lt))))))))
         ;; Deallocate the callee stack frame.
         (move csp-tn ocfp-tn))))
   (values))
@@ -276,23 +312,28 @@
 ;;; results Start and Count (also, it's nice to be able to target them).
 (defun receive-unknown-values (args nargs start count)
   (declare (type tn args nargs start count))
-  (assemble ()
-    (inst b :eq MULTIPLE)
-    (move start csp-tn)
-    (inst add csp-tn csp-tn n-word-bytes)
-    (inst str (first *register-arg-tns*) (@ start))
-    (inst mov count (fixnumize 1))
-    (inst b DONE)
-    MULTIPLE
-    #.(assert (evenp register-arg-count))
-    (do ((arg *register-arg-tns* (cddr arg))
-         (i 0 (+ i 2)))
-        ((null arg))
-      (inst stp (first arg) (second arg)
-            (@ args (* i n-word-bytes))))
-    (move start args)
-    (move count nargs)
-    DONE))
+  (let ((unused-count-p (eq (tn-kind count) :unused))
+        (unused-start-p (eq (tn-kind start) :unused)))
+    (assemble ()
+      (inst b :eq MULTIPLE)
+      (unless unused-start-p
+        (move start csp-tn))
+      (inst str (first *register-arg-tns*) (@ csp-tn n-word-bytes :post-index))
+      (unless unused-count-p
+        (inst mov count (fixnumize 1)))
+      (inst b DONE)
+      MULTIPLE
+      #.(assert (evenp register-arg-count))
+      (do ((arg *register-arg-tns* (cddr arg))
+           (i 0 (+ i 2)))
+          ((null arg))
+        (inst stp (first arg) (second arg)
+              (@ args (* i n-word-bytes))))
+      (unless unused-start-p
+        (move start args))
+      (unless unused-count-p
+        (move count nargs))
+      DONE)))
 
 ;;; VOP that can be inherited by unknown values receivers.  The main
 ;;; thing this handles is allocation of the result temporaries.
@@ -531,7 +572,7 @@
     (inst cbz count DONE)
 
     (let ((dx-p (node-stack-allocate-p node)))
-      (pseudo-atomic (pa-flag :sync nil :elide dx-p)
+      (pseudo-atomic (pa-flag :sync nil :elide-if dx-p)
         ;; Allocate a cons (2 words) for each item.
         (let ((size (cond (dx-p
                            (lsl count (1+ (- word-shift n-fixnum-tag-bits))))
@@ -647,6 +688,7 @@
   (:move-args :local-call)
   (:info arg-locs callee target nvals)
   (:vop-var vop)
+  (:node-var node)
   (:temporary (:scs (descriptor-reg) :from (:eval 0)) move-temp)
   (:temporary (:sc control-stack :offset nfp-save-offset) nfp-save)
   (:temporary (:sc any-reg :offset ocfp-offset :from (:eval 0)) ocfp)
@@ -661,7 +703,7 @@
       (maybe-load-stack-tn cfp-tn fp)
       (note-this-location vop :call-site)
       (inst bl target)
-      (default-unknown-values vop values nvals move-temp)
+      (default-unknown-values vop values nvals move-temp node)
       (when cur-nfp
         (load-stack-tn cur-nfp nfp-save)))))
 
@@ -750,15 +792,15 @@
   (:ignore val-locs vals)
   (:vop-var vop)
   (:generator 6
-              (maybe-load-stack-tn old-fp-temp old-fp)
-              (maybe-load-stack-tn lip return-pc)
-              (move csp-tn cfp-tn)
-              (let ((cur-nfp (current-nfp-tn vop)))
-                (when cur-nfp
-                  (inst add nsp-tn cur-nfp (add-sub-immediate
-                                            (bytes-needed-for-non-descriptor-stack-frame)))))
-              (move cfp-tn old-fp-temp)
-              (lisp-return lip :known)))
+    (maybe-load-stack-tn old-fp-temp old-fp)
+    (maybe-load-stack-tn lip return-pc)
+    (move csp-tn cfp-tn)
+    (let ((cur-nfp (current-nfp-tn vop)))
+      (when cur-nfp
+        (inst add nsp-tn cur-nfp (add-sub-immediate
+                                  (bytes-needed-for-non-descriptor-stack-frame)))))
+    (move cfp-tn old-fp-temp)
+    (lisp-return lip :known)))
 
 ;;;; Full call:
 ;;;
@@ -831,6 +873,7 @@
          '((:move-args :full-call)))
 
      (:vop-var vop)
+     (:node-var node)
      (:info ,@(unless (or variable (eq return :tail)) '(arg-locs))
             ,@(unless variable '(nargs))
             ,@(when (eq named :direct) '(fun))
@@ -844,8 +887,8 @@
       ,@(unless variable '(args))
       ,@(ecase return
           (:fixed '(ocfp-temp))
-          (:tail '(old-fp return-pc))
-          (:unknown '(r0-temp))))
+          (:tail '(old-fp return-pc node))
+          (:unknown '(r0-temp node))))
 
      ,@(unless (eq named :direct)
          `((:temporary (:sc descriptor-reg :offset lexenv-offset
@@ -901,15 +944,7 @@
                               (ecase what
                                 (:load-nargs
                                  ,@(if variable
-                                       `((move nargs-pass csp-tn)
-                                         ;; The variable args are on the stack
-                                         ;; and become the frame, but there may
-                                         ;; be <4 args and 2 stack slots are
-                                         ;; assumed allocate on the call. So
-                                         ;; need to ensure there are at least 2
-                                         ;; slots. This just adds 2 more.
-                                         (inst add csp-tn nargs-pass (* 2 n-word-bytes))
-                                         (inst sub nargs-pass nargs-pass new-fp)
+                                       `((inst sub nargs-pass csp-tn new-fp)
                                          (inst asr nargs-pass nargs-pass (- word-shift n-fixnum-tag-bits))
                                          ,@(do ((arg *register-arg-names* (cddr arg))
                                                 (i 0 (+ i 2))
@@ -928,7 +963,12 @@
                                       `((:frob-nfp
                                          (store-stack-tn nfp-save cur-nfp))
                                         (:load-fp
-                                         (move cfp-tn new-fp))))
+                                         (move cfp-tn (cond ,@(and
+                                                               (not variable)
+                                                               '(((<= nargs register-arg-count)
+                                                                  csp-tn)))
+                                                            (t
+                                                             new-fp))))))
                                 ((nil)))))
                           (insert-step-instrumenting ()
                             ;; Conditionally insert a conditional trap:
@@ -995,7 +1035,7 @@
 
                    ,@(ecase return
                        (:fixed
-                        '((default-unknown-values vop values nvals move-temp)
+                        '((default-unknown-values vop values nvals move-temp node)
                           (when cur-nfp
                             (load-stack-tn cur-nfp nfp-save))))
                        (:unknown

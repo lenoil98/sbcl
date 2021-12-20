@@ -135,11 +135,11 @@
       (info :variable :macro-expansion 'fruitbaskets)
     (assert (and (not foundp) (not data)))))
 
-;; packed info vector tests
+;; packed-info tests
 
 (test-util:with-test (:name :globaldb-info-iterate)
   (let ((s (with-output-to-string (*standard-output*) (show-info '*))))
-    (dolist (x '((:function :definition) (:function :type)
+    (dolist (x '((:function :type)
                  (:function :where-from) (:function :kind)
                  (:function :info) (:function :source-transform)
                  (:type :kind) (:type :builtin)
@@ -157,7 +157,6 @@
   (flet ((try (x)
            (assert (eq (find-fdefn x) (info :function :definition x)))))
     (do-all-symbols (s)
-      (try s)
       (try `(setf ,s))
       (try `(cas ,s)))))
 
@@ -189,10 +188,10 @@
 
 ;; The real GET-INFO-VALUE AVERs that INFO-NUMBER is legal. This one doesn't.
 (defun cheating-get-info-value (sym aux-key info-number)
-  (let* ((vector (symbol-info-vector sym))
+  (let* ((vector (symbol-dbinfo sym))
          (index (packed-info-value-index vector aux-key info-number)))
     (if index
-        (values (svref vector index) t)
+        (values (sb-kernel:%info-ref vector index) t)
         (values nil nil))))
 
 ;; Info vectors may be concurrently updated. If more than one thread writes

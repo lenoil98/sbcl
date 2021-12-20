@@ -164,14 +164,15 @@
 #+call-symbol
 (defoptimizer (%coerce-callable-for-call ltn-annotate) ((fun) node ltn-policy)
   (declare (ignore ltn-policy))
-  (let ((dest (node-dest node)))
+  (multiple-value-bind (dest dest-lvar)
+      (and (node-lvar node)
+           (principal-lvar-dest-and-lvar (node-lvar node)))
     (cond ((and (basic-combination-p dest)
                 (eq (basic-combination-kind dest) :full)
-                (eq (lvar-uses (basic-combination-fun dest)) node)
+                (eq (basic-combination-fun dest) dest-lvar)
                 ;; Everything else can't handle NIL, just don't
                 ;; bother optimizing it.
-                (not (and (constant-lvar-p fun)
-                          (null (lvar-value fun)))))
+                (not (lvar-value-is-nil fun)))
            (setf (basic-combination-fun dest) fun
                  (basic-combination-args node) '(nil)
                  (node-lvar node) nil
@@ -476,7 +477,9 @@
   (setf (node-tail-p node) nil)
   (let ((value (exit-value node)))
     (when value
-      (annotate-unknown-values-lvar value)))
+      (if (lvar-single-value-p (node-lvar node))
+          (annotate-fixed-values-lvar value (list *backend-t-primitive-type*))
+          (annotate-unknown-values-lvar value))))
   (values))
 
 (defun ltn-analyze-enclose (node)
@@ -914,7 +917,7 @@
       ;; transforms or VOPs or whatever.
       (unless template
         (ltn-default-call call)
-        (when (let ((funleaf (physenv-lambda (node-physenv call)))
+        (when (let ((funleaf (environment-lambda (node-environment call)))
                     (name (lvar-fun-name (combination-fun call))))
                 (and (leaf-has-source-name-p funleaf)
                      (eq name (leaf-source-name funleaf))

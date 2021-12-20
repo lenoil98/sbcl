@@ -102,7 +102,6 @@ Evaluate the FORMS as a PROGN. Within the lexical scope of the body,
 RETURN-FROM can be used to exit the form."
   (unless (symbolp name)
     (compiler-error "The block name ~S is not a symbol." name))
-  (start-block start)
   (ctran-starts-block next)
   (let* ((dummy (make-ctran))
          (entry (make-entry))
@@ -116,7 +115,6 @@ RETURN-FROM can be used to exit the form."
     (let* ((env-entry (list entry next result))
            (*lexenv* (make-lexenv :blocks (list (cons name env-entry))
                                   :cleanup cleanup)))
-      (push env-entry (ctran-entries next))
       (ir1-convert-progn-body dummy next result forms))))
 
 (def-ir1-translator return-from ((name &optional value) start next result)
@@ -201,7 +199,6 @@ TAGS, and NIL is returned. If a statement contains a GO to a defined TAG
 within the lexical scope of the form, then control is transferred to the next
 statement following that tag. A TAG must be an integer or a symbol. A
 STATEMENT must be a list. Other objects are illegal within the body."
-  (start-block start)
   (ctran-starts-block next)
   (let* ((dummy (make-ctran))
          (entry (make-entry))
@@ -870,27 +867,28 @@ also processed as top level forms."
       (multiple-value-call #'values
         (extract-fletish-vars definitions context) forms declarations))))
 
+;;; This is similar to IR1-CONVERT-PROGN-BODY except that code to
+;;; potentially make a closure for each FUN in FUNS is emitted, and
+;;; then the body is converted as usual.
+;;;
+;;; When one of these FUNS is declared dynamic extent, we make a
+;;; cleanup with the ENCLOSE as the MESS-UP node and introduce it into
+;;; the lexical environment to convert the body in. We force NEXT to
+;;; start a block outside of this cleanup, causing cleanup code to be
+;;; emitted when the scope is exited.
 (defun ir1-convert-fbindings (start next result funs body)
-  (let ((ctran (make-ctran))
-        (dx-p (find-if #'leaf-dynamic-extent funs)))
-    (when dx-p
-      (ctran-starts-block ctran)
-      (ctran-starts-block next))
-    (enclose start ctran funs)
-    (cond (dx-p
-           (let* ((dummy (make-ctran))
-                  (entry (make-entry))
-                  (cleanup (make-cleanup :kind :dynamic-extent
-                                         :mess-up entry
-                                         :info (list (ctran-next start)))))
-             (push entry (lambda-entries (lexenv-lambda *lexenv*)))
-             (setf (entry-cleanup entry) cleanup)
-             (link-node-to-previous-ctran entry ctran)
-             (use-ctran entry dummy)
-
+  (let ((enclose-ctran (make-ctran)))
+    (enclose start enclose-ctran funs)
+    (cond ((some #'leaf-dynamic-extent funs)
+           (ctran-starts-block next)
+           (let ((cleanup (make-cleanup :kind :dynamic-extent
+                                        :mess-up (ctran-use enclose-ctran)))
+                 (cleanup-ctran (make-ctran)))
              (let ((*lexenv* (make-lexenv :cleanup cleanup)))
-               (ir1-convert-progn-body dummy next result body))))
-          (t (ir1-convert-progn-body ctran next result body)))))
+               (ir1-convert enclose-ctran cleanup-ctran nil '(%cleanup-point))
+               (ir1-convert-progn-body cleanup-ctran next result body))))
+          (t
+           (ir1-convert-progn-body enclose-ctran next result body)))))
 
 (def-ir1-translator flet ((definitions &body body)
                           start next result)
@@ -1294,16 +1292,13 @@ the thrown values will be returned."
   ;; We represent the possibility of the control transfer by making an
   ;; "escape function" that does a lexical exit, and instantiate the
   ;; cleanup using %WITHIN-CLEANUP.
-  (let* ((tag-ctran (make-ctran))
-         (tag-lvar (make-lvar)))
-    (ir1-convert start tag-ctran tag-lvar tag)
-    (ir1-convert
-     tag-ctran next result
-     (with-unique-names (exit-block)
-       `(block ,exit-block
-          (%within-cleanup
-           :catch (%catch (%escape-fun ,exit-block) ,tag-lvar)
-           ,@body))))))
+  (ir1-convert
+   start next result
+   (with-unique-names (exit-block)
+     `(block ,exit-block
+        (%within-cleanup
+         :catch (%catch (%escape-fun ,exit-block) ,tag)
+         ,@body)))))
 
 ;;; Since NSP is restored on unwind we only need to protect against
 ;;; local transfers of control, basically the same as special
@@ -1473,6 +1468,15 @@ values from the first VALUES-FORM making up the first argument, etc."
         (use-continuation node next result)
         (setf (basic-combination-args node) (arg-lvars))))))
 
+;;; MULTIPLE-VALUE-PROG1 is represented in IR1 by having the
+;;; VALUES-FORM code use a VALUE lvar that gets handed off to
+;;; RESULT. In other words, as the result continuation isn't
+;;; IMMEDIATELY-USED-P by the nodes that compute the result, we have
+;;; to interpose a DELAY node using RESULT immediately so that the
+;;; result continuation can assume that it is immediately used. This
+;;; is important here because MULTIPLE-VALUE-PROG1 is the only special
+;;; form which receives unknown values with multiple uses, some (in
+;;; this case one) of which are not immediate.
 (def-ir1-translator multiple-value-prog1
     ((values-form &rest forms) start next result)
   "MULTIPLE-VALUE-PROG1 values-form form*
@@ -1482,17 +1486,13 @@ VALUES-FORM."
   (let* ((value-ctran (make-ctran))
          (forms-ctran (make-ctran))
          (value-lvar (make-lvar))
-         ;; This is to avoid writing in the RESULT LVAR before the
-         ;; body is executed, because the body may overwrite it.
-         ;; See MAY-DELETE-VESTIGIAL-EXIT.
-         (cast (make-vestigial-exit-cast
-                :value value-lvar)))
+         (delay (make-delay :value value-lvar)))
     (ctran-starts-block value-ctran)
     (ir1-convert start value-ctran value-lvar values-form)
     (ir1-convert-progn-body value-ctran forms-ctran nil forms)
-    (link-node-to-previous-ctran cast forms-ctran)
-    (setf (lvar-dest value-lvar) cast)
-    (use-continuation cast next result)))
+    (link-node-to-previous-ctran delay forms-ctran)
+    (setf (lvar-dest value-lvar) delay)
+    (use-continuation delay next result)))
 
 
 ;;;; interface to defining macros

@@ -502,7 +502,7 @@
       (inst cmpwi amount 0)
       (inst neg ndesc amount)
       (inst bge positive)
-      (inst cmpwi ndesc 31)
+      (inst cmplwi ndesc 31)
       (inst srw result number ndesc)
       (inst ble done)
       (move result zero-tn)
@@ -549,7 +549,7 @@
          (inst cmpwi amount 0)
          (inst neg ndesc amount)
          (inst bge positive)
-         (inst cmpwi ndesc 31)
+         (inst cmplwi ndesc 31)
          (inst sraw result number ndesc)
          (inst ble done)
          (inst srawi result number 31)
@@ -706,7 +706,7 @@
              fast-ash-left/unsigned=>unsigned))
 (deftransform ash-left-mod32 ((integer count)
                               ((unsigned-byte 32) (unsigned-byte 5)))
-  (when (sb-c::constant-lvar-p count)
+  (when (sb-c:constant-lvar-p count)
     (sb-c::give-up-ir1-transform))
   '(%primitive fast-ash-left-mod32/unsigned=>unsigned integer count))
 
@@ -948,7 +948,7 @@
 ;;;
 
 (define-vop (fast-eql/fixnum fast-conditional)
-  (:args (x :scs (any-reg descriptor-reg zero))
+  (:args (x :scs (any-reg zero))
          (y :scs (any-reg zero)))
   (:arg-types tagged-num tagged-num)
   (:note "inline fixnum comparison")
@@ -958,11 +958,13 @@
     (inst b? (if not-p :ne :eq) target)))
 ;;;
 (define-vop (generic-eql/fixnum fast-eql/fixnum)
+  (:args (x :scs (any-reg descriptor-reg))
+         (y :scs (any-reg)))
   (:arg-types * tagged-num)
   (:variant-cost 7))
 
 (define-vop (fast-eql-c/fixnum fast-conditional/fixnum)
-  (:args (x :scs (any-reg descriptor-reg zero)))
+  (:args (x :scs (any-reg zero)))
   (:arg-types tagged-num (:constant (signed-byte 14)))
   (:info target not-p y)
   (:translate eql)
@@ -971,6 +973,7 @@
     (inst b? (if not-p :ne :eq) target)))
 ;;;
 (define-vop (generic-eql-c/fixnum fast-eql-c/fixnum)
+  (:args (x :scs (any-reg descriptor-reg)))
   (:arg-types * (:constant (signed-byte 11)))
   (:variant-cost 6))
 
@@ -1010,7 +1013,7 @@
   (:results (value :scs (unsigned-reg)))
   (:result-types unsigned-num))
 
-(define-vop (bignum-set word-index-set-nr)
+(define-vop (bignum-set word-index-set)
   (:variant bignum-digits-offset other-pointer-lowtag)
   (:translate #+bignum-assertions sb-bignum:%%bignum-set
               #-bignum-assertions sb-bignum:%bignum-set)

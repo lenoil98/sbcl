@@ -31,10 +31,6 @@
   (:generator 1
     (storew value object offset lowtag)))
 
-(define-vop (init-slot set-slot)
-  (:info name dx-p offset lowtag)
-  (:ignore name dx-p))
-
 (define-vop (compare-and-swap-slot)
   (:args (object :scs (descriptor-reg))
          (old :scs (descriptor-reg any-reg))
@@ -188,16 +184,14 @@
 
 ;;; Like CHECKED-CELL-REF, only we are a predicate to see if the cell
 ;;; is bound.
-(define-vop (boundp-frob)
+(define-vop (boundp)
   (:args (object :scs (descriptor-reg)))
   (:conditional)
   (:info target not-p)
   (:policy :fast-safe)
-  (:temporary (:scs (descriptor-reg)) value))
-
-#+sb-thread
-(define-vop (boundp boundp-frob)
+  (:temporary (:scs (descriptor-reg)) value)
   (:translate boundp)
+  #+sb-thread
   (:generator 9
     (loadw value object symbol-tls-index-slot other-pointer-lowtag)
     (inst lwzx value thread-base-tn value)
@@ -206,11 +200,8 @@
     (loadw value object symbol-value-slot other-pointer-lowtag)
     CHECK-UNBOUND
     (inst cmpwi value unbound-marker-widetag)
-    (inst b? (if not-p :eq :ne) target)))
-
-#-sb-thread
-(define-vop (boundp boundp-frob)
-  (:translate boundp)
+    (inst b? (if not-p :eq :ne) target))
+  #-sb-thread
   (:generator 9
     (loadw value object symbol-value-slot other-pointer-lowtag)
     (inst cmpwi value unbound-marker-widetag)
@@ -277,16 +268,12 @@
 (define-vop (fdefn-makunbound)
   (:policy :fast-safe)
   (:translate fdefn-makunbound)
-  (:args (fdefn :scs (descriptor-reg) :target result))
+  (:args (fdefn :scs (descriptor-reg)))
   (:temporary (:scs (non-descriptor-reg)) temp)
-  (:results (result :scs (descriptor-reg)))
   (:generator 38
     (storew null-tn fdefn fdefn-fun-slot other-pointer-lowtag)
     (load-asm-rtn-addr temp 'undefined-tramp)
-    (storew temp fdefn fdefn-raw-addr-slot other-pointer-lowtag)
-    (move result fdefn)))
-
-
+    (storew temp fdefn fdefn-raw-addr-slot other-pointer-lowtag)))
 
 ;;;; Binding and Unbinding.
 
@@ -382,13 +369,13 @@
   (:variant closure-info-offset fun-pointer-lowtag)
   (:translate %closure-index-ref))
 
+(define-vop (%closure-index-set word-index-set)
+  (:variant closure-info-offset fun-pointer-lowtag)
+  (:translate %closure-index-set))
+
 (define-vop (funcallable-instance-info word-index-ref)
   (:variant funcallable-instance-info-offset fun-pointer-lowtag)
   (:translate %funcallable-instance-info))
-
-(define-vop (set-funcallable-instance-info word-index-set-nr)
-  (:variant funcallable-instance-info-offset fun-pointer-lowtag)
-  (:translate %set-funcallable-instance-info))
 
 (define-vop (closure-ref)
   (:args (object :scs (descriptor-reg)))
@@ -438,7 +425,7 @@
   (:variant instance-slots-offset instance-pointer-lowtag)
   (:arg-types instance positive-fixnum))
 
-(define-vop (instance-index-set word-index-set-nr)
+(define-vop (instance-index-set word-index-set)
   (:policy :fast-safe)
   (:translate %instance-set)
   (:variant instance-slots-offset instance-pointer-lowtag)
@@ -467,12 +454,44 @@
   (:policy :fast-safe)
   (:variant 0 other-pointer-lowtag))
 
-(define-vop (code-header-set word-index-set-nr)
+(define-vop (code-header-set)
   (:translate code-header-set)
   (:policy :fast-safe)
-  (:variant 0 other-pointer-lowtag))
-
-
+  (:args (object :scs (descriptor-reg))
+         (index :scs (any-reg))
+         (value :scs (any-reg descriptor-reg)))
+  (:arg-types * tagged-num *)
+  (:temporary (:scs (non-descriptor-reg)) temp #+gencgc card)
+  #+gencgc (:temporary (:sc non-descriptor-reg :offset nl3-offset) pa-flag)
+  (:generator 10
+    #+cheneygc
+    (progn (inst addi temp index (- other-pointer-lowtag))
+           (inst stwx value object temp))
+    #+gencgc
+    (progn
+    ;; Load the card mask
+    (inst lr temp (make-fixup "gc_card_table_mask" :foreign-dataref)) ; address of linkage entry
+    (loadw temp temp)      ; address of gc_card_table_mask
+    (inst lwz temp temp 0) ; value of gc_card_table_mask
+    (pseudo-atomic (pa-flag)
+      ;; Compute card mark index
+      ;; Maybe these 2 steps should be one RLWINM, but I'm not that clever.
+      (inst srawi card object gencgc-card-shift)
+      (inst and card card temp)
+      ;; Load mark table base
+      (inst lr temp (make-fixup "gc_card_mark" :foreign-dataref)) ; address of linkage entry
+      (loadw temp temp) ; address of gc_card_mark
+      (loadw temp temp) ; value of gc_card_mark
+      ;; Touch the card mark byte.
+      (inst stbx zero-tn temp card)
+      ;; set 'written' flag in the code header
+      ;; If two threads get here at the same time, they'll write the same byte.
+      (let ((byte #+big-endian (- other-pointer-lowtag) #+little-endian (bug "Wat")))
+        (inst lbz temp object byte)
+        (inst ori temp temp #x40)
+        (inst stb temp object byte))
+      (inst addi temp index (- other-pointer-lowtag))
+      (inst stwx value object temp)))))
 
 ;;;; raw instance slot accessors
 
@@ -489,7 +508,7 @@
                   (:arg-types instance positive-fixnum)
                   (:results (value :scs (,sc)))
                   (:result-types ,primtype))
-                (define-vop (,(symbolicate "%RAW-INSTANCE-SET/" suffix) word-index-set-nr)
+                (define-vop (,(symbolicate "%RAW-INSTANCE-SET/" suffix) word-index-set)
                   (:policy :fast-safe)
                   (:translate ,(symbolicate "%RAW-INSTANCE-SET/" suffix))
                   (:variant instance-slots-offset instance-pointer-lowtag)

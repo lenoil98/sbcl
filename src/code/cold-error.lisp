@@ -11,7 +11,7 @@
 
 (in-package "SB-KERNEL")
 
-(defparameter *break-on-signals* nil ; initialized by genesis
+(defvar *break-on-signals* nil
   "When (TYPEP condition *BREAK-ON-SIGNALS*) is true, then calls to SIGNAL will
    enter the debugger prior to signalling that condition.")
 
@@ -115,7 +115,7 @@
 
 ;;; counts of nested errors (with internal errors double-counted)
 (defvar *maximum-error-depth*) ; this gets set to 10 in !COLD-INIT
-(defparameter *current-error-depth* 0) ; initialized by genesis
+(defvar *current-error-depth* 0)
 
 ;;; INFINITE-ERROR-PROTECT is used by ERROR and friends to keep us out
 ;;; of hyperspace.
@@ -209,9 +209,10 @@ of condition handling occurring."
     (apply #'%break 'break datum arguments)))
 
 ;;; These functions definitions are for cold-init.
-;;; The real definitions are found in 'condition.lisp'
+;;; The real definitions are found in 'warm-error.lisp'
 (defvar *!cold-warn-action* #+sb-devel 'print #-sb-devel nil)
 (defun warn (datum &rest arguments)
+  (declare (explicit-check datum)) ;; CONDITION-CLASS not yet defined
   (when (and (stringp datum) (plusp (mismatch "defining setf macro" datum)))
     (return-from warn nil))
   (let ((action (cond ((boundp '*!cold-warn-action*) *!cold-warn-action*)
@@ -242,7 +243,9 @@ of condition handling occurring."
                  (write-string " | ")
                  (write arg)
                  (terpri))))))
-    (when (eq action 'lose) (sb-sys:%primitive sb-c:halt))))
+    (when (eq action 'lose)
+      (sb-sys:%primitive sb-c:halt)
+      (sb-impl::critically-unreachable "losing-warn"))))
 (defun style-warn (datum &rest arguments)
   (declare (notinline warn))
   (apply 'warn datum arguments))

@@ -1,10 +1,10 @@
 (in-package "SB-IMPL")
 
-(defcas car (cons) %compare-and-swap-car)
-(defcas cdr (cons) %compare-and-swap-cdr)
-(defcas first (cons) %compare-and-swap-car)
-(defcas rest (cons) %compare-and-swap-cdr)
-(defcas symbol-plist (symbol) %compare-and-swap-symbol-plist)
+(declaim (inline (cas car) (cas cdr) (cas first) (cas rest)))
+(defun (cas car) (old new cons) (%compare-and-swap-car cons old new))
+(defun (cas cdr) (old new cons) (%compare-and-swap-cdr cons old new))
+(defun (cas first) (old new cons) (%compare-and-swap-car cons old new))
+(defun (cas rest) (old new cons) (%compare-and-swap-cdr cons old new))
 
 ;;; Out-of-line definitions for various primitive cas functions.
 (macrolet ((def (name lambda-list ref &optional set)
@@ -39,7 +39,6 @@
   (def %raw-instance-cas/signed-word (instance index)
        %raw-instance-ref/signed-word
        %raw-instance-set/signed-word)
-  (def %compare-and-swap-symbol-info (symbol) symbol-info)
   (def %compare-and-swap-symbol-value (symbol) symbol-value)
   (def %compare-and-swap-svref (vector index) svref))
 

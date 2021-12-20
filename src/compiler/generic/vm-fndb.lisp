@@ -123,7 +123,15 @@
 (defknown %set-symbol-hash (symbol hash-code)
   t ())
 
-(defknown symbol-info-vector (symbol) (or null simple-vector))
+;;; SYMBOL-PACKAGE-ID demands a vop so as to avoid placing a raw bit value
+;;; in a descriptor register on precise GC. (The SLOT vop returns a descriptor)
+(defknown sb-impl::symbol-package-id (symbol) (unsigned-byte 16))
+;;; TODO: I'd like to eliminate the (OR NULL) from this return type.
+;;; For that to happen, I probably need +nil-packed-infos+ to become
+;;; placed in static space because assembly routines may need it.
+;;; On the other hand, they may not, because there is no special case
+;;; code needed when reading from it, which is entire point.
+(defknown symbol-dbinfo (symbol) (or null packed-info))
 
 (defknown initialize-vector ((simple-array * (*)) &rest t)
   (simple-array * (*))
@@ -168,7 +176,7 @@
 ;;; ASSIGN-VECTOR-FLAGSS assign all and only the flags byte.
 ;;; RESET- performs LOGANDC2 and returns no value.
 (defknown (assign-vector-flags reset-header-bits)
-  (t (unsigned-byte 8)) (values)
+  (t (unsigned-byte 16)) (values)
   (#+x86-64 always-translatable))
 (defknown (test-header-bit)
   (t (unsigned-byte #.(- sb-vm:n-word-bits sb-vm:n-widetag-bits))) (boolean)
@@ -181,10 +189,12 @@
 (defknown %array-rank (array) array-rank
   (flushable))
 
-#+(or x86 x86-64)
+#+(or x86 x86-64 arm64)
 (defknown (%array-rank= widetag=) (t t) boolean
   (flushable))
 
+(defknown simple-array-header-of-rank-p (t array-rank) boolean
+  (flushable))
 (defknown sb-kernel::check-array-shape (simple-array list)
   (simple-array)
   (flushable)
@@ -208,7 +218,6 @@
   (foldable flushable))
 (defknown %set-instance-layout (instance sb-vm:layout) (values) ())
 ;;; %SET-FUN-LAYOUT should only called on FUNCALLABLE-INSTANCE
-;;; (but %set-funcallable-instance-layout is too long a name)
 (defknown %set-fun-layout (funcallable-instance sb-vm:layout) (values) ())
 ;;; Layout getter that accepts any object, and if it has INSTANCE- or FUN-
 ;;; POINTER-LOWTAG returns the layout, otherwise some agreed-upon layout.
@@ -256,15 +265,13 @@
 ;;; These two are mostly used for bit-bashing operations.
 (defknown %vector-raw-bits (t index) sb-vm:word
   (flushable))
-(defknown (%set-vector-raw-bits) (t index sb-vm:word) sb-vm:word
-  ())
+(defknown (%set-vector-raw-bits) (t index sb-vm:word) (values) ())
 
 
 ;;; Allocate an unboxed, non-fancy vector with type code TYPE, length LENGTH,
 ;;; and WORDS words long. Note: it is your responsibility to ensure that the
 ;;; relation between LENGTH and WORDS is correct.
-;;; The extra bit beyond N_WIDETAG_BITS is for the vector weakness flag.
-;;; Note that in almost all situations the first argument is a constant.
+;;; Note that in almost all situations the first argument (TYPE) is a constant.
 ;;; There are only 3 places that it can be non-constant, and not at all
 ;;; after self-build is complete. The three non-constant places are from:
 ;;;  - ALLOCATE-VECTOR-WITH-WIDETAG in src/code/array
@@ -274,7 +281,7 @@
 ;;; vector type will usuallly end up calling allocate-vector-with-widetag
 ;;; via %MAKE-ARRAY.
 (defknown allocate-vector (#+ubsan boolean
-                           (unsigned-byte 9) index
+                           word index
                            ;; The number of words is later converted
                            ;; to bytes, make sure it fits.
                            (and index
@@ -584,7 +591,7 @@
 (defknown fdefn-name (fdefn) t (foldable flushable))
 (defknown fdefn-fun (fdefn) (or function null) (flushable))
 (defknown (setf fdefn-fun) (function fdefn) t ())
-(defknown fdefn-makunbound (fdefn) t ())
+(defknown fdefn-makunbound (fdefn) (values) ())
 ;;; FDEFN -> FUNCTION, trapping if not FBOUNDP
 (defknown safe-fdefn-fun (fdefn) function ())
 
@@ -595,6 +602,7 @@
 
 (defknown %closure-index-ref (function index) t
   (flushable))
+(defknown %closure-index-set (function index t) (values) ())
 
 ;; T argument is for the 'fun' slot.
 (defknown sb-vm::%alloc-closure (index t) function (flushable))
@@ -605,7 +613,8 @@
   ())
 
 (defknown %funcallable-instance-info (function index) t (flushable))
-(defknown %set-funcallable-instance-info (function index t) t ())
+(defknown (setf %funcallable-instance-info) (t function index) t ())
+(defknown %set-funcallable-instance-info (function index t) (values) ())
 
 #+sb-fasteval
 (defknown sb-interpreter:fun-proto-fn (interpreted-function)
@@ -622,6 +631,9 @@
 
 (defknown %single-float (real) single-float (movable foldable))
 (defknown %double-float (real) double-float (movable foldable))
+
+(defknown bignum-to-float (bignum symbol) float (movable foldable))
+(defknown sb-kernel::float-ratio (ratio symbol) float (movable foldable))
 
 (defknown make-single-float ((signed-byte 32)) single-float
   (movable flushable))

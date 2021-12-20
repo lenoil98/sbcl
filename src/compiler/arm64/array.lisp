@@ -37,7 +37,7 @@
       ;; See ENCODE-ARRAY-RANK.
       (inst sub ndescr rank (fixnumize 1))
       (inst and ndescr ndescr (fixnumize array-rank-mask))
-      (inst orr ndescr type (lsl ndescr array-rank-byte-pos))
+      (inst orr ndescr type (lsl ndescr array-rank-position))
       (inst lsr ndescr ndescr n-fixnum-tag-bits)
       ;; And store the header value.
       (storew ndescr header 0 other-pointer-lowtag))
@@ -59,10 +59,44 @@
   (:results (res :scs (unsigned-reg)))
   (:result-types positive-fixnum)
   (:generator 6
-    (inst ldrb res (@ x #+little-endian (- 2 other-pointer-lowtag)
-                        #+big-endian    (- 5 other-pointer-lowtag)))
-    (inst add res res 1)
-    (inst and res res array-rank-mask)))
+    (inst ldrsb res (@ x (- (/ array-rank-position n-word-bytes)
+                          other-pointer-lowtag)))
+    (inst add res res 1)))
+
+(define-vop ()
+  (:translate %array-rank=)
+  (:policy :fast-safe)
+  (:args (array :scs (descriptor-reg)))
+  (:temporary (:scs (unsigned-reg)) x)
+  (:info rank)
+  (:arg-types * (:constant t))
+  (:conditional :eq)
+  (:generator 2
+    (inst ldrb x (@ array (- (/ array-rank-position n-word-bytes)
+                            other-pointer-lowtag)))
+    (inst cmp x (add-sub-immediate (encode-array-rank rank)))))
+
+(define-vop (simple-array-header-of-rank-p type-predicate)
+  (:translate sb-c::simple-array-header-of-rank-p)
+  (:policy :fast-safe)
+  (:info target not-p rank)
+  (:arg-types * (:constant t))
+  (:generator 2
+    (unless (other-pointer-tn-ref-p args)
+      (%test-lowtag value temp (if not-p
+                                   target
+                                   drop-through)
+                    t other-pointer-lowtag))
+    (inst ldrh temp (@ value (- other-pointer-lowtag)))
+    (inst cmp temp (add-sub-immediate
+                     (dpb (encode-array-rank rank)
+                       (byte 8 array-rank-position)
+                       simple-array-widetag)))
+    (inst b (if not-p
+                :ne
+                :eq)
+      target)
+    drop-through))
 
 ;;;; Bounds checking routine.
 (define-vop (check-bound)
@@ -228,12 +262,12 @@
          (:translate data-vector-ref)
          (:policy :fast-safe)
          (:args (object :scs (descriptor-reg))
-                (index :scs (unsigned-reg)))
+                (index :scs (unsigned-reg) :to :save))
          (:arg-types ,type positive-fixnum)
-         (:results (value :scs (any-reg)))
+         (:results (result :scs (unsigned-reg)))
          (:result-types positive-fixnum)
          (:temporary (:scs (interior-reg)) lip)
-         (:temporary (:scs (non-descriptor-reg) :to (:result 0)) temp result)
+         (:temporary (:scs (non-descriptor-reg)) temp)
          (:generator 20
            ;; Compute the offset for the word we're interested in.
            (inst lsr temp index ,bit-shift)
@@ -253,9 +287,7 @@
            ;; Shift the field we need to the low bits of RESULT.
            (inst lsr result result temp)
            ;; Mask out the field we're interested in.
-           (inst and result result ,(1- (ash 1 bits)))
-           ;; And fixnum-tag the result.
-           (inst lsl value result n-fixnum-tag-bits)))
+           (inst and result result ,(1- (ash 1 bits)))))
        (define-vop (,(symbolicate "DATA-VECTOR-REF/" type "-C"))
          (:note "inline array access")
          (:translate data-vector-ref)
@@ -263,9 +295,8 @@
          (:args (object :scs (descriptor-reg)))
          (:info index)
          (:arg-types ,type (:constant index))
-         (:results (value :scs (any-reg)))
+         (:results (result :scs (unsigned-reg)))
          (:result-types positive-fixnum)
-         (:temporary (:scs (non-descriptor-reg) :to (:result 0)) result)
          (:generator 15
            (multiple-value-bind (index bit) (floor index ,elements-per-word)
              (inst ldr result (@ object
@@ -273,8 +304,7 @@
                                   (+ (* index n-word-bytes)
                                      (- (* vector-data-offset n-word-bytes)
                                         other-pointer-lowtag)))))
-             (inst ubfm result result (* bit ,bits) (+ (* bit ,bits) (1- ,bits)))
-             (inst lsl value result n-fixnum-tag-bits))))
+             (inst ubfm result result (* bit ,bits) (+ (* bit ,bits) (1- ,bits))))))
        (define-vop (,(symbolicate "DATA-VECTOR-SET/" type "-C"))
          (:note "inline array store")
          (:translate data-vector-set)
@@ -320,46 +350,74 @@
          ,@(unless (= bits 1)
              '((:temporary (:scs (non-descriptor-reg) :from (:argument 1)) shift)))
          (:generator 25
-                     (let ((shift ,(if (= bits 1)
-                                       'index
-                                       'shift)))
-                       ;; Compute the offset for the word we're interested in.
-                       (inst lsr temp index ,bit-shift)
-                       ;; Load the word in question.
-                       (inst add lip object (lsl temp word-shift))
-                       (inst ldr old (@ lip
-                                        (- (* vector-data-offset n-word-bytes)
-                                           other-pointer-lowtag)))
-                       ;; Compute the position of the bitfield we need.
-                       ,@(unless (= bits 1)
-                           `((inst and shift index ,(1- elements-per-word))))
-                       ,@(when (eq *backend-byte-order* :big-endian)
-                           `((inst eor shift ,(1- elements-per-word))))
-                       ,@(unless (= bits 1)
-                           `((inst lsl shift shift ,(1- (integer-length bits)))))
-                       ;; Clear the target bitfield.
-                       (unless (and (sc-is value immediate)
-                                    (= (tn-value value) ,(1- (ash 1 bits))))
-                         (inst mov temp ,(1- (ash 1 bits)))
-                         (inst lsl temp temp shift)
-                         (inst bic old old temp))
-                       (unless (and (sc-is value immediate)
-                                    (= (tn-value value) 0))
-                         ;; LOGIOR in the new value (shifted appropriatly).
-                         (sc-case value
-                           (immediate
-                            (inst mov temp (logand (tn-value value) ,(1- (ash 1 bits))))
-                            (inst lsl temp temp shift))
-                           (unsigned-reg
-                            (inst lsl temp value shift)))
-                         (inst orr old old temp))
-                       ;; Write the altered word back to the array.
-                       (inst str old (@ lip
-                                        (- (* vector-data-offset n-word-bytes)
-                                           other-pointer-lowtag))))))))))
+           (let ((shift ,(if (= bits 1)
+                             'index
+                             'shift)))
+             ;; Compute the offset for the word we're interested in.
+             (inst lsr temp index ,bit-shift)
+             ;; Load the word in question.
+             (inst add lip object (lsl temp word-shift))
+             (inst ldr old (@ lip
+                              (- (* vector-data-offset n-word-bytes)
+                                 other-pointer-lowtag)))
+             ;; Compute the position of the bitfield we need.
+             ,@(unless (= bits 1)
+                 `((inst and shift index ,(1- elements-per-word))))
+             ,@(when (eq *backend-byte-order* :big-endian)
+                 `((inst eor shift ,(1- elements-per-word))))
+             ,@(unless (= bits 1)
+                 `((inst lsl shift shift ,(1- (integer-length bits)))))
+             ;; Clear the target bitfield.
+             (unless (and (sc-is value immediate)
+                          (= (tn-value value) ,(1- (ash 1 bits))))
+               (inst mov temp ,(1- (ash 1 bits)))
+               (inst lsl temp temp shift)
+               (inst bic old old temp))
+             (unless (and (sc-is value immediate)
+                          (= (tn-value value) 0))
+               ;; LOGIOR in the new value (shifted appropriatly).
+               (sc-case value
+                 (immediate
+                  (inst mov temp (logand (tn-value value) ,(1- (ash 1 bits))))
+                  (inst lsl temp temp shift))
+                 (unsigned-reg
+                  (inst lsl temp value shift)))
+               (inst orr old old temp))
+             ;; Write the altered word back to the array.
+             (inst str old (@ lip
+                              (- (* vector-data-offset n-word-bytes)
+                                 other-pointer-lowtag))))))))))
   (def-small-data-vector-frobs simple-bit-vector 1)
   (def-small-data-vector-frobs simple-array-unsigned-byte-2 2)
   (def-small-data-vector-frobs simple-array-unsigned-byte-4 4))
+
+(define-vop (data-vector-ref/simple-bit-vector-eq)
+  (:policy :fast-safe)
+  (:args (object :scs (descriptor-reg)) (index :scs (unsigned-reg)))
+  (:arg-types simple-bit-vector positive-fixnum)
+  (:conditional :eq)
+  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:scs (non-descriptor-reg)) temp x)
+  (:generator 20
+    (inst lsr temp index 6)
+    (inst add lip object (lsl temp word-shift))
+    (inst ldr x (@ lip (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)))
+    (inst lsr x x index)
+    (inst tst x 1)))
+
+(define-vop (data-vector-ref/simple-bit-vector-c-eq)
+  (:policy :fast-safe)
+  (:args (object :scs (descriptor-reg)))
+  (:info index)
+  (:arg-types simple-bit-vector (:constant index))
+  (:conditional :eq)
+  (:temporary (:scs (non-descriptor-reg)) x)
+  (:generator 15
+    (multiple-value-bind (index bit)
+        (floor index 64)
+      (inst ldr x (@ object (load-store-offset (+ (* index n-word-bytes)
+                                                  (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)))))
+      (inst tst x (ash 1 bit)))))
 
 ;;; And the float variants.
 (define-vop (data-vector-ref/simple-array-single-float)

@@ -25,8 +25,6 @@
 #include "genesis/fdefn.h"
 #include "genesis/static-symbols.h"
 #include "genesis/thread.h"
-#include "genesis/ratio.h"
-#include "genesis/complex.h"
 
 /* Minimize conditionalization for different OS naming schemes. */
 #if defined __linux__  || defined LISP_FEATURE_HAIKU || defined LISP_FEATURE_FREEBSD || \
@@ -49,16 +47,9 @@
 /* Get the right type of alignment. Linux, FreeBSD and OpenBSD
  * want alignment in bytes. */
 #if defined(__linux__) || defined(LISP_FEATURE_FREEBSD) || defined(__OpenBSD__) || defined __NetBSD__ || defined(__sun) || defined _WIN64 || defined(__DragonFly__)
-#define align_4byte	4
-#define align_8byte	8
 #define align_16byte	16
-#define align_32byte	32
-#define align_page	32768
 #else
-#define	align_4byte	2
-#define	align_8byte	3
 #define	align_16byte	4
-#define	align_page	15
 #endif
 
 /*
@@ -82,6 +73,7 @@
 #define TRAP int3
 #endif
 
+#define CARD_TABLE_REG %r12
 #define THREAD_BASE_REG %r13
 
 #ifdef LISP_FEATURE_WIN32
@@ -179,7 +171,7 @@ Lstack:
 	push	%rdi	# args from C
 	push	%rsi	#
 	push	%rdx	#
-#ifdef LISP_FEATURE_SB_THREAD
+#if defined LISP_FEATURE_SB_THREAD && !defined LISP_FEATURE_GS_SEGMENT_THREAD
 #ifdef LISP_FEATURE_GCC_TLS
 	movq	GNAME(current_thread)@GOTTPOFF(%rip), THREAD_BASE_REG
 	movq	%fs:(THREAD_BASE_REG), THREAD_BASE_REG
@@ -224,6 +216,7 @@ Lzero:
 	# DW_OP_breg6 (rbp): 0 / DW_OP_deref / DW_OP_lit16 / DW_OP_plus
 	.cfi_escape 0x0f, 5, 0x76, 0, 6, 0x40, 0x22
 Lcall:
+	LOAD_PIC_VAR(gc_card_mark, CARD_TABLE_REG)
 	call	*CLOSURE_FUN_OFFSET(%rax)
 
 	/* If the function returned multiple values, the carry flag will be set.
@@ -290,6 +283,7 @@ GNAME(funcall_alien_callback):
 #else
         mov     (ENTER_ALIEN_CALLBACK_FDEFN+FDEFN_FUN_OFFSET),%rax
 #endif
+	LOAD_PIC_VAR(gc_card_mark, CARD_TABLE_REG)
 	call	*CLOSURE_FUN_OFFSET(%rax)
 
 /* Restore C regs */

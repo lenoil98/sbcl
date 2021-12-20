@@ -83,7 +83,7 @@ static boolean vector_isevery(boolean (*pred)(lispobj), struct vector* v)
  * updating the need-to-rehash indicator, we might create keys that compare
  * the same under the table's comparator.  It seems like doing that could
  * cause various kinds of weirdness in some applications. Nobody has reported
- * misbehavior in the 10 months or so that coalescing has been the default,
+ * misbehavior in the 3 years or so that coalescing has been the default,
  * so it doesn't seem horribly bad, but does seem a bit broken */
 static void coalesce_obj(lispobj* where, struct hopscotch_table* ht)
 {
@@ -96,8 +96,8 @@ static void coalesce_obj(lispobj* where, struct hopscotch_table* ht)
     // If 1, then we share vectors tagged as +VECTOR-SHAREABLE+,
     // but if >1, those and also +VECTOR-SHAREABLE-NONSTD+.
     int mask = gc_coalesce_string_literals > 1
-      ? (VECTOR_SHAREABLE|VECTOR_SHAREABLE_NONSTD)<<N_WIDETAG_BITS
-      : (VECTOR_SHAREABLE                        )<<N_WIDETAG_BITS;
+      ? (VECTOR_SHAREABLE|VECTOR_SHAREABLE_NONSTD)<<ARRAY_FLAGS_POSITION
+      : (VECTOR_SHAREABLE                        )<<ARRAY_FLAGS_POSITION;
 
     lispobj* obj = native_pointer(ptr);
     lispobj header = *obj;
@@ -131,7 +131,7 @@ static void coalesce_obj(lispobj* where, struct hopscotch_table* ht)
 
 /* FIXME: there are 10+ variants of the skeleton of an object traverser.
  * Pick one and try to make it customizable. I tried a callback-based approach,
- * but it's too slow. Next best thing is a ".inc" file which defines the shape
+ * but it's way too slow. Next best thing is a ".inc" file which defines the shape
  * of the function, with pieces inserted by #define.
  *
  * (1) gc-common's table-based mechanism
@@ -148,6 +148,7 @@ static void coalesce_obj(lispobj* where, struct hopscotch_table* ht)
  * (10) do-referenced-object which thank goodness is common to 2 uses
  * and if you want to count 'print.c' as another, there's that.
  * There's also cheneygc's print_garbage() which uses the dispatch tables.
+ * And now there's update_writeprotection() which is also ad-hoc.
  */
 
 static uword_t coalesce_range(lispobj* where, lispobj* limit, uword_t arg)
@@ -170,6 +171,16 @@ static uword_t coalesce_range(lispobj* where, lispobj* limit, uword_t arg)
                 for (i=0; i<(nwords-1); ++i)
                     if (bitmap_logbitp(i, bitmap)) coalesce_obj(where+1+i, ht);
                 continue;
+#ifdef LISP_FEATURE_COMPACT_SYMBOL
+            case SYMBOL_WIDETAG:
+            {
+                struct symbol* symbol = (void*)where;
+                lispobj name = decode_symbol_name(symbol->name);
+                coalesce_obj(&name, ht);
+                set_symbol_name(symbol, name);
+                continue;
+            }
+#endif
             case CODE_HEADER_WIDETAG:
                 nwords = code_header_words((struct code*)where);
                 break;
@@ -197,16 +208,13 @@ void coalesce_similar_objects()
     uword_t arg = (uword_t)&ht;
 
     hopscotch_create(&ht, HOPSCOTCH_VECTOR_HASH, 0, 1<<17, 0);
-#ifndef LISP_FEATURE_WIN32
-    // Apparently this triggers the "Unable to recommit" lossage message
-    // in handle_access_violation() in src/runtime/win32-os.c
     coalesce_range((lispobj*)READ_ONLY_SPACE_START,
                    (lispobj*)READ_ONLY_SPACE_END,
                    arg);
-    coalesce_range((lispobj*)STATIC_SPACE_OBJECTS_START,
-                   (lispobj*)STATIC_SPACE_END,
-                   arg);
-#endif
+    lispobj* the_symbol_nil = (lispobj*)(NIL - LIST_POINTER_LOWTAG - N_WORD_BYTES);
+    coalesce_range(the_symbol_nil, ALIGN_UP(SYMBOL_SIZE,2) + the_symbol_nil, arg);
+    coalesce_range((lispobj*)(T - OTHER_POINTER_LOWTAG), static_space_free_pointer, arg);
+
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
     coalesce_range((lispobj*)FIXEDOBJ_SPACE_START, fixedobj_free_pointer, arg);
     coalesce_range((lispobj*)VARYOBJ_SPACE_START, varyobj_free_pointer, arg);

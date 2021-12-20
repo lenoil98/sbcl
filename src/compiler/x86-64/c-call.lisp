@@ -133,8 +133,8 @@
 
 
 (deftransform %alien-funcall ((function type &rest args) * * :node node)
-  (aver (sb-c::constant-lvar-p type))
-  (let* ((type (sb-c::lvar-value type))
+  (aver (sb-c:constant-lvar-p type))
+  (let* ((type (sb-c:lvar-value type))
          (env (sb-c::node-lexenv node))
          (arg-types (alien-fun-type-arg-types type))
          (result-type (alien-fun-type-result-type type)))
@@ -202,8 +202,8 @@
 
 (defoptimizer (sign-extend derive-type) ((x size))
   (declare (ignore x))
-  (when (sb-c::constant-lvar-p size)
-    (specifier-type `(signed-byte ,(sb-c::lvar-value size)))))
+  (when (sb-c:constant-lvar-p size)
+    (specifier-type `(signed-byte ,(sb-c:lvar-value size)))))
 
 (define-vop (sign-extend)
   (:translate sign-extend)
@@ -357,7 +357,7 @@
   ;; Store SP in thread struct, unless the enclosing block says not to
   #+sb-safepoint
   (when (policy (sb-c::vop-node vop) (/= sb-c:insert-safepoints 0))
-    (storew rsp-tn thread-base-tn thread-saved-csp-offset))
+    (inst mov (thread-slot-ea thread-saved-csp-offset) rsp-tn))
 
   #+win32 (inst sub rsp-tn #x20)       ;MS_ABI: shadow zone
 
@@ -391,8 +391,7 @@
   ;; Zero the saved CSP, unless this code shouldn't ever stop for GC
   #+sb-safepoint
   (when (policy (sb-c::vop-node vop) (/= sb-c:insert-safepoints 0))
-    (inst xor (object-slot-ea thread-base-tn thread-saved-csp-offset 0)
-          rsp-tn)))
+    (inst xor (thread-slot-ea thread-saved-csp-offset) rsp-tn)))
 
 (define-vop (alloc-number-stack-space)
   (:info amount)
@@ -488,7 +487,7 @@
                      ;; stack location to a temporary register.
                      (unless gpr
                        (incf stack-argument-count)
-                       (setf gpr temp-reg-tn)
+                       (setf gpr rax)
                        (inst mov gpr stack-arg-tn))
                      ;; Copy from either argument register or temporary
                      ;; register to target.
@@ -505,8 +504,8 @@
                             ;; temporary (general purpose) register, and
                             ;; from there to the target location.
                             (incf stack-argument-count)
-                            (inst mov temp-reg-tn stack-arg-tn)
-                            (inst mov target-tn temp-reg-tn)))))
+                            (inst mov rax stack-arg-tn)
+                            (inst mov target-tn rax)))))
                   (t
                    (bug "Unknown alien floating point type: ~S" type)))))
 

@@ -24,8 +24,15 @@
 #ifndef __ASSEMBLER__
 
 #ifdef LISP_FEATURE_SB_THREAD
+
+#ifdef LISP_FEATURE_ARM64
+#define foreign_function_call_active_p(thread) \
+    (thread->control_stack_pointer)
+#else
 #define foreign_function_call_active_p(thread) \
     (thread->foreign_function_call_active)
+#endif
+
 #else
 extern int foreign_function_call_active;
 #define foreign_function_call_active_p(thread) \
@@ -47,6 +54,7 @@ extern uword_t immobile_range_1_max_offset, immobile_range_2_min_offset;
 extern unsigned int varyobj_space_size;
 #endif
 extern uword_t asm_routines_start, asm_routines_end;
+extern int gc_card_table_nbits;
 
 static inline lispobj points_to_asm_code_p(uword_t ptr) {
     return asm_routines_start <= ptr && ptr < asm_routines_end;
@@ -113,6 +121,8 @@ extern lispobj *current_dynamic_space;
 #else
 #error "Which GC?"
 #endif
+
+extern lispobj lisp_package_vector;
 
 extern void globals_init(void);
 

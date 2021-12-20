@@ -16,30 +16,13 @@
 ;;; ANSI: "the floating-point format that is to be used when reading a
 ;;; floating-point number that has no exponent marker or that has e or
 ;;; E for an exponent marker"
-(defparameter *read-default-float-format* 'single-float)
+(defvar *read-default-float-format* 'single-float)
 
 (defvar *readtable*)
 
-(defun gethash-return-default (key self default)
-  (declare (optimize (safety 0))
-           (ignore key self))
-  default)
 (defun !readtable-cold-init ()
-  (macrolet ((alloc-fake-hash-table ()
-               (let ((dd (find-defstruct-description 'hash-table)))
-                 (sb-kernel::instance-constructor-form
-                  dd
-                  (mapcar (lambda (dsd)
-                            (case (dsd-name dsd)
-                              (gethash-impl '#'gethash-return-default)
-                              (pairs (make-array (+ kv-pairs-overhead-slots 2)
-                                                 :initial-element 0))
-                              (rehash-size 1)
-                              (rehash-threshold $1.0)
-                              (t (dsd-default dsd))))
-                          (dd-slots dd))))))
-    (setq *empty-extended-char-table* (alloc-fake-hash-table)
-          *readtable* (make-readtable))))
+  (setq *empty-extended-char-table* (make-hash-table :rehash-size 1 :test #'eq)
+        *readtable* (make-readtable)))
 
 (setf (documentation '*readtable* 'variable)
       "Variable bound to current readtable.")
@@ -109,8 +92,6 @@
                        (extended-char-table readtable) table))
                (setf (gethash char table) (cons attributes function)))
               ((neq table *empty-extended-char-table*)
-               ;; can't REMHASH from *empty-extended-char-table*
-               ;; since it's not a real hash-table.
                (remhash char table)))))
   nil)
 
@@ -258,15 +239,14 @@
     (cerror "Frob it anyway!" 'standard-readtable-modified-error
             :operation operation)))
 
+(declaim (inline readtable-case))
 (defun readtable-case (readtable)
-  (aref #(:upcase :downcase :preserve :invert) (%readtable-case readtable)))
+  (%readtable-case readtable))
 
 (defun (setf readtable-case) (case readtable)
   ;; This function does not accept a readtable designator, only a readtable.
   (assert-not-standard-readtable readtable '(setf readtable-case))
-  (setf (%readtable-case readtable)
-        (ecase case (:upcase 0) (:downcase 1) (:preserve 2) (:invert 3)))
-  case)
+  (setf (%readtable-case readtable) case))
 
 (declaim (inline readtable-normalization))
 (defun readtable-normalization (readtable)
@@ -599,7 +579,7 @@ standard Lisp readtable when NIL."
 (defun ouch-read-buffer (char buffer)
   ;; When buffer overflow
   (let ((op (token-buf-fill-ptr buffer)))
-    (declare (optimize (sb-c::insert-array-bounds-checks 0)))
+    (declare (optimize (sb-c:insert-array-bounds-checks 0)))
     (when (>= op (length (token-buf-string buffer)))
     ;; an out-of-line call for the uncommon case avoids bloat.
     ;; Size should be doubled.
@@ -622,7 +602,7 @@ standard Lisp readtable when NIL."
 ;; Retun the next character from the buffered token, or NIL.
 (declaim (maybe-inline token-buf-getchar))
 (defun token-buf-getchar (b)
-  (declare (optimize (sb-c::insert-array-bounds-checks 0)))
+  (declare (optimize (sb-c:insert-array-bounds-checks 0)))
   (let ((i (token-buf-cursor (truly-the token-buf b))))
     (and (< i (token-buf-fill-ptr b))
          (prog1 (elt (token-buf-string b) i)
@@ -948,7 +928,7 @@ standard Lisp readtable when NIL."
   (declare (character closech))
   (macrolet ((scan (read-a-char eofp &optional finish)
                `(loop (let ((char ,read-a-char))
-                        (declare (optimize (sb-c::insert-array-bounds-checks 0)))
+                        (declare (optimize (sb-c:insert-array-bounds-checks 0)))
                         (cond (,eofp (error 'end-of-file :stream stream))
                               ((eql char closech)
                                (return ,finish))
@@ -1170,7 +1150,7 @@ standard Lisp readtable when NIL."
      ((and (zerop (length escapes)) (eq case :upcase))
       (let ((buffer (token-buf-string token-buf)))
         (dotimes (i (token-buf-fill-ptr token-buf))
-          (declare (optimize (sb-c::insert-array-bounds-checks 0)))
+          (declare (optimize (sb-c:insert-array-bounds-checks 0)))
           (setf (schar buffer i) (char-upcase (schar buffer i))))))
      ((eq case :preserve))
      (t
@@ -1181,7 +1161,7 @@ standard Lisp readtable when NIL."
                                   -1 (vector-pop escapes))))
                         ((minusp i))
                       (declare (fixnum i)
-                               (optimize (sb-c::insert-array-bounds-checks 0)))
+                               (optimize (sb-c:insert-array-bounds-checks 0)))
                       (if (< esc i)
                           (let ((ch (schar buffer i)))
                             ,@body)
@@ -1661,7 +1641,7 @@ extended <package-name>::<form-in-package> syntax."
 (defmacro !setq-optional-leading-sign (sign-flag token-buf rewind)
   ;; guaranteed to have at least one character in buffer at the start
   ;; or immediately following [ESFDL] marker depending on 'rewind' flag.
-  `(locally (declare (optimize (sb-c::insert-array-bounds-checks 0)))
+  `(locally (declare (optimize (sb-c:insert-array-bounds-checks 0)))
      (,(if rewind 'setf 'incf)
        (token-buf-cursor ,token-buf)
        (case (elt (token-buf-string ,token-buf)

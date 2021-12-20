@@ -11,6 +11,11 @@
 
 #-x86-64 (sb-ext:exit :code 104)
 
+;;; This trivial function failed to compile due to rev 88d078fe
+(defun foo (&key k)
+  (make-list (reduce #'max (mapcar #'length k))))
+(compile 'foo)
+
 (with-test (:name :lowtag-test-elision)
   ;; This tests a certain behavior that while "undefined" should at least not
   ;; be fatal. This is important for things like hash-table :TEST where we might
@@ -49,6 +54,14 @@
                     (disassemble fun :stream s)))
                 #\newline)))
     (sb-int:unencapsulate 'sb-disassem::add-debugging-hooks 'test)))
+
+(sb-vm::define-vop (tryme)
+    (:generator 1 (sb-assem:inst mov :byte (sb-vm::ea :gs sb-vm::rax-tn) 0)))
+(with-test (:name :try-gs-segment)
+  (assert (loop for line in (disassembly-lines
+                             (compile nil
+                                      '(lambda () (sb-sys:%primitive tryme))))
+                thereis (search "MOV BYTE PTR GS:[RAX]" line))))
 
 (defun disasm (safety expr &optional (remove-epilogue t))
   ;; This lambda has a name because if it doesn't, then the name
@@ -764,7 +777,7 @@ sb-vm::(define-vop (cl-user::test)
     (let ((trampoline
             (sb-di::code-header-from-pc
              (sb-sys:int-sap (sb-vm::fdefn-raw-addr
-                              (sb-kernel::find-fdefn symbol))))))
+                              (sb-int:find-fdefn symbol))))))
       (assert (zerop (sb-kernel:code-n-entries trampoline)))
       (assert (typep (sb-di::debug-fun-from-pc trampoline 8)
                      'sb-di::bogus-debug-fun)))))
@@ -777,9 +790,8 @@ sb-vm::(define-vop (cl-user::test)
              '(lambda (x) (if (stringp (foo-s (truly-the foo x))) 'is 'not)))))
     ;; the comparison of X to NIL should be a single-byte test
     (assert (loop for line in f1
-                  thereis (search (format nil "CMP AL, ~D"
-                                          (logand sb-vm:nil-value #xff))
-                                  line)))
+                  thereis (and (search (format nil "CMP ") line) ; register is arbitrary
+                               (search (format nil ", ~D" (logand sb-vm:nil-value #xff)) line))))
     ;; the two variations of the test compile to the identical code
     (dotimes (i 4)
       (assert (string= (nth i f1) (nth i f2))))))
@@ -986,7 +998,7 @@ sb-vm::(define-vop (cl-user::test)
 (with-test (:name :sap-set-does-not-cons)
   (loop for (type accessor telltale) in
         '((sb-vm:word sb-sys:sap-ref-word "ALLOC-UNSIGNED-BIGNUM")
-          (double-float sb-sys:sap-ref-double "CONS"))
+          (double-float sb-sys:sap-ref-double "ALLOC-TRAMP"))
         do (let* ((positive-test
                    (compile nil `(lambda (sap) (,accessor sap 0))))
                   (negative-test
@@ -1044,3 +1056,88 @@ sb-vm::(define-vop (cl-user::test)
                                 most-negative-fixnum)
   (try-logbitp-walking-bit-test bitsy-sw  :sw  64
                                 (sb-c::mask-signed-field 64 (ash 1 63))))
+
+#+allocator-metrics ; missing symbols if absent feature
+(with-test (:name :allocator-histogram-bucketing)
+  (let* ((min 0) (max 5000)
+         (var-fun (compile nil '(lambda (n) (make-array (the fixnum n))))))
+    (loop for n-elements from min to max
+       do
+         (let* ((fixed-fun (compile nil `(lambda () (make-array ,n-elements))))
+               (h1 (progn
+                     (sb-thread::reset-allocator-histogram)
+                     (funcall fixed-fun)
+                     (first (sb-thread::allocator-histogram))))
+               (h2 (progn
+                     (sb-thread::reset-allocator-histogram)
+                     (funcall var-fun n-elements)
+                     (first (sb-thread::allocator-histogram)))))
+           ;; We have to allow for the possibilty of either or both MAKE-ARRAY calls causing
+           ;; a GC to occur immediately thereafter, which allocates a cons for the GC epoch.
+           ;; So if there is an extra element in bin 0, just remove it.
+           (when (and (> (aref h1 0) 0)
+                      (= (loop for value across h1 sum value) 2))
+             (decf (aref h1 0)))
+           (when (and (> (aref h2 0) 0) (= (loop for value across h2 sum value) 2))
+             (decf (aref h2 0)))
+           (unless (and (= (loop for value across h1 sum value) 1) ; exactly 1 bucket is nonzero
+                        (equalp h1 h2))
+             (let ((*print-length* nil))
+               (format t "h1=~s~%h2=~s~%" h1 h2)
+               (error "Error on n-elements = ~d" n-elements)))))))
+
+(with-test (:name :uniquify-fixups)
+  (let* ((f (let ((sb-c::*compile-to-memory-space* :dynamic))
+              (compile nil
+                       '(lambda (x)
+                         `(,(list 1 2) ,(cons 1 2) ,(list nil x) ,(list '(a) #\x))))))
+         (fixups
+          (sb-c::unpack-code-fixup-locs
+           (sb-vm::%code-fixups (sb-kernel:fun-code-header f)))))
+    ;; There are 5 call outs to the fallback allocator, but only 2 (or 3)
+    ;; fixups to the asm routines, because of uniquification per code component.
+    ;; 2 of them are are CONS->RNN and CONS->R11
+    ;; the other is ENABLE-ALLOC-COUNTER which may or may not be present
+    (assert (<= (length fixups) 3))))
+
+(defstruct submarine x y z)
+(defstruct (moreslots (:include submarine)) a b c)
+(declaim (ftype (function () double-float) get-dbl))
+(with-test (:name :write-combining-instance-set)
+  (let* ((f (compile nil '(lambda (s)
+                            (setf (submarine-x (truly-the submarine s)) 0
+                                  (submarine-y s) 0
+                                  (submarine-z s) 0))))
+         (lines (disassembly-lines f)))
+    (assert (= 1 (loop for line in lines count (search "MOVUPD" line))))
+    (assert (= 1 (loop for line in lines count (search "MOVSD" line)))))
+  (let* ((f (compile nil '(lambda (s)
+                            (setf (moreslots-a (truly-the moreslots s)) 0
+                                  (submarine-x s) 0
+                                  (moreslots-c s) 0))))
+         (lines (disassembly-lines f)))
+    (assert (= 3 (loop for line in lines count (search "MOVSD" line)))))
+  ;; This was crashing in the MOV emitter (luckily) because it received
+  ;; an XMM register due to omission of a MOVE-FROM-DOUBLE to heap-allocate.
+  (compile nil
+           '(lambda (sub a)
+             (declare (submarine sub))
+             (let ((fooval (+ (get-dbl) 23d0)))
+               (setf (submarine-x sub) a
+                     (submarine-y sub) fooval)
+               a))))
+
+#+immobile-code
+(with-test (:name :no-static-linkage-if-notinline)
+  ;; The normal state of the image has no "static" calls to FIND-PACKAGE
+  ;; but also has no globally proclaimed NOTINLINE, because that would
+  ;; suppress the optimization for CACHED-FIND-PACKAGE on a constant string.
+  (assert (not (sb-vm::fdefn-has-static-callers (sb-int:find-fdefn 'find-package))))
+  (assert (not (sb-int:info :function :inlinep 'find-package))))
+
+(sb-vm::define-vop (trythis)
+  (:generator 1
+   (sb-vm::inst and sb-vm::rax-tn (sb-c:make-fixup nil :gc-barrier))))
+(defun zook ()
+  (sb-sys:%primitive trythis)
+  nil)

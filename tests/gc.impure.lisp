@@ -35,22 +35,7 @@
     (assert (= (aref a 4) 18))
     ;; broken cells are the cons, string, bignum, hash-table, plus one NIL
     ;; cell that was never assigned into
-    (assert (= (count nil *weak-vect*) 5))))
-
-;;; Make sure MAP-REFERENCING-OBJECTS doesn't spuriously treat raw bits as
-;;; potential pointers. Also make sure it sees the SYMBOL-INFO slot.
-(defstruct afoo (slot nil :type sb-ext:word))
-(defvar *afoo* (make-afoo :slot (sb-kernel:get-lisp-obj-address '*posix-argv*)))
-(with-test (:name :map-referencing-objs)
-  (sb-vm::map-referencing-objects (lambda (x) (assert (not (typep x 'afoo))))
-                                  :dynamic '*posix-argv*)
-  (let ((v (sb-kernel:symbol-info 'satisfies)) referers)
-    (sb-vm::map-referencing-objects (lambda (referer) (push referer referers))
-                                    #+gencgc :dynamic #-gencgc :static v)
-    #+immobile-space
-    (sb-vm::map-referencing-objects (lambda (referer) (push referer referers))
-                                    :immobile v)
-    (assert (member 'satisfies referers))))
+    *weak-vect*))
 
 ;; Assert something about *CURRENT-THREAD* seeing objects that it just consed.
 (with-test (:name :m-a-o-threadlocally-precise
@@ -152,7 +137,8 @@
                 (sb-kernel:get-lisp-obj-address string-one)
                 (sb-kernel:get-lisp-obj-address string-two)))))
 #+gencgc
-(with-test (:name :pin-all-code-with-gc-enabled)
+(with-test (:name :pin-all-code-with-gc-enabled
+                  :skipped-on :interpreter)
   #+sb-thread (sb-thread:join-thread (sb-thread:make-thread #'make-some-objects))
   #-sb-thread (progn (make-some-objects) (sb-sys:scrub-control-stack))
   (sb-sys:with-code-pages-pinned (:dynamic) (gc))
@@ -193,12 +179,12 @@
 #+immobile-space
 (with-test (:name :generation-of-fdefn)
   ;; generation-of broke when fdefns stopped storing a generation in word 0
-  (assert (= (sb-kernel:generation-of (sb-kernel::find-fdefn 'car))
+  (assert (= (sb-kernel:generation-of (sb-int:find-fdefn 'car))
              sb-vm:+pseudo-static-generation+)))
 
 (with-test (:name :static-fdefn-space)
   (sb-int:dovector (name sb-vm:+static-fdefns+)
-    (assert (eq (sb-ext:heap-allocated-p (sb-kernel::find-fdefn name))
+    (assert (eq (sb-ext:heap-allocated-p (sb-int:find-fdefn name))
                 (or #+immobile-code :immobile :static)))))
 
 ;;; SB-EXT:GENERATION-* accessors returned bogus values for generation > 0
@@ -360,20 +346,6 @@
            (setf (aref a serial) 1))))
      :all)))
 
-(defvar *foo*)
-#+gencgc
-(with-test (:name (sb-ext:search-roots :simple-fun)
-            :broken-on (and :darwin :arm64))
-  ;; Tracing a path to a simple fun wasn't working at some point
-  ;; because of failure to employ fun_code_header in the right place.
-  (setq *foo* (compile nil '(lambda () 42)))
-  (let ((wp (sb-ext:make-weak-pointer *foo*)))
-    (assert (sb-ext:search-roots wp :criterion :oldest :print nil))))
-
-#+gencgc
-(with-test (:name (sb-ext:search-roots :ignore-immediate))
-  (sb-ext:search-roots (make-weak-pointer 48) :gc t :print nil))
-
 #+sb-thread
 (with-test (:name :concurrently-alloc-code)
   (let ((gc-thread
@@ -466,17 +438,6 @@
     (sb-thread:join-thread worker-thread)
     (setq working nil)
     (sb-thread:join-thread gc-thread)))
-
-(with-test (:name :no-conses-on-large-object-pages)
-  (let* ((fun (checked-compile '(lambda (&rest params) params)))
-         (list (make-list #+gencgc (/ sb-vm:large-object-size
-                                      (sb-ext:primitive-object-size '(1))
-                                      1/2)
-                          #-gencgc 16384))
-         (rest (apply fun list)))
-    (sb-sys:with-pinned-objects (rest)
-      (sb-ext:gc :full t)
-      (assert (and (equal list rest) t)))))
 
 (defun use-up-thread-region ()
   ;; cons until the thread-local allocation buffer uses up a page

@@ -52,7 +52,7 @@
         (unsafely-set-bit
          (compile nil
                   '(lambda (bv i val)
-                     (declare (optimize (sb-c::insert-array-bounds-checks 0)))
+                     (declare (optimize (sb-c:insert-array-bounds-checks 0)))
                      (setf (bit bv i) val)))))
     (replace bv '(1 0 1 1 1))
     (let ((hash (sxhash bv)))
@@ -223,7 +223,8 @@
 
 (with-test (:name (hash-table :custom-hashfun-with-standard-test))
   (flet ((kv-flag-bits (ht)
-           (sb-kernel:get-header-data (sb-impl::hash-table-pairs ht))))
+           (ash (sb-kernel:get-header-data (sb-impl::hash-table-pairs ht))
+                (- sb-vm:array-flags-data-position))))
     ;; verify that EQ hashing on symbols is address-sensitive
     (let ((h (make-hash-table :test 'eq)))
       (setf (gethash 'foo h) 1)
@@ -345,7 +346,7 @@
   ;; and those objects have comparators that descend.
   ;; However, there are still some things hashed by address:
   (test-this-object 'equalp (make-weak-pointer "bleep"))
-  (test-this-object 'equalp (sb-kernel::find-fdefn 'cons))
+  (test-this-object 'equalp (sb-int:find-fdefn 'cons))
   (test-this-object 'equalp #'car)
   (test-this-object 'equalp (constantly 5))
   (test-this-object 'equal (sb-sys:int-sap 0)))
@@ -370,8 +371,8 @@
             '(lambda (x y)
                (logxor (ash (sxhash (truly-the (or string null) x)) -3)
                        (sxhash (truly-the (or bit-vector null) y))))))
-        (fdefn1 (sb-kernel::find-fdefn 'sb-kernel:%sxhash-string))
-        (fdefn2 (sb-kernel::find-fdefn 'sb-kernel:%sxhash-bit-vector)))
+        (fdefn1 (sb-int:find-fdefn 'sb-kernel:%sxhash-string))
+        (fdefn2 (sb-int:find-fdefn 'sb-kernel:%sxhash-bit-vector)))
     (every (lambda (x) (member x `(,fdefn1 ,fdefn2)))
            (ctu:find-code-constants f))))
 
@@ -403,3 +404,10 @@
 (with-test (:name :array-psxhash-non-consing :skipped-on :interpreter)
    (let ((a (make-array 1000 :element-type 'double-float)))
      (ctu:assert-no-consing (sb-int:psxhash a))))
+
+(with-test (:name :array-psxhash)
+  (let ((table (make-hash-table :test 'equalp)))
+    (let ((x (vector 1.0d0 1.0d0))
+          (y (make-array 2 :element-type 'double-float :initial-contents '(1.0d0 1.0d0))))
+      (setf (gethash x table) t)
+      (assert (gethash y table)))))

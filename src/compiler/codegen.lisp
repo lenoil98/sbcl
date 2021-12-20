@@ -18,24 +18,22 @@
 
 ;;; the number of bytes used by the code object header
 
-#-sb-xc-host
-(defun component-header-length (&optional
-                                (component *component-being-compiled*))
-  (let* ((2comp (component-info component))
-         (constants (ir2-component-constants 2comp)))
-    (ash (align-up (length constants) code-boxed-words-align) sb-vm:word-shift)))
-
-;;; KLUDGE: the assembler can not emit backpatches comprising jump tables without
-;;; knowing the boxed code header length. But there is no compiler IR2 metaobject,
-;;; for SB-FASL:*ASSEMBLER-ROUTINES*. We have to return a fixed answer for that.
-#+sb-xc-host
-(defun component-header-length ()
-  (if (boundp '*component-being-compiled*)
-      (let ((component *component-being-compiled*))
-        (let* ((2comp (component-info component))
-               (constants (ir2-component-constants 2comp)))
-          (ash (align-up (length constants) code-boxed-words-align) sb-vm:word-shift)))
-      (* sb-vm:n-word-bytes 4))) ; FIXME: what is 4 ?
+(macrolet ((header-length-in-bytes (comp)
+             `(let* ((2comp (component-info ,comp))
+                     (constants (ir2-component-constants 2comp)))
+                (ash (align-up (length constants) code-boxed-words-align)
+                     sb-vm:word-shift))))
+  #-sb-xc-host
+  (defun component-header-length (&optional (component *component-being-compiled*))
+    (header-length-in-bytes component))
+  ;; KLUDGE: the assembler can not emit backpatches comprising jump tables without
+  ;; knowing the boxed code header length. But there is no compiler IR2 metaobject,
+  ;; for SB-FASL:*ASSEMBLER-ROUTINES*. We have to return a fixed answer for that.
+  #+sb-xc-host
+  (defun component-header-length ()
+    (if (boundp '*component-being-compiled*)
+        (header-length-in-bytes *component-being-compiled*)
+        (* sb-vm:n-word-bytes (align-up sb-vm:code-constants-offset 2)))))
 
 ;;; the size of the NAME'd SB in the currently compiled component.
 ;;; This is useful mainly for finding the size for allocating stack
@@ -48,9 +46,9 @@
 (defun current-nfp-tn (vop)
   (unless (zerop (sb-allocated-size 'non-descriptor-stack))
     (let ((block (ir2-block-block (vop-block vop))))
-    (when (ir2-physenv-number-stack-p
-           (physenv-info
-            (block-physenv block)))
+    (when (ir2-environment-number-stack-p
+           (environment-info
+            (block-environment block)))
       (ir2-component-nfp (component-info (block-component block)))))))
 
 ;;; the TN that is used to hold the number stack frame-pointer in the
@@ -58,13 +56,13 @@
 ;;; allocated
 (defun callee-nfp-tn (2env)
   (unless (zerop (sb-allocated-size 'non-descriptor-stack))
-    (when (ir2-physenv-number-stack-p 2env)
+    (when (ir2-environment-number-stack-p 2env)
       (ir2-component-nfp (component-info *component-being-compiled*)))))
 
 ;;; the TN used for passing the return PC in a local call to the function
 ;;; designated by 2ENV
 (defun callee-return-pc-tn (2env)
-  (ir2-physenv-return-pc-pass 2env))
+  (ir2-environment-return-pc-pass 2env))
 
 ;;;; noise to emit an instruction trace
 
@@ -271,9 +269,8 @@
 (defun generate-code (component &aux (ir2-component (component-info component)))
   (declare (type ir2-component ir2-component))
   (when *compiler-trace-output*
-    (format *compiler-trace-output*
-            "~|~%assembly code for ~S~2%"
-            component))
+    (let ((*print-pretty* nil)) ; force 1 line
+      (format *compiler-trace-output* "~|~%assembly code for ~S~2%" component)))
   (let* ((prev-env nil)
          ;; The first function's alignment word is zero-filled, but subsequent
          ;; ones can use a NOP which helps the disassembler not lose sync.
@@ -330,10 +327,10 @@
                                  (ir2-block-%trampoline-label block)
                                  (ir2-block-dropped-thru-to block)
                                  alignp)))
-          (let ((env (block-physenv 1block)))
+          (let ((env (block-environment 1block)))
             (unless (eq env prev-env)
-              (let ((lab (gen-label "physenv elsewhere start")))
-                (setf (ir2-physenv-elsewhere-start (physenv-info env))
+              (let ((lab (gen-label "environment elsewhere start")))
+                (setf (ir2-environment-elsewhere-start (environment-info env))
                       lab)
                 (emit (asmstream-elsewhere-section asmstream) lab))
               (setq prev-env env)))))
@@ -370,6 +367,8 @@
     ;; Todo: can we implement the flow-based aspect of coverage mark compression
     ;; in IR2 instead of waiting until assembly generation?
     #+(or x86 x86-64) (coverage-mark-lowering-pass component asmstream)
+    ;; The #+(or x86 x86-64) case has _already_ output the mark bytes into
+    ;; the data section in lowering pass, so we don't do that here.
     #-(or x86 x86-64)
     (when coverage-map
       #+arm64
@@ -400,7 +399,8 @@
            (make-segment :header-skew skew
                          :run-scheduler (default-segment-run-scheduler)))
         (values segment text-length fun-table
-                (asmstream-elsewhere-label asmstream) fixup-notes)))))
+                (asmstream-elsewhere-label asmstream) fixup-notes
+                (sb-assem::get-allocation-points asmstream))))))
 
 (defun label-elsewhere-p (label-or-posn kind)
   (let ((elsewhere (label-position *elsewhere-label*))

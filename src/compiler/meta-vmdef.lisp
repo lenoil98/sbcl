@@ -815,31 +815,35 @@
         (when more
           (error "The MORE operand isn't the last operand: ~S" specs))
         (incf *parse-vop-operand-count*)
+        (incf num)
         (let* ((name (first spec))
                (old (if (vop-parse-inherits parse)
                         (find-operand name
                                       (vop-parse-or-lose
                                        (vop-parse-inherits parse))
-                                      (list kind)
+                                      (list* kind
+                                             (if (eq kind :argument)
+                                                 '(:more-argument)
+                                                 '(:more-result)))
                                       nil)
                         nil))
                (res
-                (nconc (list :kind kind)
-                       (if old
-                        (list
-                         :target (operand-parse-target old)
-                         :born (operand-parse-born old)
-                         :dies (operand-parse-dies old)
-                         :scs (operand-parse-scs old)
-                         :load-tn (operand-parse-load-tn old)
-                         :load (operand-parse-load old))
-                        (ecase kind
-                          (:argument
-                           (list :born (parse-time-spec :load)
-                                 :dies (parse-time-spec `(:argument ,(incf num)))))
-                          (:result
-                           (list :born (parse-time-spec `(:result ,(incf num)))
-                                 :dies (parse-time-spec :save))))))))
+                 (nconc (list :kind kind)
+                        (if old
+                            (list
+                             :target (operand-parse-target old)
+                             :born (operand-parse-born old)
+                             :dies (operand-parse-dies old)
+                             :scs (operand-parse-scs old)
+                             :load-tn (operand-parse-load-tn old)
+                             :load (operand-parse-load old))
+                            (ecase kind
+                              (:argument
+                               (list :born (parse-time-spec :load)
+                                     :dies (parse-time-spec `(:argument ,num))))
+                              (:result
+                               (list :born (parse-time-spec `(:result ,num))
+                                     :dies (parse-time-spec :save))))))))
           (do ((tail (rest spec) (cddr tail)))
               ((null tail))
             (let ((key (first tail))
@@ -900,6 +904,11 @@
     (dolist (name (cddr spec))
       (unless (symbolp name)
         (error "bad temporary name: ~S" name))
+      ;; It's almost always a mistake to have overlaps in the operand names.
+      ;; But I guess that some users think it's fine?
+      #+sb-xc-host
+      (when (member name (vop-parse-temps parse) :key #'operand-parse-name)
+        (warn "temp ~s already exists in ~s" name (vop-parse-name parse)))
       (incf *parse-vop-operand-count*)
       (let ((res (list :born (parse-time-spec :load)
                        :dies (parse-time-spec :save))))
@@ -1232,7 +1241,9 @@
                       (when (sc-allowed-by-primitive-type
                              (sc-or-lose sc)
                              (primitive-type-or-lose ptype))
-                        (return t))))
+                        (return t)))
+                    #+arm64
+                    (eq sc 'sb-vm::zero))
           (warn "~:[Result~;Argument~] ~A to VOP ~S~@
                  has SC restriction ~S which is ~
                  not allowed by the operand type:~%  ~S"
@@ -1990,17 +2001,18 @@
                    (when (and ,tn-var (not (eq ,tn-var :more)))
                      (,bod ,tn-var)))))))))))
 
-;;; Iterate over all the IR2 blocks in PHYSENV, in emit order.
-(defmacro do-physenv-ir2-blocks ((block-var physenv &optional result)
-                                 &body body)
-  (once-only ((n-physenv physenv))
-    (once-only ((n-first `(lambda-block (physenv-lambda ,n-physenv))))
+;;; Iterate over all the IR2 blocks in the environment ENV, in emit
+;;; order.
+(defmacro do-environment-ir2-blocks ((block-var env &optional result)
+                                     &body body)
+  (once-only ((n-env env))
+    (once-only ((n-first `(lambda-block (environment-lambda ,n-env))))
       (once-only ((n-tail `(block-info
                             (component-tail
                              (block-component ,n-first)))))
         `(do ((,block-var (block-info ,n-first)
                           (ir2-block-next ,block-var)))
              ((or (eq ,block-var ,n-tail)
-                  (not (eq (ir2-block-physenv ,block-var) ,n-physenv)))
+                  (not (eq (ir2-block-environment ,block-var) ,n-env)))
               ,result)
            ,@body)))))

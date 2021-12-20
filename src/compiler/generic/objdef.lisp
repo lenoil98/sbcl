@@ -32,9 +32,7 @@
 
 ;;;; the primitive objects themselves
 
-(define-primitive-object (cons :type cons
-                               :lowtag list-pointer-lowtag
-                               :alloc-trans cons)
+(define-primitive-object (cons :type cons :lowtag list-pointer-lowtag)
   (car :ref-trans car :set-trans %rplaca :init :arg
        :cas-trans %compare-and-swap-car)
   (cdr :ref-trans cdr :set-trans %rplacd :init :arg
@@ -182,7 +180,7 @@ during backtrace.
 ;;; hidden dependencies on primitive object sizes for the most part,
 ;;; 'ppc-assem.S' contains a literal constant that relies on knowing
 ;;; the precise size of a code object. Yes, there is a FIXME there :-)
-;;; So, if you touch this, then fix that.
+;;; So, if you touch this, then fix that. REALLY REALLY.
 (define-primitive-object (code :type code-component
                                 :lowtag other-pointer-lowtag
                                 :widetag code-header-widetag)
@@ -198,21 +196,15 @@ during backtrace.
   ;; for the assembler code component, a cons holding a hash-table.
   ;; (the cons points from read-only to static space, but the hash-table
   ;; wants to be in dynamic space)
+  ;; The corresponding SETF function is defined using code-header-set
+  ;; on the slot index; and there's a special variant if #+darwin-jit.
   (debug-info :type t
               :ref-known (flushable)
-              :ref-trans %%code-debug-info
-              :set-known ()
-              :set-trans (setf #-darwin-jit %code-debug-info
-                               #+darwin-jit %%code-debug-info))
-  ;; Define this slot if the architecture might ever use fixups.
-  ;; x86-64 doesn't necessarily use them, depending on the feature set,
-  ;; but this keeps things consistent.
-  #+(or x86 x86-64)
-  (fixups :type t
-          :ref-known (flushable)
-          :ref-trans %code-fixups
-          :set-known ()
-          :set-trans (setf %code-fixups))
+              :ref-trans %%code-debug-info)
+  ;; Not all architectures use fixups. The slot is always present for consistency.
+  ;; The corresponding SETF function is defined using code-header-set
+  ;; on the slot index.
+  (fixups :type t :ref-known (flushable) :ref-trans %code-fixups)
   (constants :rest-p t))
 
 (define-primitive-object (fdefn :type fdefn
@@ -382,13 +374,30 @@ during backtrace.
          :set-trans %set-symbol-global-value
          :set-known ())
 
-  (info :ref-trans symbol-info :ref-known (flushable)
-        :set-trans (setf symbol-info)
-        :set-known ()
-        :cas-trans %compare-and-swap-symbol-info
-        :type (or simple-vector list)
+  ;; The private accessor for INFO reads the slot verbatim.
+  ;; In contrast, the SYMBOL-INFO function always returns a PACKED-INFO
+  ;; instance (see info-vector.lisp) or NIL. The slot itself may hold a cons
+  ;; of the user's PLIST and a PACKED-INFO or just a PACKED-INFO.
+  ;; It can't hold a PLIST alone without wrapping in an extra cons cell.
+  (info :ref-trans symbol-%info :ref-known (flushable)
+        ;; IR2-CONVERT-CASSER only knows the arg order as (OBJECT OLD NEW),
+        ;; so as much as I'd like to name this (CAS SYMBOL-%INFO),
+        ;; it can't be that, because it'd need args of (OLD NEW OBJECT).
+        ;; This is a pretty close approximation of the desired name.
+        :cas-trans sb-impl::cas-symbol-%info
+        :type (or instance list)
         :init :null)
-  (name :ref-trans symbol-name :init :arg)
+  (name :init :arg #-compact-symbol :ref-trans #-compact-symbol symbol-name)
+  ;; This slot holds an FDEFN. It's almost unnecessary to have FDEFNs at all
+  ;; for symbols. If we ensured that any function bound to a symbol had a
+  ;; call convention rendering it callable in the manner of a SIMPLE-FUN,
+  ;; then we would only need to store that function's raw entry address here,
+  ;; thereby removing the FDEFN for any global symbol. Any closure assigned
+  ;; to a symbol would need a tiny trampoline, which is already the case
+  ;; for #+immobile-code.
+  (fdefn :ref-trans %symbol-fdefn :ref-known ()
+         :cas-trans cas-symbol-fdefn)
+  #-compact-symbol
   (package :ref-trans sb-xc:symbol-package
            :set-trans %set-symbol-package
            :init :null)
@@ -471,6 +480,9 @@ during backtrace.
                             *thread-header-slot-names*)))))
   (assign-header-slot-indices))
 
+(eval-when (:compile-toplevel :load-toplevel :execute)
+(defconstant histogram-small-bins 32)) ; for consing size histogram
+
 ;;; this isn't actually a lisp object at all, it's a c structure that lives
 ;;; in c-land.  However, we need sight of so many parts of it from Lisp that
 ;;; it makes sense to define it here anyway, so that the GENESIS machinery
@@ -515,13 +527,9 @@ during backtrace.
   ;; Deterministic consing profile recording area.
   (profile-data :c-type "uword_t *" :pointer t)
   ;; Thread-local allocation buffers
-  #+gencgc (boxed-tlab :c-type "struct alloc_region" :length 4)
+  #+gencgc (mixed-tlab :c-type "struct alloc_region" :length 4)
   #+gencgc (unboxed-tlab :c-type "struct alloc_region" :length 4)
   ;; END of slots to keep near the beginning.
-
-  (dynspace-addr)
-  (dynspace-card-count)
-  (dynspace-pte-base)
 
   ;; This is the original address at which the memory was allocated,
   ;; which may have different alignment then what we prefer to use.
@@ -555,7 +563,7 @@ during backtrace.
   ;; handling, we need to know if the machine context is in Lisp code
   ;; or not.  On non-threaded targets, this is a global variable in
   ;; the runtime, but it's clearly a per-thread value.
-  #+sb-thread
+  #+(and sb-thread (not arm64))
   (foreign-function-call-active :c-type "boolean")
   ;; Same as above for the location of the current control stack frame.
   #+(and sb-thread (not (or x86 x86-64)))
@@ -567,6 +575,7 @@ during backtrace.
   (control-stack-pointer :c-type "lispobj *")
   #+mach-exception-handler
   (mach-port-name :c-type "mach_port_name_t")
+  #+ppc64 (card-table)
 
   ;; allocation instrumenting
   (tot-bytes-alloc-boxed)
@@ -575,7 +584,8 @@ during backtrace.
   (et-allocator-mutex-acq) ; elapsed times
   (et-find-freeish-page)
   (et-bzeroing)
-  (obj-size-histo :c-type "size_histogram" :length #.sb-vm:n-word-bits)
+  (obj-size-histo :c-type "size_histogram"
+                  :length #.(+ histogram-small-bins sb-vm:n-word-bits))
 
   ;; The *current-thread* MUST be the last slot in the C thread structure.
   ;; It it the only slot that needs to be noticed by the garbage collector.
@@ -627,3 +637,77 @@ during backtrace.
           (ldb code-serialno-byte (sap-ref-word (code-instructions code) 0)))))
 
 ) ; end PROGN
+
+;;; The definitions below want to use ALIGN-UP, which is not defined
+;;; in time to put these in early-objdef, but it turns out that we don't
+;;; need them there.
+(defconstant nil-value
+    (+ static-space-start
+       ;; mixed_region precedes NIL
+       ;; 8 is the number of words to reserve at the beginning of static space
+       ;; prior to the words of NIL.
+       ;; If you change this, then also change MAKE-NIL-DESCRIPTOR in genesis.
+       #+(and gencgc (not sb-thread) (not 64-bit)) (ash 8 word-shift)
+       #+64-bit #x100
+       ;; magic padding because of NIL's symbol/cons-like duality
+       (* 2 n-word-bytes)
+       list-pointer-lowtag))
+
+;;; MIXED-REGION is address in static space at which a 'struct alloc_region'
+;;; is overlaid on a lisp vector with element type WORD.
+#-sb-thread
+(defconstant mixed-region
+  (+ static-space-start
+     (* 2 n-word-bytes))) ; skip the array header
+
+;;; Start of static objects:
+;;;
+;;;   32-bit w/threads     |   32-bit no threads     |      64-bit
+;;;  --------------------  | --------------------    | ---------------------
+;;;       padding          |      padding            |      padding
+;;;  NIL: header (#x07__)  | NIL: header (#x06__)    | NIL: header (#x05__)
+;;;       hash             |      hash               |      hash
+;;;       value            |      value              |      value
+;;;       info             |      info               |      info
+;;;       name             |      name               |      name
+;;;       fdefn            |      fdefn              |      fdefn
+;;;       package          |      package            |      (unused)
+;;;       tls_index        |   T: header             |   T: header
+;;;       (unused)         |                         |
+;;;    T: header           |                         |
+;;;  -------------------   | --------------------    | ---------------------
+;;;    SYMBOL_SIZE=8       |   SYMBOL_SIZE=7         |   SYMBOL_SIZE=6
+;;;    NIL is 10 words     |   NIL is 8 words        |   NIL is 8 words
+
+;;; This constant is the address at which to scan NIL as a root.
+;;; To ensure that scav_symbol is invoked, we have to see the widetag
+;;; in the 0th word, which is at 1 word prior to the word containing the CAR of
+;;; nil-as-a-list. So subtract the lowtag and then go back one more word.
+;;; This address is NOT double-lispword-aligned, but the scavenge method
+;;; does not assert that.
+(defconstant nil-symbol-slots-start
+  (- nil-value list-pointer-lowtag n-word-bytes))
+
+;;; NIL as a symbol contains the usual number of words for a symbol,
+;;; aligned to a double-lispword. This will NOT end at a double-lispword boundary.
+;;; In all 3 scenarios depicted above, the number of slots that the 'scav' function
+;;; returns suggests that it would examine the header word of the *next* symbol.
+;;; But it does not, because it confines itself to looking only at the number of
+;;; words indicated in the symbol header of NIL. But we have to pass in the aligned
+;;; count because of the assertion in heap_scavenge that the scan ends as expected,
+;;; and scavenge methods must return an even number because nothing can be smaller
+;;; than 1 cons cell or not a multiple thereof.
+(defconstant nil-symbol-slots-end
+  (+ nil-symbol-slots-start (ash (align-up symbol-size 2) word-shift)))
+
+;;; This constant is the number of words to report that NIL consumes
+;;; when Lisp asks for its primitive-object-size. So we say that it consumes
+;;; all words from the start of static-space objects up to the next object.
+(defconstant sizeof-nil-in-words (+ 2 (sb-int:align-up (1- sb-vm:symbol-size) 2)))
+
+;;; Address at which to start scanning static symbols when heap-walking.
+;;; Basically skip over MIXED-REGION (if it's in static space) and NIL.
+;;; Or: go to NIL's header word, subtract 1 word, and add in the physical
+;;; size of NIL in bytes that we report for primitive-object-size.
+(defconstant static-space-objects-start
+  (+ nil-symbol-slots-start (ash (1- sizeof-nil-in-words) word-shift)))

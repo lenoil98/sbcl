@@ -429,6 +429,20 @@ static void relocate_space(uword_t start, lispobj* end, struct heap_adjust* adj)
             for (i=0; i<(nwords-1); ++i)
                 if (bitmap_logbitp(i, bitmap)) adjust_pointers(slots+i, 1, adj);
             continue;
+#ifdef LISP_FEATURE_COMPACT_SYMBOL
+          case SYMBOL_WIDETAG:
+            { // Copied from scav_symbol() in gc-common
+            struct symbol* s = (void*)where;
+            adjust_pointers(&s->value, 2, adj);
+            lispobj name = decode_symbol_name(s->name);
+            lispobj adjusted_name = adjust_word(adj, name);
+            // writeback the name if it changed
+            if (adjusted_name != name) set_symbol_name(s, adjusted_name);
+            int indicated_nwords = (*where>>N_WIDETAG_BITS) & 0xFF;
+            adjust_pointers(&s->fdefn, indicated_nwords - 4, adj);
+            }
+            continue;
+#endif
         case FDEFN_WIDETAG:
             adjust_pointers(where+1, 2, adj);
             // For most architectures, 'raw_addr' doesn't satisfy is_lisp_pointer()
@@ -438,12 +452,21 @@ static void relocate_space(uword_t start, lispobj* end, struct heap_adjust* adj)
             continue;
         case CODE_HEADER_WIDETAG:
             if (filler_obj_p(where)) {
+                // OMGWTF! Why does a filler code object merit adjustment?
                 if (where[2]) adjust_word_at(where+2, adj);
                 continue;
             }
             // Fixup the constant pool. The word at where+1 is a fixnum.
             code = (struct code*)where;
             adjust_pointers(where+2, code_header_words(code)-2, adj);
+#ifdef LISP_FEATURE_UNTAGGED_FDEFNS
+            // Process each untagged fdefn pointer.
+            lispobj* fdefns_start = code->constants + code_n_funs(code)
+              * CODE_SLOTS_PER_SIMPLE_FUN;
+            int i;
+            for (i=code_n_named_calls(code)-1; i>=0; --i)
+                adjust_word_at(fdefns_start+i, adj);
+#endif
 #if defined LISP_FEATURE_X86 || defined LISP_FEATURE_X86_64 || \
     defined LISP_FEATURE_PPC || defined LISP_FEATURE_PPC64
             // Fixup absolute jump table
@@ -522,7 +545,9 @@ static void relocate_space(uword_t start, lispobj* end, struct heap_adjust* adj)
         case COMPLEX_VECTOR_WIDETAG:
         case COMPLEX_ARRAY_WIDETAG:
         // And the rest of the purely descriptor objects.
+#ifndef LISP_FEATURE_COMPACT_SYMBOL
         case SYMBOL_WIDETAG:
+#endif
         case VALUE_CELL_WIDETAG:
         case WEAK_POINTER_WIDETAG:
         case RATIO_WIDETAG:
@@ -579,6 +604,7 @@ static void relocate_heap(struct heap_adjust* adj)
                         (char*)adj->range[i].start + adj->range[i].delta,
                         (char*)adj->range[i].end + adj->range[i].delta);
     }
+    relocate_space(NIL_SYMBOL_SLOTS_START, (lispobj*)NIL_SYMBOL_SLOTS_END, adj);
     relocate_space(STATIC_SPACE_OBJECTS_START, static_space_free_pointer, adj);
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
     relocate_space(FIXEDOBJ_SPACE_START, fixedobj_free_pointer, adj);
@@ -676,6 +702,21 @@ void calc_immobile_space_bounds()
 }
 #endif
 
+static void check_dynamic_space_addr_ok(uword_t start, uword_t size)
+{
+#ifdef LISP_FEATURE_64_BIT // don't want a -Woverflow warning on 32-bit
+    uword_t end_word_addr = start + size - N_WORD_BYTES;
+    // Word-aligned pointers can't address more than 48 significant bits for now.
+    // If you want to lift that restriction, look at how SYMBOL-PACKAGE and
+    // SYMBOL-NAME are combined into one lispword.
+    uword_t unaddressable_bits = 0xFFFF000000000000;
+    if ((start & unaddressable_bits) || (end_word_addr & unaddressable_bits))
+        lose("Panic! This version of SBCL can not address memory\n"
+             "in the range %p:%p given by the OS.\nPlease report this as a bug.",
+             (void*)start, (void*)(start + size));
+#endif
+}
+
 /* TODO: If static + readonly were mapped as desired without disabling ASLR
  * but one of the large spaces couldn't be mapped as desired, start over from
  * the top, disabling ASLR. This should help to avoid relocating the heap
@@ -722,10 +763,6 @@ process_directory(int count, struct ndir_entry *entry,
         {1, 0, VARYOBJ_SPACE_START, &varyobj_free_pointer}
 #endif
     };
-
-#ifdef LISP_FEATURE_DARWIN_JIT
-    static_code_space_free_pointer = (lispobj *)STATIC_CODE_SPACE_START;
-#endif
 
 #if ELFCORE
     if (&lisp_code_start) {
@@ -890,6 +927,7 @@ process_directory(int count, struct ndir_entry *entry,
                 if (aligned_start > addr) // not card-aligned
                     dynamic_space_size -= GENCGC_CARD_BYTES;
                 DYNAMIC_SPACE_START = addr = aligned_start;
+                check_dynamic_space_addr_ok(addr, dynamic_space_size);
                 }
 #endif
                 break;
@@ -986,13 +1024,17 @@ process_directory(int count, struct ndir_entry *entry,
 #ifdef LISP_FEATURE_X86_64
     tune_asm_routines_for_microarch(); // before WPing immobile space
 #endif
+#ifdef LISP_FEATURE_DARWIN_JIT
+    if (!static_code_space_free_pointer)
+        static_code_space_free_pointer = (lispobj *)STATIC_CODE_SPACE_START;
+#endif
 }
 
 #ifdef LISP_FEATURE_GENCGC
-extern void gc_load_corefile_ptes(core_entry_elt_t, core_entry_elt_t,
+extern void gc_load_corefile_ptes(int, core_entry_elt_t, core_entry_elt_t,
                                   os_vm_offset_t offset, int fd);
 #else
-#define gc_load_corefile_ptes(dummy1,dummy2,dummy3,dummy4)
+#define gc_load_corefile_ptes(dummy1,dummy2,dummy3,dummy4,dummy5)
 #endif
 
 static void sanity_check_loaded_core(lispobj);
@@ -1055,8 +1097,8 @@ load_core_file(char *file, os_vm_offset_t file_offset, int merge_core_pages)
                               merge_core_pages, &adj);
             break;
         case PAGE_TABLE_CORE_ENTRY_TYPE_CODE:
-            gc_load_corefile_ptes(ptr[0], ptr[1],
-                                  file_offset + (ptr[2] + 1) * os_vm_page_size, fd);
+            gc_load_corefile_ptes(ptr[0], ptr[1], ptr[2],
+                                  file_offset + (ptr[3] + 1) * os_vm_page_size, fd);
             break;
         case INITIAL_FUN_CORE_ENTRY_TYPE_CODE:
             initial_function = adjust_word(&adj, (lispobj)*ptr);
@@ -1103,7 +1145,7 @@ char* get_asm_routine_by_name(const char* name, int *index)
         for (i=2 ; i < vector_len(table) ; i += 2)
             if (lowtag_of(sym = table->data[i]) == OTHER_POINTER_LOWTAG
                 && widetag_of(&SYMBOL(sym)->header) == SYMBOL_WIDETAG
-                && !strcmp(name, (char*)(VECTOR(SYMBOL(sym)->name)->data))) {
+                && !strcmp(name, (char*)(symbol_name(SYMBOL(sym))->data))) {
                 lispobj value = table->data[i+1];
                 // value = (start-address . (end-address . index))
                 if (index)
@@ -1276,7 +1318,7 @@ static void sanity_check_loaded_core(lispobj initial_function)
       lispobj* end = static_space_free_pointer;
       while (where<end) {
         // This falsely treats NIL as 4 conses but it doesn't really matter.
-        // The garbage collectors do too.
+        // The garbage collector gets it right!
         graph_visit(0, compute_lispobj(where), &reached);
         where += OBJECT_SIZE(*where, where);
       }

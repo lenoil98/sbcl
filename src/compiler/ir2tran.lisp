@@ -40,43 +40,31 @@
 ;;;; leaf reference
 
 ;;; Return the TN that holds the value of THING in the environment ENV.
-(declaim (ftype (sfunction ((or nlx-info lambda-var clambda) physenv) tn)
-                find-in-physenv))
-(defun find-in-physenv (thing physenv)
-  (or (cdr (assoc thing (ir2-physenv-closure (physenv-info physenv))))
+(defun find-in-environment (thing env)
+  (declare (type (or nlx-info lambda-var clambda) thing) (type environment env)
+           #-sb-xc-host (values tn))
+  (or (cdr (assoc thing (ir2-environment-closure (environment-info env))))
       (etypecase thing
         (lambda-var
-         ;; I think that a failure of this assertion means that we're
-         ;; trying to access a variable which was improperly closed
-         ;; over. The PHYSENV describes a physical environment. Every
-         ;; variable that a form refers to should either be in its
-         ;; physical environment directly, or grabbed from a
-         ;; surrounding physical environment when it was closed over.
-         ;; The ASSOC expression above finds closed-over variables, so
-         ;; if we fell through the ASSOC expression, it wasn't closed
-         ;; over. Therefore, it must be in our physical environment
-         ;; directly. If instead it is in some other physical
-         ;; environment, then it's bogus for us to reference it here
-         ;; without it being closed over. -- WHN 2001-09-29
-         (aver (eq physenv (lambda-physenv (lambda-var-home thing))))
+         (aver (eq env (lambda-environment (lambda-var-home thing))))
          (leaf-info thing))
         (nlx-info
-         (aver (eq physenv (block-physenv (nlx-info-target thing))))
+         (aver (eq env (block-environment (nlx-info-target thing))))
          (ir2-nlx-info-home (nlx-info-info thing)))
         (clambda
          (aver (xep-p thing))
          (entry-info-closure-tn (lambda-info thing))))
-      (bug "~@<~2I~_~S ~_not found in ~_~S~:>" thing physenv)))
+      (bug "~@<~2I~_~S ~_not found in ~_~S~:>" thing env)))
 
 ;;; Return a TN that represents the value of LEAF, or NIL if LEAF
 ;;; isn't directly represented by a TN. ENV is the environment that
 ;;; the reference is done in.
 (defun leaf-tn (leaf env)
-  (declare (type leaf leaf) (type physenv env))
+  (declare (type leaf leaf) (type environment env))
   (typecase leaf
     (lambda-var
      (unless (lambda-var-indirect leaf)
-       (find-in-physenv leaf env)))
+       (find-in-environment leaf env)))
     (constant (make-constant-tn leaf))
     (t nil)))
 
@@ -95,15 +83,15 @@
          (res (first locs)))
     (etypecase leaf
       (lambda-var
-       (let ((tn (find-in-physenv leaf (node-physenv node)))
+       (let ((tn (find-in-environment leaf (node-environment node)))
              (indirect (lambda-var-indirect leaf))
              (explicit (lambda-var-explicit-value-cell leaf)))
          (cond
            ((and indirect explicit)
             (vop value-cell-ref node block tn res))
            ((and indirect
-                 (not (eq (node-physenv node)
-                          (lambda-physenv (lambda-var-home leaf)))))
+                 (not (eq (node-environment node)
+                          (lambda-environment (lambda-var-home leaf)))))
             (let ((reffer (third (primitive-type-indirect-cell-type
                                   (primitive-type (leaf-type leaf))))))
               (if reffer
@@ -145,7 +133,7 @@
        ;; But in the target, more caution is warranted because users might
        ;; DEFKNOWN a function but fail to define it. And they shouldn't be
        ;; expected to understand the failure mode and the remedy.
-       (cond ((and #-sb-xc-host (info :function :definition name)
+       (cond ((and #-sb-xc-host (find-fdefn name)
                    (info :function :info name)
                    (let ((*lexenv* (node-lexenv node)))
                      (not (fun-lexically-notinline-p name))))
@@ -170,13 +158,6 @@
 
 ;;; some sanity checks for a CLAMBDA passed to IR2-CONVERT-CLOSURE
 (defun assertions-on-ir2-converted-clambda (clambda)
-  ;; This assertion was sort of an experiment. It would be nice and
-  ;; sane and easier to understand things if it were *always* true,
-  ;; but experimentally I observe that it's only *almost* always
-  ;; true. -- WHN 2001-01-02
-  #+nil
-  (aver (eql (lambda-component clambda)
-             (block-component (ir2-block-block ir2-block))))
   ;; Check for some weirdness which came up in bug
   ;; 138, 2002-01-02.
   ;;
@@ -229,15 +210,15 @@
     (let ((closure (etypecase functional
                      (clambda
                       (assertions-on-ir2-converted-clambda functional)
-                      (physenv-closure (get-lambda-physenv functional)))
+                      (environment-closure (get-lambda-environment functional)))
                      (functional
                       (aver (eq (functional-kind functional) :toplevel-xep))
                       nil)))
           global-var)
       (cond (closure
              (prepare)
-             (let* ((physenv (node-physenv ref))
-                    (tn (find-in-physenv functional physenv)))
+             (let* ((this-env (node-environment ref))
+                    (tn (find-in-environment functional this-env)))
                (emit-move ref ir2-block tn res)))
             ;; we're about to emit a reference to a "closure" that's actually
             ;; an inlinable global function.
@@ -257,7 +238,7 @@
 
 (defun closure-initial-value (what this-env current-fp)
   (declare (type (or nlx-info lambda-var clambda) what)
-           (type physenv this-env)
+           (type environment this-env)
            (type (or tn null) current-fp))
   ;; If we have an indirect LAMBDA-VAR that does not require an
   ;; EXPLICIT-VALUE-CELL, and is from this environment (not from being
@@ -265,10 +246,10 @@
   (if (and (lambda-var-p what)
            (lambda-var-indirect what)
            (not (lambda-var-explicit-value-cell what))
-           (eq (lambda-physenv (lambda-var-home what))
+           (eq (lambda-environment (lambda-var-home what))
                this-env))
     current-fp
-    (find-in-physenv what this-env)))
+    (find-in-environment what this-env)))
 
 ;;; Emit code to create function objects implementing the FUNCTIONALs
 ;;; of the enclose node. This gets interesting when the functions are
@@ -292,13 +273,13 @@
           ;; If there is no XEP then no closure needs to be created.
           (when (and xep (not (eq (functional-kind xep) :deleted)))
             (aver (xep-p xep))
-            (let ((closure (physenv-closure (get-lambda-physenv xep))))
+            (let ((closure (environment-closure (get-lambda-environment xep))))
               (when closure
                 (let* ((entry-info (lambda-info xep))
                        (tn (entry-info-closure-tn entry-info))
                        #-x86-64
                        (entry (make-load-time-constant-tn :entry xep))
-                       (env (node-physenv node))
+                       (env (node-environment node))
                        (leaf-dx-p (and lvar (leaf-dynamic-extent fun))))
                   (aver (entry-info-offset entry-info))
                   (vop make-closure node ir2-block #-x86-64 entry
@@ -308,7 +289,7 @@
                     (unless (and (lambda-var-p what)
                                  (null (leaf-refs what)))
                       (if (lambda-p what)
-                          (delayed (list tn (find-in-physenv what env) n))
+                          (delayed (list tn (find-in-environment what env) n))
                           (let ((initial-value (closure-initial-value what env nil)))
                             (if initial-value
                                 (vop closure-init node ir2-block tn initial-value n)
@@ -335,15 +316,15 @@
     (etypecase leaf
       (lambda-var
        (when (leaf-refs leaf)
-         (let ((tn (find-in-physenv leaf (node-physenv node)))
+         (let ((tn (find-in-environment leaf (node-environment node)))
                (indirect (lambda-var-indirect leaf))
                (explicit (lambda-var-explicit-value-cell leaf)))
            (cond
             ((and indirect explicit)
              (vop value-cell-set node block tn val))
             ((and indirect
-                  (not (eq (node-physenv node)
-                           (lambda-physenv (lambda-var-home leaf)))))
+                  (not (eq (node-environment node)
+                           (lambda-environment (lambda-var-home leaf)))))
              (let ((setter (fourth (primitive-type-indirect-cell-type
                                     (primitive-type (leaf-type leaf))))))
              (if setter
@@ -383,7 +364,7 @@
           (ecase (ir2-lvar-kind 2lvar)
             (:delayed
              (let ((ref (lvar-uses lvar)))
-               (leaf-tn (ref-leaf ref) (node-physenv ref))))
+               (leaf-tn (ref-leaf ref) (node-environment ref))))
             (:fixed
              (aver (= (length (ir2-lvar-locs 2lvar)) 1))
              (first (ir2-lvar-locs 2lvar)))))
@@ -464,7 +445,9 @@
                          for i from 0
                          for loc = (pop locs)
                          collect (cond ((and loc
-                                             (eq (tn-primitive-type loc) prim-type))
+                                             (if (eq (tn-kind loc) :unused)
+                                                 (member i optional)
+                                                 (eq (tn-primitive-type loc) prim-type)))
                                         loc)
                                        ((and (not loc)
                                              (member i optional))
@@ -546,13 +529,14 @@
                (move-results-coerced node block results locs))))
           (:unknown
            (let ((locs (loop for tn in results
-                             collect (cond #+(or x86 x86-64)
+                             collect (cond #+(or x86 x86-64 arm64)
                                            ((eq (tn-kind tn) :constant)
                                             tn)
                                            ((and
-                                             #-(or x86 x86-64)
+                                             #-(or x86 x86-64 arm64)
                                              (neq (tn-kind tn) :constant)
-                                             (eq (tn-primitive-type tn) *backend-t-primitive-type*))
+                                             (equal (primitive-type-scs (tn-primitive-type tn))
+                                                    `(,sb-vm:descriptor-reg-sc-number)))
                                             tn)
                                            ((let ((new (make-normal-tn *backend-t-primitive-type*)))
                                               (emit-move node block tn new)
@@ -571,7 +555,7 @@
              (2lvar (lvar-info lvar))
              (value (cast-value node))
              (2value (lvar-info value)))
-    (when 2lvar ;; the cast can be unused but not deleted to due vestigial exits
+    (when 2lvar ;; the cast can be unused but not deleted due to DELAY
       (ecase (ir2-lvar-kind 2lvar)
         (:unused)
         ((:unknown :fixed)
@@ -771,10 +755,14 @@
 
 (defoptimizer (%%primitive derive-type) ((template info &rest args))
   (declare (ignore info args))
-  (let ((type (template-type (gethash (lvar-value template) *backend-template-names*))))
-    (if (fun-type-p type)
-        (fun-type-returns type)
-        *wild-type*)))
+  (let* ((template (gethash (lvar-value template) *backend-template-names*))
+         (type (template-type template)))
+    (cond ((zerop (vop-info-num-results template))
+           (values-specifier-type '(values &optional)))
+          ((fun-type-p type)
+           (fun-type-returns type))
+          (t
+           *wild-type*))))
 
 ;;;; local call
 
@@ -843,10 +831,10 @@
             (locs loc))))
 
       (when old-fp
-        (let ((this-1env (node-physenv node))
-              (called-env (physenv-info (lambda-physenv fun)))
+        (let ((this-1env (node-environment node))
+              (called-env (environment-info (lambda-environment fun)))
               passed)
-          (dolist (thing (ir2-physenv-closure called-env))
+          (dolist (thing (ir2-environment-closure called-env))
             (let ((value (closure-initial-value (car thing) this-1env closure-fp))
                   (loc (cdr thing)))
               ;; Don't pass the FP for indirect variables multiple times
@@ -855,7 +843,7 @@
                 (temps value)
                 (locs loc))))
           (temps old-fp)
-          (locs (ir2-physenv-old-fp called-env))))
+          (locs (ir2-environment-old-fp called-env))))
 
       (values (temps) (locs)))))
 
@@ -865,11 +853,11 @@
 ;;; function's passing location.
 (defun ir2-convert-tail-local-call (node block fun)
   (declare (type combination node) (type ir2-block block) (type clambda fun))
-  (let ((this-env (physenv-info (node-physenv node)))
+  (let ((this-env (environment-info (node-environment node)))
         (current-fp (make-stack-pointer-tn)))
     (multiple-value-bind (temps locs)
         (emit-psetq-moves node block fun
-                          (ir2-physenv-old-fp this-env) current-fp)
+                          (ir2-environment-old-fp this-env) current-fp)
 
       ;; If we're about to emit a move from CURRENT-FP then we need to
       ;; initialize it.
@@ -879,12 +867,12 @@
       (mapc (lambda (temp loc)
               (emit-move node block temp loc))
             temps locs))
-
+    #-fp-and-pc-standard-save
     (emit-move node block
-               (ir2-physenv-return-pc this-env)
-               (ir2-physenv-return-pc-pass
-                (physenv-info
-                 (lambda-physenv fun)))))
+               (ir2-environment-return-pc this-env)
+               (ir2-environment-return-pc-pass
+                (environment-info
+                 (lambda-environment fun)))))
 
   (values))
 
@@ -919,7 +907,7 @@
         (emit-psetq-moves node block fun old-fp)
       (vop current-fp node block old-fp)
       (vop allocate-frame node block
-           (physenv-info (lambda-physenv fun))
+           (environment-info (lambda-environment fun))
            fp nfp)
       (values fp nfp temps (mapcar #'make-alias-tn locs)))))
 
@@ -935,7 +923,7 @@
       (vop* known-call-local node block
             (fp nfp (reference-tn-list temps nil))
             ((reference-tn-list locs t))
-            arg-locs (physenv-info (lambda-physenv fun)) start)
+            arg-locs (environment-info (lambda-environment fun)) start)
       (move-lvar-result node block locs lvar)))
   (values))
 
@@ -955,7 +943,7 @@
   (multiple-value-bind (fp nfp temps arg-locs)
       (ir2-convert-local-call-args node block fun)
     (let ((2lvar (and lvar (lvar-info lvar)))
-          (env (physenv-info (lambda-physenv fun)))
+          (env (environment-info (lambda-environment fun)))
           (temp-refs (reference-tn-list temps nil)))
       (if (and 2lvar (eq (ir2-lvar-kind 2lvar) :unknown))
           (vop* multiple-call-local node block (fp nfp temp-refs)
@@ -1062,12 +1050,12 @@
 ;;; named) tail call.
 (defun ir2-convert-tail-full-call (node block)
   (declare (type combination node) (type ir2-block block))
-  (let* ((env (physenv-info (node-physenv node)))
+  (let* ((env (environment-info (node-environment node)))
          (args (basic-combination-args node))
          (nargs (length args))
          (pass-refs (move-tail-full-call-args node block))
-         (old-fp (ir2-physenv-old-fp env))
-         (return-pc (ir2-physenv-return-pc env))
+         (old-fp (ir2-environment-old-fp env))
+         (return-pc (ir2-environment-return-pc env))
          (fun-lvar (basic-combination-fun node)))
     (multiple-value-bind (fun-tn named)
         (fun-lvar-tn node block fun-lvar)
@@ -1332,7 +1320,7 @@
 (defun init-xep-environment (node block fun)
   (declare (type bind node) (type ir2-block block) (type clambda fun))
   (let ((start-label (entry-info-offset (leaf-info fun)))
-        (env (physenv-info (node-physenv node)))
+        (env (environment-info (node-environment node)))
         arg-count-tn)
     (let ((ef (functional-entry-fun fun)))
       (vop xep-allocate-frame node block start-label)
@@ -1359,7 +1347,7 @@
                    #+x86-64 verified))
              (t
               (vop xep-setup-sp node block))))
-      (when (ir2-physenv-closure env)
+      (when (ir2-environment-closure env)
         (let ((closure (make-normal-tn *backend-t-primitive-type*)))
           (when (policy fun (> store-closure-debug-pointer 1))
             ;; Save the closure pointer on the stack.
@@ -1368,11 +1356,11 @@
                                            sb-vm:control-stack-sc-number)))
               (vop setup-closure-environment node block start-label
                    closure-save)
-              (setf (ir2-physenv-closure-save-tn env) closure-save)
+              (setf (ir2-environment-closure-save-tn env) closure-save)
               (component-live-tn closure-save)))
           (vop setup-closure-environment node block start-label closure)
           (let ((n -1))
-            (dolist (loc (ir2-physenv-closure env))
+            (dolist (loc (ir2-environment-closure env))
               (vop closure-ref node block closure (incf n) (cdr loc)))))))
     (unless (eq (functional-kind fun) :toplevel)
       (let ((vars (lambda-vars fun))
@@ -1388,9 +1376,9 @@
                   (emit-make-value-cell node block pass home)
                   (emit-move node block pass home))))
           (incf n))))
-
+    #-fp-and-pc-standard-save
     (emit-move node block (make-old-fp-passing-location)
-               (ir2-physenv-old-fp env)))
+               (ir2-environment-old-fp env)))
 
   (values))
 
@@ -1416,18 +1404,16 @@
   ;;
   ;; It could be saved from the XEP, but some functions have both
   ;; external and internal entry points, so it will be saved twice.
-  (let ((temp (make-normal-tn *backend-t-primitive-type*))
-        (bsp-save-tn (make-representation-tn *backend-t-primitive-type*
+  (let ((bsp-save-tn (make-representation-tn *backend-t-primitive-type*
                                              sb-vm:control-stack-sc-number)))
-    (vop current-binding-pointer node block temp)
-    (emit-move node block temp bsp-save-tn)
-    (setf (ir2-physenv-bsp-save-tn env) bsp-save-tn)
+    (vop current-binding-pointer node block bsp-save-tn)
+    (setf (ir2-environment-bsp-save-tn env) bsp-save-tn)
     (component-live-tn bsp-save-tn)))
 
 (defun ir2-convert-bind (node block)
   (declare (type bind node) (type ir2-block block))
   (let* ((fun (bind-lambda node))
-         (env (physenv-info (lambda-physenv fun))))
+         (env (environment-info (lambda-environment fun))))
     (aver (member (functional-kind fun)
                   '(nil :external :optional :toplevel :cleanup)))
 
@@ -1443,10 +1429,10 @@
            ;; handles closures inside closures correctly). [remark by JES]
            (let* ((entry-fun (lambda-entry-fun fun)))
              (when entry-fun
-               (let ((2env (physenv-info (lambda-physenv fun)))
-                     (entry-2env (physenv-info (lambda-physenv entry-fun))))
-                 (setf (ir2-physenv-closure-save-tn 2env)
-                       (ir2-physenv-closure-save-tn entry-2env)))))))
+               (let ((2env (environment-info (lambda-environment fun)))
+                     (entry-2env (environment-info (lambda-environment entry-fun))))
+                 (setf (ir2-environment-closure-save-tn 2env)
+                       (ir2-environment-closure-save-tn entry-2env)))))))
     #-fp-and-pc-standard-save
     (let ((lab (gen-label)))
       ;; KLUDGE: Technically, we should be doing this before VOP
@@ -1454,16 +1440,17 @@
       ;; expected to work anyway, so there's no real window to worry
       ;; about.
       (vop emit-label node block lab)
-      (setf (ir2-physenv-cfp-saved-pc env) lab))
+      (setf (ir2-environment-cfp-saved-pc env) lab))
 
+    #-fp-and-pc-standard-save
     (emit-move node
                block
-               (ir2-physenv-return-pc-pass env)
-               (ir2-physenv-return-pc env))
+               (ir2-environment-return-pc-pass env)
+               (ir2-environment-return-pc env))
     #-fp-and-pc-standard-save
     (let ((lab (gen-label)))
       (vop emit-label node block lab)
-      (setf (ir2-physenv-lra-saved-pc env) lab))
+      (setf (ir2-environment-lra-saved-pc env) lab))
 
     #+unwind-to-frame-and-call-vop
     (when (and (lambda-allow-instrumenting fun)
@@ -1472,7 +1459,7 @@
       (save-bsp node block env))
 
     (let ((lab (gen-label)))
-      (setf (ir2-physenv-environment-start env) lab)
+      (setf (ir2-environment-environment-start env) lab)
       (vop note-environment-start node block lab)
       #+sb-safepoint
       (when (policy fun (/= insert-safepoints 0))
@@ -1495,9 +1482,9 @@
          (2lvar (lvar-info lvar))
          (lvar-kind (ir2-lvar-kind 2lvar))
          (fun (return-lambda node))
-         (env (physenv-info (lambda-physenv fun)))
-         (old-fp (ir2-physenv-old-fp env))
-         (return-pc (ir2-physenv-return-pc env))
+         (env (environment-info (lambda-environment fun)))
+         (old-fp (ir2-environment-old-fp env))
+         (return-pc (ir2-environment-return-pc env))
          (returns (tail-set-info (lambda-tail-set fun))))
     (cond
      ((and (eq (return-info-kind returns) :fixed)
@@ -1539,15 +1526,15 @@
 ;;;; function as multiple values.
 
 (defoptimizer (%caller-frame ir2-convert) (() node block)
-  (let ((ir2-physenv (physenv-info (node-physenv node))))
+  (let ((ir2-environment (environment-info (node-environment node))))
     (move-lvar-result node block
-                      (list (ir2-physenv-old-fp ir2-physenv))
+                      (list (ir2-environment-old-fp ir2-environment))
                       (node-lvar node))))
 
 (defoptimizer (%caller-pc ir2-convert) (() node block)
-  (let ((ir2-physenv (physenv-info (node-physenv node))))
+  (let ((ir2-environment (environment-info (node-environment node))))
     (move-lvar-result node block
-                      (list (ir2-physenv-return-pc ir2-physenv))
+                      (list (ir2-environment-return-pc ir2-environment))
                       (node-lvar node))))
 
 ;;;; multiple values
@@ -1608,10 +1595,10 @@
                  (eq (ir2-lvar-kind start-lvar) :unknown)))
       (cond
        (tails
-        (let ((env (physenv-info (node-physenv node))))
+        (let ((env (environment-info (node-environment node))))
           (vop tail-call-variable node block start fun
-               (ir2-physenv-old-fp env)
-               (ir2-physenv-return-pc env)
+               (ir2-environment-old-fp env)
+               (ir2-environment-return-pc env)
                #+call-symbol
                (fun-tn-type fun-lvar fun))))
        ((and 2lvar
@@ -1729,6 +1716,9 @@ not stack-allocated LVAR ~S." source-lvar)))))
              (ir2-convert-full-call node block)))))
 
 (defoptimizer (%more-arg-values ir2-convert) ((context start count) node block)
+  ;; Slime is still using that argument
+  (aver (and (constant-lvar-p start)
+             (eql (lvar-value start) 0)))
   (binding* ((lvar (node-lvar node) :exit-if-null)
              (2lvar (lvar-info lvar)))
     (ecase (ir2-lvar-kind 2lvar)
@@ -1736,21 +1726,15 @@ not stack-allocated LVAR ~S." source-lvar)))))
        (loop for loc in (ir2-lvar-locs 2lvar)
              for idx upfrom 0
              unless (eq (tn-kind loc) :unused)
-             do (if-vop-existsp (:named sb-vm::more-arg-or-nil)
-                    (vop sb-vm::more-arg-or-nil node block
-                         (lvar-tn node block context)
-                         (lvar-tn node block count)
-                         idx
-                         loc)
-                    (vop sb-vm::more-arg node block
-                         (lvar-tn node block context)
-                         (emit-constant idx)
-                         loc))))
+             do (vop sb-vm::more-arg-or-nil node block
+                     (lvar-tn node block context)
+                     (lvar-tn node block count)
+                     idx
+                     loc)))
       (:unknown
        (let ((locs (ir2-lvar-locs 2lvar)))
          (vop* %more-arg-values node block
                ((lvar-tn node block context)
-                (lvar-tn node block start)
                 (lvar-tn node block count)
                 nil)
                ((reference-tn-list locs t))))))))
@@ -1847,7 +1831,7 @@ not stack-allocated LVAR ~S." source-lvar)))))
 (defun ir2-convert-exit (node block)
   (declare (type exit node) (type ir2-block block))
   (let* ((nlx (exit-nlx-info node))
-         (loc (find-in-physenv nlx (node-physenv node)))
+         (loc (find-in-environment nlx (node-environment node)))
          (temp (make-stack-pointer-tn))
          (value (exit-value node)))
     (if (nlx-info-safe-p nlx)
@@ -1855,7 +1839,10 @@ not stack-allocated LVAR ~S." source-lvar)))))
         (emit-move node block loc temp))
     (if value
         (let ((locs (ir2-lvar-locs (lvar-info value))))
-          (vop unwind node block temp (first locs) (second locs)))
+          (vop unwind node block temp (first locs)
+               (or (second locs)
+                   ;; FIXME: avoid writing this TN
+                   (emit-constant 0))))
         (let ((0-tn (emit-constant 0)))
           (vop unwind node block temp 0-tn 0-tn))))
 
@@ -1872,7 +1859,7 @@ not stack-allocated LVAR ~S." source-lvar)))))
   (let ((nlx (lvar-value info)))
     (when (nlx-info-safe-p nlx)
       (vop value-cell-set node block
-           (find-in-physenv nlx (node-physenv node))
+           (find-in-environment nlx (node-environment node))
            (emit-constant 0)))))
 
 ;;; We have to do a spurious move of no values to the result lvar so
@@ -1975,9 +1962,10 @@ not stack-allocated LVAR ~S." source-lvar)))))
   (let* ((info (lvar-value info-lvar))
          (lvar (node-lvar node))
          (2info (nlx-info-info info))
-         (target (ir2-nlx-info-target 2info)))
+         (target (ir2-nlx-info-target 2info))
+         (kind (cleanup-kind (nlx-info-cleanup info))))
 
-    (ecase (cleanup-kind (nlx-info-cleanup info))
+    (ecase kind
       ((:catch :block :tagbody)
        (let ((top-loc (ir2-nlx-info-save-sp 2info))
              (start-loc (make-nlx-entry-arg-start-location))
@@ -1989,11 +1977,19 @@ not stack-allocated LVAR ~S." source-lvar)))))
                    ((reference-tn-list (ir2-lvar-locs 2lvar) t))
                    target)
              (let ((locs (standard-result-tns lvar)))
-               (vop* nlx-entry node block
-                     (top-loc start-loc count-loc nil)
-                     ((reference-tn-list locs t))
-                     target
-                     (length locs))
+               (if (and (= (length locs) 1)
+                        (memq kind '(:block :tagbody))
+                        lvar
+                        (lvar-single-value-p lvar))
+                   (vop* nlx-entry-single node block
+                         (top-loc start-loc nil)
+                         ((reference-tn-list locs t))
+                         target)
+                   (vop* nlx-entry node block
+                         (top-loc start-loc count-loc nil)
+                         ((reference-tn-list locs t))
+                         target
+                         (length locs)))
                (move-lvar-result node block locs lvar)))))
       #-no-continue-unwind
       ((:unwind-protect)
@@ -2036,53 +2032,69 @@ not stack-allocated LVAR ~S." source-lvar)))))
 
 ;;;; n-argument functions
 
-(macrolet ((def (name)
-             `(defoptimizer (,name ir2-convert) ((&rest args) node block)
-                (cond #+gencgc
-                      ((>= (length args)
-                           (/ sb-vm:large-object-size
-                              (* sb-vm:n-word-bytes 2)))
-                       ;; The VOPs will try to allocate all space at once
-                       ;; And it'll end up in large objects, and no conses
-                       ;; are welcome there.
-                       (ir2-convert-full-call node block))
-                      (t
-                       (let* ((scs
-                               (operand-parse-scs
-                                (vop-parse-more-args
-                                 (gethash 'list *backend-parsed-vops*))))
-                              (allow-const
-                               ;; Make sure the backend allows both of IMMEDIATE
-                               ;; and CONSTANT since MAKE-CONSTANT-TN could produce either.
-                               (and (member 'sb-vm::constant scs)
-                                    (member 'sb-vm::immediate scs)
-                                    ;; FIXME: this is terribly wrong that in high debug
-                                    ;; settings we can't allow constants at the IR2 level.
-                                    ;; But two UNWIND-TO-FRAME-AND-CALL tests fail when
-                                    ;; constants are allowed. Somehow we're affecting
-                                    ;; semantics. It's baffling.
-                                    (policy node (< debug 3))))
-                              (refs (reference-tn-list
-                                     (loop for arg in args
-                                           for tn = (make-normal-tn *backend-t-primitive-type*)
-                                           do
-                                           (cond ((and allow-const (constant-lvar-p arg))
-                                                  (setq tn (emit-constant (lvar-value arg))))
-                                                 (t
-                                                  (emit-move node block (lvar-tn node block arg) tn)))
-                                           collect tn)
-                                     nil))
-                              (lvar (node-lvar node))
-                              (res (lvar-result-tns
-                                    lvar (list (specifier-type 'list)))))
-                         (when (and lvar (lvar-dynamic-extent lvar))
-                           (vop current-stack-pointer node block
-                                (ir2-lvar-stack-pointer (lvar-info lvar))))
-                         (vop* ,name node block (refs) ((first res) nil)
-                               (length args))
-                         (move-lvar-result node block res lvar)))))))
-  (def list)
-  (def list*))
+(defoptimizer (list ir2-convert) ((&rest args) node block)
+  (let* ((fun (lvar-fun-name (combination-fun node)))
+         (star (ecase fun (list* t) (list nil))))
+    ;; LIST needs at least 1 arg, LIST* demands at least 2 args
+    (aver (if star (cdr args) args))
+    ;; This used to convert as a full call to LIST or LIST* when n-cons-cell exceeded a threshold
+    ;; which could confuse GC (see the :NO-CONSES-ON-LARGE-OBJECT-PAGES regression test).
+    ;; It's no longer required to special-case that situation.
+    ;; Nonetheless, beyond a certain length, it might make sense to do a full call anyway,
+    ;; because there's little to be gained by inlining all the stores - the generated code size
+    ;; grows at a rate faster than pushing more stack arguments - but because MAKE-LIST avoids
+    ;; allocating as one huge chunk (instead, doing a cons at a time), in theory it can better
+    ;; utilize free memory. But really, if you have a statically written LIST call with so many
+    ;; args that it exhausts the heap, you should probably rethink your coding style.
+    (let* ((allow-const
+            ;; The backend either does or doesn't allow constants in the "more" arg.
+            ;; Determine that once only. Only x86-64 specifies any SCs as yet.
+            (and #.(let ((scs
+                          (operand-parse-scs
+                           (vop-parse-more-args (gethash 'list *backend-parsed-vops*)))))
+                     ;; MAKE-CONSTANT-TN could produce either SC, so ensure both are present.
+                     (and (member 'sb-vm::constant scs)
+                          (member 'sb-vm::immediate scs)
+                          t))
+                 ;; FIXME: this is terribly wrong that in high debug
+                 ;; settings we can't allow constants at the IR2 level.
+                 ;; But two UNWIND-TO-FRAME-AND-CALL tests fail when
+                 ;; constants are allowed. Somehow we're affecting
+                 ;; semantics. It's baffling.
+                 (policy node (< debug 3))))
+           (refs (reference-tn-list
+                  (mapcar (lambda (arg)
+                            (cond ((and allow-const (constant-lvar-p arg))
+                                   (emit-constant (lvar-value arg)))
+                                  (t
+                                   (let ((tn (make-normal-tn *backend-t-primitive-type*)))
+                                     (emit-move node block (lvar-tn node block arg) tn)
+                                     tn))))
+                          args)
+                  nil))
+           (lvar (node-lvar node))
+           (res (lvar-result-tns lvar (list (specifier-type 'list))))
+           (num-conses (- (length args) (if star 1 0))))
+      (when (and lvar (lvar-dynamic-extent lvar))
+        (vop current-stack-pointer node block (ir2-lvar-stack-pointer (lvar-info lvar))))
+      ;;; This COND-like expression is unfortunate, but the VOP* macro chokes if the name
+      ;;; doesn't exist. This was the best workaround I found, short of using #+.
+      (or (when-vop-existsp (:named cons)
+            (when (= num-conses 1)
+              (unless star
+                (setf (tn-ref-across refs) (reference-tn (emit-constant nil) nil)))
+              (vop* cons node block (refs) ((first res) nil))
+              t))
+          (when-vop-existsp (:named sb-vm::cons-2)
+            (when (= num-conses 2)
+              (unless star
+                (setf (tn-ref-across (tn-ref-across refs))
+                      (reference-tn (emit-constant nil) nil)))
+              (vop* sb-vm::cons-2 node block (refs) ((first res) nil))
+              t))
+          (vop* list node block (refs) ((first res) nil) star num-conses))
+      (move-lvar-result node block res lvar))))
+(setf (fun-info-ir2-convert (fun-info-or-lose 'list*)) #'list-ir2-convert-optimizer)
 
 
 (defoptimizer (mask-signed-field ir2-convert) ((width x) node block)

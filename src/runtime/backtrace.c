@@ -121,12 +121,35 @@ lispobj debug_print(lispobj string)
     return 0;
 }
 
-static int string_equal (struct vector *vector, char *string)
+lispobj symbol_package(struct symbol* s)
 {
-    if (widetag_of(&vector->header) != SIMPLE_BASE_STRING_WIDETAG)
-        return 0;
-    return !strcmp((char *) vector->data, string);
+#ifdef LISP_FEATURE_COMPACT_SYMBOL
+    static int warned;
+    // if using ldb when debugging cold-init, this can be confusing to see all symbols
+    // as if they were uninterned
+    if (!lisp_package_vector) {
+        if (!warned) {
+          fprintf(stderr, "Warning: package vector has not been initialized yet\n");
+          warned = 1;
+        }
+        return NIL;
+    }
+    struct vector* v = VECTOR(lisp_package_vector);
+    int id = symbol_package_id(s);
+    if (id < fixnum_value(v->length_)) return v->data[id];
+    lose("can't decode package ID %d", id);
+#else
+    return s->package;
+#endif
 }
+
+#ifndef LISP_FEATURE_COMPACT_SYMBOL
+static int symbol_package_id(struct symbol* s) {
+    lispobj pkg = s->package;
+    if (pkg == NIL) return PACKAGE_ID_NONE;
+    return fixnum_value(((struct package*)native_pointer(pkg))->id);
+}
+#endif
 
 static void
 print_entry_name (lispobj name, FILE *f)
@@ -148,26 +171,24 @@ print_entry_name (lispobj name, FILE *f)
         putc(')', f);
     } else if (lowtag_of(name) == OTHER_POINTER_LOWTAG) {
         struct symbol *symbol = SYMBOL(name);
+        char* prefix = 0;
         int widetag = header_widetag(symbol->header);
         switch (widetag) {
         case SYMBOL_WIDETAG:
-            if (symbol->package != NIL) {
-                struct package *pkg
-                    = (struct package *) native_pointer(follow_maybe_fp(symbol->package));
-                struct vector *pkg_name = VECTOR(follow_maybe_fp(pkg->_name));
-                if (string_equal(pkg_name, "COMMON-LISP"))
-                    ;
-                else if (string_equal(pkg_name, "COMMON-LISP-USER")) {
-                    fputs("CL-USER::", f);
-                }
-                else if (string_equal(pkg_name, "KEYWORD")) {
-                    putc(':', f);
-                } else {
-                    print_string(pkg_name, f);
-                    fputs("::", f);
-                }
+            switch (symbol_package_id(symbol)) {
+            case PACKAGE_ID_NONE: prefix = "#:"; break;
+            case PACKAGE_ID_LISP: prefix = ""; break;
+            case PACKAGE_ID_USER: prefix = "CL-USER::"; break;
+            case PACKAGE_ID_KEYWORD: prefix = ":"; break;
             }
-            print_string(VECTOR(follow_maybe_fp(symbol->name)), f);
+            if (prefix) fputs(prefix, f); else {
+                struct package *pkg
+                    = (struct package *)native_pointer(symbol_package(symbol));
+                struct vector *pkg_name = VECTOR(follow_maybe_fp(pkg->_name));
+                print_string(pkg_name, f);
+                fputs("::", f);
+            }
+            print_string(symbol_name(symbol), f);
             break;
         case SIMPLE_BASE_STRING_WIDETAG:
 #ifdef SIMPLE_CHARACTER_STRING_WIDETAG

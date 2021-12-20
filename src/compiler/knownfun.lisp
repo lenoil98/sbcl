@@ -50,7 +50,9 @@
                         (funcall 'sb-pcl::fun-doc (transform-function transform)))
       "optimize"))
 
-(defprinter (transform) type note important)
+(defmethod print-object ((x transform) stream)
+  (print-unreadable-object (x stream :type t :identity t)
+    (princ (type-specifier (transform-type x)) stream)))
 
 ;;; Grab the FUN-INFO and enter the function, replacing any old
 ;;; one with the same type and note.
@@ -87,35 +89,39 @@
                             (type-specifier ctype)
                             ctype)))
     (dolist (name names)
-      (unless overwrite-fndb-silently
-        (let ((old-fun-info (info :function :info name)))
-          (when old-fun-info
-            ;; This is handled as an error because it's generally a bad
-            ;; thing to blow away all the old optimization stuff. It's
-            ;; also a potential source of sneaky bugs:
-            ;;    DEFKNOWN FOO
-            ;;    DEFTRANSFORM FOO
-            ;;    DEFKNOWN FOO ; possibly hidden inside some macroexpansion
-            ;;    ; Now the DEFTRANSFORM doesn't exist in the target Lisp.
-            ;; However, it's continuable because it might be useful to do
-            ;; it when testing new optimization stuff interactively.
-            (cerror "Go ahead, overwrite it."
-                    "~@<overwriting old FUN-INFO ~2I~_~S ~I~_for ~S~:>"
-                    old-fun-info name))))
-      (setf (info :function :type name) type-to-store)
-      (setf (info :function :where-from name) :declared)
-      (setf (info :function :kind name) :function)
-      (setf (info :function :info name)
-            (make-fun-info :attributes attributes
-                           :derive-type derive-type
-                           :optimizer optimizer
-                           :result-arg result-arg
-                           :call-type-deriver call-type-deriver
-                           :annotation annotation))
-      (if location
-          (setf (getf (info :source-location :declaration name) 'defknown)
-                location)
-          (remf (info :source-location :declaration name) 'defknown))))
+      (block ignore
+        (unless overwrite-fndb-silently
+          (let ((old-fun-info (info :function :info name)))
+            (when old-fun-info
+              ;; This is handled as an error because it's generally a bad
+              ;; thing to blow away all the old optimization stuff. It's
+              ;; also a potential source of sneaky bugs:
+              ;;    DEFKNOWN FOO
+              ;;    DEFTRANSFORM FOO
+              ;;    DEFKNOWN FOO ; possibly hidden inside some macroexpansion
+              ;;    ; Now the DEFTRANSFORM doesn't exist in the target Lisp.
+              ;; However, it's continuable because it might be useful to do
+              ;; it when testing new optimization stuff interactively.
+              (restart-case
+                  (cerror "Go ahead, overwrite it."
+                          "~@<overwriting old FUN-INFO ~2I~_~S ~I~_for ~S~:>"
+                          old-fun-info name)
+                (ignore ()
+                  (return-from ignore))))))
+        (setf (info :function :type name) type-to-store)
+        (setf (info :function :where-from name) :declared)
+        (setf (info :function :kind name) :function)
+        (setf (info :function :info name)
+              (make-fun-info :attributes attributes
+                             :derive-type derive-type
+                             :optimizer optimizer
+                             :result-arg result-arg
+                             :call-type-deriver call-type-deriver
+                             :annotation annotation))
+        (if location
+            (setf (getf (info :source-location :declaration name) 'defknown)
+                  location)
+            (remf (info :source-location :declaration name) 'defknown)))))
   names)
 
 
@@ -483,7 +489,16 @@
                            (pop required)
                            (type-intersection
                             (pop required)
-                            (specifier-type `(array * ,(length args)))))
+                            (let ((rank (length args)))
+                              (when (>= rank array-rank-limit)
+                                (setf (combination-kind call) :error)
+                                (compiler-warn "More subscripts for ~a (~a) than ~a (~a)"
+                                               (combination-fun-debug-name call)
+                                               rank
+                                               'array-rank-limit
+                                               array-rank-limit)
+                                (return-from array-call-type-deriver))
+                              (specifier-type `(array * ,rank)))))
                        set)
           (loop for type in required
                 do

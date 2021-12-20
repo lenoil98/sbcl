@@ -18,13 +18,11 @@
 
 ;;; Map of code-component -> list of PC offsets at which allocations occur.
 ;;; This table is needed in order to enable allocation profiling.
-(define-load-time-global *allocation-point-fixups*
+(define-load-time-global *allocation-patch-points*
   (make-hash-table :test 'eq :weakness :key :synchronized t))
 
 #-x86-64
 (progn
-(defun convert-alloc-point-fixups (dummy1 dummy2)
-  (declare (ignore dummy1 dummy2)))
 (defun sb-vm::statically-link-code-obj (code fixups)
   (declare (ignore code fixups))))
 
@@ -73,59 +71,64 @@
                   (* sb-vm:simple-fun-self-slot sb-vm:n-word-bytes))
                (get-lisp-obj-address self))))
 
-(flet ((fixup (code-obj offset sym kind flavor preserved-lists statically-link-p)
+(flet ((fixup (code-obj offset name kind flavor preserved-lists statically-link-p)
          (declare (ignorable statically-link-p))
+         ;; NAME depends on the kind and flavor of fixup.
          ;; PRESERVED-LISTS is a vector of lists of locations (by kind)
          ;; at which fixup must be re-applied after code movement.
          ;; CODE-OBJ must already be pinned in order to legally call this.
          ;; One call site that reaches here is below at MAKE-CORE-COMPONENT
          ;; and the other is LOAD-CODE, both of which pin the code.
-         ;; SYM is a little bit of a misnomer - it may be a generalized function name.
-         (when (sb-vm:fixup-code-object
+         (ecase
+             (sb-vm:fixup-code-object
                  code-obj offset
                  (ecase flavor
                    ((:assembly-routine :assembly-routine* :asm-routine-nil-offset)
-                    (- (or (get-asm-routine sym (eq flavor :assembly-routine*))
-                           (error "undefined assembler routine: ~S" sym))
+                    (- (or (get-asm-routine name (eq flavor :assembly-routine*))
+                           (error "undefined assembler routine: ~S" name))
                        (if (eq flavor :asm-routine-nil-offset) sb-vm:nil-value 0)))
-                   (:foreign (foreign-symbol-address sym))
-                   (:foreign-dataref (foreign-symbol-address sym t))
+                   (:foreign (foreign-symbol-address name))
+                   (:foreign-dataref (foreign-symbol-address name t))
                    (:code-object (get-lisp-obj-address code-obj))
-                   #+sb-thread (:symbol-tls-index (ensure-symbol-tls-index sym))
+                   #+sb-thread (:symbol-tls-index (ensure-symbol-tls-index name))
                    (:layout (get-lisp-obj-address
-                             (wrapper-friend (if (symbolp sym) (find-layout sym) sym))))
-                   (:layout-id (layout-id sym))
-                   (:immobile-symbol (get-lisp-obj-address sym))
-                   (:symbol-value (get-lisp-obj-address (symbol-global-value sym)))
+                             (wrapper-friend (if (symbolp name) (find-layout name) name))))
+                   (:layout-id (layout-id name))
+                   #+gencgc (:gc-barrier (extern-alien "gc_card_table_nbits" int))
+                   (:immobile-symbol (get-lisp-obj-address name))
+                   ;; It is legal to take the address of symbol-value only if the
+                   ;; value is known to be an immobile object
+                   ;; (whose address we don't want to wire in).
+                   (:symbol-value (get-lisp-obj-address (symbol-global-value name)))
                    #+immobile-code
                    (:named-call
-                    (prog1 (sb-vm::fdefn-entry-address sym) ; creates if didn't exist
+                    (prog1 (sb-vm::fdefn-entry-address name) ; creates if didn't exist
                       (when statically-link-p
-                        (push (cons offset (find-fdefn sym)) (elt preserved-lists 0)))))
-                   #+immobile-code (:static-call (sb-vm::function-raw-address sym)))
+                        (push (cons offset (find-fdefn name)) (elt preserved-lists 0)))))
+                   #+immobile-code (:static-call (sb-vm::function-raw-address name)))
                  kind flavor)
-           (ecase kind
-             (:relative (push offset (elt preserved-lists 1)))
-             (:absolute (push offset (elt preserved-lists 2)))
-             (:absolute64 (push offset (elt preserved-lists 3)))))
-         ;; These won't exist except for x86-64, but it doesn't matter.
-         (when (member sym '(sb-vm::enable-alloc-counter
-                             sb-vm::enable-sized-alloc-counter))
-           (push offset (elt preserved-lists 4))))
+           ((nil)) ; don't need to save it in the code-fixups, otherwise do
+           (:relative (push offset (elt preserved-lists 1)))
+           (:absolute (push offset (elt preserved-lists 2)))
+           (:immediate (push offset (elt preserved-lists 3)))
+           (:absolute64 (push offset (elt preserved-lists 4)))))
 
        (finish-fixups (code-obj preserved-lists)
          (declare (ignorable code-obj preserved-lists))
-         #+(or x86 x86-64)
+         ;; PRESERVED-LISTS are somewhat backend-dependent, but essentially
+         ;; you get to store three lists that might as well have been named
+         ;; Larry, Moe, and Curly.
          (let ((rel-fixups (elt preserved-lists 1))
                (abs-fixups (elt preserved-lists 2))
-               (abs64-fixups (elt preserved-lists 3)))
-           (aver (not abs64-fixups)) ; no preserved 64-bit fixups
-           (when (or abs-fixups rel-fixups)
+               (gc-barrier-fixups (elt preserved-lists 3))
+               (abs64-fixups (elt preserved-lists 4)))
+           ;; the fixup list packer only preserves at most 3 lists.
+           ;; And it's not clear that this is the best way to represent them.
+           (aver (not abs64-fixups))
+           (when (or abs-fixups rel-fixups gc-barrier-fixups)
              (setf (sb-vm::%code-fixups code-obj)
-                   (sb-c:pack-code-fixup-locs abs-fixups rel-fixups))))
-         (awhen (elt preserved-lists 4)
-           (setf (gethash code-obj *allocation-point-fixups*)
-                 (convert-alloc-point-fixups code-obj it)))
+                   (sb-c:pack-code-fixup-locs abs-fixups rel-fixups gc-barrier-fixups))))
+
          ;; Assign all SIMPLE-FUN-SELF slots
          (dotimes (i (code-n-entries code-obj))
            (let ((fun (%code-entry-point code-obj i)))
@@ -144,11 +147,12 @@
   (defun apply-fasl-fixups (fop-stack code-obj n-fixups &aux (top (svref fop-stack 0)))
     (dx-let ((preserved (make-array 5 :initial-element nil)))
       (macrolet ((pop-fop-stack () `(prog1 (svref fop-stack top) (decf top))))
+        (binding* ((alloc-points (pop-fop-stack) :exit-if-null))
+          (setf (gethash code-obj *allocation-patch-points*) alloc-points))
         (dotimes (i n-fixups (setf (svref fop-stack 0) top))
           (multiple-value-bind (offset kind flavor)
               (sb-fasl::!unpack-fixup-info (pop-fop-stack))
-            (fixup code-obj offset (pop-fop-stack) kind flavor
-                   preserved nil))))
+            (fixup code-obj offset (pop-fop-stack) kind flavor preserved nil))))
       (finish-fixups code-obj preserved)))
 
   (defun apply-core-fixups (fixup-notes code-obj)
@@ -258,7 +262,7 @@
           (logior (ash serialno (byte-position sb-vm::code-serialno-byte))
                   jumptable-word))))
 
-(defun make-core-component (component segment length fixup-notes object)
+(defun make-core-component (component segment length fixup-notes alloc-points object)
   (declare (type component component)
            (type segment segment)
            (type index length)
@@ -268,11 +272,25 @@
          (2comp (component-info component))
          (constants (ir2-component-constants 2comp))
          (nboxed (align-up (length constants) sb-c::code-boxed-words-align))
-         (code-obj (allocate-code-object
-                    (component-mem-space component)
-                    (count-if (lambda (x) (typep x '(cons (eql :named-call))))
-                              constants)
-                    nboxed length))
+         (n-named-calls
+          ;; Pre-scan for fdefinitions to ensure their existence.
+          ;; Doing so guarantees that storing them into the boxed header now
+          ;; can't create any old->young pointer, which is important since gencgc
+          ;; does not deal with untagged pointers when looking for old->young.
+          (do ((count 0)
+               (index (+ sb-vm:code-constants-offset
+                         (* (length (ir2-component-entries 2comp))
+                            sb-vm:code-slots-per-simple-fun))
+                      (1+ index)))
+              ((>= index (length constants)) count)
+            (let* ((const (aref constants index))
+                   (kind (if (listp const) (car const) const)))
+              (case kind
+                ((member :named-call :fdefinition)
+                 (setf (second const) (find-or-create-fdefn (second const)))
+                 (when (eq kind :named-call) (incf count)))))))
+         (code-obj (allocate-code-object (component-mem-space component)
+                                         n-named-calls nboxed length))
          (named-call-fixups
       ;; The following operations need the code pinned:
       ;; 1. copying into code-instructions (a SAP)
@@ -310,6 +328,12 @@
             (setf (%code-debug-info code-obj) debug-info)
             (apply-core-fixups fixup-notes code-obj))))
 
+    (when alloc-points
+      #+(and x86-64 sb-thread)
+      (if (= (extern-alien "alloc_profiling" int) 0) ; record the object for later
+          (setf (gethash code-obj *allocation-patch-points*) alloc-points)
+          (funcall 'sb-aprof::patch-code code-obj alloc-points)))
+
       ;; Don't need code pinned now
       ;; (It will implicitly be pinned on the conservatively scavenged backends)
     (let* ((entries (ir2-component-entries 2comp))
@@ -345,8 +369,7 @@
           (t
            (let ((referent
                   (etypecase kind
-                   ((member :named-call :fdefinition)
-                    (find-or-create-fdefn (cadr const)))
+                   ((member :named-call :fdefinition) (cadr const))
                    ((eql :known-fun)
                     (%coerce-name-to-fun (cadr const)))
                    (constant
@@ -358,7 +381,7 @@
       (sb-vm::statically-link-code-obj code-obj named-call-fixups))
     (when sb-fasl::*show-new-code*
       (let ((*print-pretty* nil))
-        (format t "~&~X New code(core): ~A~%" (get-lisp-obj-address code-obj) code-obj)))
+        (format t "~&New code(~Db,core): ~A~%" (code-object-size code-obj) code-obj)))
     code-obj))
 
 (defun set-code-fdefn (code index fdefn)

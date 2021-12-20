@@ -560,6 +560,7 @@ void* os_dlsym_default(char* name)
 {
     unsigned int i;
     void* result = 0;
+    buildTimeImages[0] = (void*)runtime_module_handle;
     if (buildTimeImageCount == 0) {
         buildTimeImageCount =
             1 + os_get_build_time_shared_libraries(15u,
@@ -790,7 +791,8 @@ set_up_win64_seh_thunk(size_t page_size)
     struct win64_seh_data *seh_data = (void *) WIN64_SEH_DATA_ADDR;
     DWORD64 base = (DWORD64) seh_data;
 
-    uint8_t *dthunk = seh_data->direct_thunk;
+    // 'volatile' works around "warning: writing 1 byte into a region of size 0 [-Wstringop-overflow=]"
+    volatile uint8_t *dthunk = seh_data->direct_thunk;
     dthunk[0] = 0x41; // pop r15
     dthunk[1] = 0x5F;
     dthunk[2] = 0xFF; // call rbx
@@ -800,7 +802,7 @@ set_up_win64_seh_thunk(size_t page_size)
     dthunk[6] = 0xC3; // ret
     dthunk[7] = 0x90; // nop (padding)
 
-    uint8_t *ithunk = seh_data->indirect_thunk;
+    volatile uint8_t *ithunk = seh_data->indirect_thunk;
     ithunk[0] = 0x41; // pop r15
     ithunk[1] = 0x5F;
     ithunk[2] = 0xFF; // call qword ptr [rbx]
@@ -810,7 +812,7 @@ set_up_win64_seh_thunk(size_t page_size)
     ithunk[6] = 0xC3; // ret
     ithunk[7] = 0x90; // nop (padding)
 
-    uint8_t *tramp = seh_data->handler_trampoline;
+    volatile uint8_t *tramp = seh_data->handler_trampoline;
     tramp[0] = 0xFF; // jmp qword ptr [rip+2]
     tramp[1] = 0x25;
     UNALIGNED_STORE32((tramp+2), 2);
@@ -840,8 +842,7 @@ set_up_win64_seh_thunk(size_t page_size)
 static LARGE_INTEGER lisp_init_time;
 static double qpcMultiplier;
 
-void os_init(char __attribute__((__unused__)) *argv[],
-             char __attribute__((__unused__)) *envp[])
+void os_init()
 {
 #ifdef LISP_FEATURE_64_BIT
     LARGE_INTEGER qpcFrequency;
@@ -1132,7 +1133,7 @@ handle_access_violation(os_context_t *ctx,
 
     /* dynamic space */
     page_index_t page = find_page_index(fault_address);
-    if (page != -1 && !page_table[page].write_protected) {
+    if (page != -1 && !PAGE_WRITEPROTECTED_P(page)) {
         os_commit_memory(PTR_ALIGN_DOWN(fault_address, os_vm_page_size),
                          os_vm_page_size);
         return 0;
@@ -1386,7 +1387,9 @@ veh(EXCEPTION_POINTERS *ep)
         (rip >= DYNAMIC_SPACE_START &&
          rip <= DYNAMIC_SPACE_START+dynamic_space_size);
 
-    if (code == EXCEPTION_ACCESS_VIOLATION || from_lisp)
+    if (code == EXCEPTION_ACCESS_VIOLATION ||
+        code == STATUS_HEAP_CORRUPTION ||
+        from_lisp)
         disp = handle_exception_ex(ep->ExceptionRecord, 0, ep->ContextRecord,
                                    // continue search on unhandled memory faults
                                    // if not in Lisp code. This gives foreign
@@ -1478,11 +1481,11 @@ char *dirname(char *path)
 
 // 0 - not a socket or other error, 1 - has input, 2 - has no input
 int
-socket_input_available(HANDLE socket)
+socket_input_available(HANDLE socket, long time, long utime)
 {
     int count = 0;
     int wsaErrno = GetLastError();
-    TIMEVAL timeout = {0, 0};
+    TIMEVAL timeout = {time, utime};
     fd_set readfds, errfds;
 
     FD_ZERO(&readfds);

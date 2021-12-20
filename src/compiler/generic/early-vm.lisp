@@ -72,12 +72,17 @@
   "The most positive integer that is of type SB-EXT:WORD.")
 
 (defconstant maximum-bignum-length
-  ;; Compute number of bits in the maximum length's representation
-  ;; leaving one bit for a GC mark bit.
-  (ldb (byte (- n-word-bits n-widetag-bits 1) 0) -1))
+  ;; 32-bit: leave one bit for a GC mark bit
+  #-64-bit (ldb (byte (- n-word-bits n-widetag-bits 1) 0) -1)
+  ;; 64-bit: restrict to a reasonably large theoretical size of 32GiB per bignum.
+  ;; I haven't exercised our math routines to anywhere near that limit.
+  #+64-bit #xFFFFFFFF)
 
 ;;; The ANSI-specified minimum is 8.
-(defconstant array-rank-limit 256
+;;; Since the array rank is stored as rank-1 in the array header,
+;;; having it stop at 128 ensures that adding 1 produces an unsigned
+;;; result.
+(defconstant array-rank-limit 129
   "the exclusive upper bound on the rank of an array")
 
 ;;; FIXME: these limits are wrong at the most basic level according to the spec,

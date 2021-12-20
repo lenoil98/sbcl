@@ -80,30 +80,39 @@
           (args (compiler-error-context-format-args context)))
       (collect ((full nil cons)
                 (short nil cons))
-        (let* ((forms (source-path-forms path))
-               (n 0)
-               (forms (if (member (first forms) args)
-                          (rest forms)
-                          forms))
-               (transforms (memq 'transformed forms))
-               (forms (if transforms
-                          (cdr transforms)
-                          forms)))
-          (dolist (src forms)
-            (if (>= n *enclosing-source-cutoff*)
-                (short (stringify-form (if (consp src)
-                                           (car src)
-                                           src)
-                                       nil))
-                (full (stringify-form src)))
-            (incf n))
-          (setf (compiler-error-context-%enclosing-source context) (short)
-                (compiler-error-context-%source context) (full)))))))
+        (flet ((no-transforms (x)
+                 (let ((pos (position 'transformed x :from-end t)))
+                   (if pos
+                       (subseq x (1+ pos))
+                       x)))
+               (hide-inlines (x)
+                 (loop for elt = (pop x)
+                       while x
+                       if (eq elt 'inlined)
+                       do (pop x)
+                       else
+                       collect elt)))
+          (let* ((forms (source-path-forms path))
+                 (n 0)
+                 (forms (if (member (first forms) args)
+                            (rest forms)
+                            forms))
+                 (forms (hide-inlines (no-transforms forms))))
+            (dolist (src forms)
+              (if (>= n *enclosing-source-cutoff*)
+                  (short (stringify-form (if (consp src)
+                                             (car src)
+                                             src)
+                                         nil))
+                  (full (stringify-form src)))
+              (incf n))
+            (setf (compiler-error-context-%enclosing-source context) (short)
+                  (compiler-error-context-%source context) (full))))))))
 
 ;;; If true, this is the node which is used as context in compiler warning
 ;;; messages.
 (declaim (type (or null compiler-error-context node
-                   lvar-annotation) *compiler-error-context*))
+                   lvar-annotation ctran) *compiler-error-context*))
 (defvar *compiler-error-context* nil)
 
 ;;; a plist mapping macro names to source context parsers. Each parser
@@ -239,7 +248,7 @@
 ;;; If OLD-CONTEXTS is passed in, and includes a context with the
 ;;; same original source path as the new context would have, the old
 ;;; context is reused instead, and a secondary value of T is returned.
-(defun find-error-context (args &optional old-contexts)
+(defun find-error-context (args &optional old-contexts (old-contexts-key #'identity))
   (let ((context *compiler-error-context*))
     (if (compiler-error-context-p context)
         (values context t)
@@ -247,13 +256,18 @@
                             (node-source-path context))
                            ((lvar-annotation-p context)
                             (lvar-annotation-source-path context))
+                           ((ctran-p context)
+                            (ctran-source-path context))
                            ((boundp '*current-path*)
                             *current-path*)))
                (old
                 (find (when path (source-path-original-source path))
-                      (remove-if #'null old-contexts)
+                      old-contexts
                       :test #'equal
-                      :key #'compiler-error-context-original-source-path)))
+                      :key (lambda (x)
+                             (and x
+                                  (compiler-error-context-original-source-path
+                                   (funcall old-contexts-key x)))))))
           (if old
               (values old t)
               (when (and *source-info* path)
@@ -478,8 +492,11 @@ has written, having proved that it is unreachable."))
 
   (defun compiler-notify (datum &rest args)
     (unless (if *compiler-error-context*
-              (policy *compiler-error-context* (= inhibit-warnings 3))
-              (policy *lexenv* (= inhibit-warnings 3)))
+                (policy (if (ctran-p *compiler-error-context*)
+                            (ctran-next *compiler-error-context*)
+                            *compiler-error-context*)
+                    (= inhibit-warnings 3))
+                (policy *lexenv* (= inhibit-warnings 3)))
       (with-condition (condition datum args)
         (incf *compiler-note-count*)
         (print-compiler-message
@@ -539,6 +556,8 @@ has written, having proved that it is unreachable."))
 (defvar *compiler-warning-count*)
 (defvar *compiler-style-warning-count*)
 (defvar *compiler-note-count*)
+
+(defvar *methods-in-compilation-unit*)
 
 ;;; Keep track of whether any surrounding COMPILE or COMPILE-FILE call
 ;;; should return WARNINGS-P or FAILURE-P.
@@ -630,6 +649,41 @@ has written, having proved that it is unreachable."))
             (push context (undefined-warning-warnings res)))
           (incf (undefined-warning-count res))))))
   (values))
+
+(defun note-key-arg-mismatch (name keys)
+  (let* ((found (find name
+                      *argument-mismatch-warnings*
+                      :key #'argument-mismatch-warning-name))
+         (res (or found
+                  (make-argument-mismatch-warning :name name))))
+    (unless found
+      (push res *argument-mismatch-warnings*))
+    (multiple-value-bind (context old)
+        (find-error-context (list name) (argument-mismatch-warning-warnings res) #'cdr)
+      (unless old
+        (push (cons keys context) (argument-mismatch-warning-warnings res))))))
+
+(defun report-key-arg-mismatches ()
+  #-sb-xc-host
+  (loop for warning in *argument-mismatch-warnings*
+        for name = (argument-mismatch-warning-name warning)
+        for type = (sb-pcl::compute-gf-ftype name)
+        when (and (fun-type-p type)
+                  (not (fun-type-allowp type)))
+        do
+        (loop for (keys . context) in (argument-mismatch-warning-warnings warning)
+              for bad = (loop for key in keys
+                              when (not (member key (fun-type-keywords type)
+                                                :key #'key-info-name))
+                              collect key)
+              do (let ((*compiler-error-context* context))
+                   (cond ((cdr bad)
+                          (compiler-style-warn "~@<~{~S~^, ~} and ~S are not a known argument keywords.~:@>"
+                                               (butlast bad)
+                                               (car (last bad))))
+                         (bad
+                          (compiler-style-warn "~S is not a known argument keyword."
+                                               (car bad))))))))
 
 ;; The compiler tracks full calls that were emitted so that it is possible
 ;; to detect a definition of a compiler-macro occuring after the first

@@ -39,7 +39,49 @@
                 (sap-ref-single sap 4)))
       (complex-double-float
        (complex (sap-ref-double sap 0)
-                (sap-ref-double sap 8))))))
+                (sap-ref-double sap 8)))
+      #+sb-simd-pack
+      (simd-pack-int
+       (%make-simd-pack-ub64
+        (sap-ref-64 sap 0)
+        (sap-ref-64 sap 8)))
+      #+sb-simd-pack
+      (simd-pack-single
+       (%make-simd-pack-single
+        (sap-ref-single sap 0)
+        (sap-ref-single sap 4)
+        (sap-ref-single sap 8)
+        (sap-ref-single sap 12)))
+      #+sb-simd-pack
+      (simd-pack-double
+       (%make-simd-pack-double
+        (sap-ref-double sap 0)
+        (sap-ref-double sap 8)))
+      #+sb-simd-pack-256
+      (simd-pack-256-int
+       (%make-simd-pack-256-ub64
+        (sap-ref-64 sap 0)
+        (sap-ref-64 sap 8)
+        (sap-ref-64 sap 16)
+        (sap-ref-64 sap 24)))
+      #+sb-simd-pack-256
+      (simd-pack-256-single
+       (%make-simd-pack-256-single
+        (sap-ref-single sap 0)
+        (sap-ref-single sap 4)
+        (sap-ref-single sap 8)
+        (sap-ref-single sap 12)
+        (sap-ref-single sap 16)
+        (sap-ref-single sap 20)
+        (sap-ref-single sap 24)
+        (sap-ref-single sap 28)))
+      #+sb-simd-pack-256
+      (simd-pack-256-double
+       (%make-simd-pack-256-double
+        (sap-ref-double sap 0)
+        (sap-ref-double sap 8)
+        (sap-ref-double sap 16)
+        (sap-ref-double sap 24))))))
 
 (defun %set-context-float-register (context index format value)
   (declare (ignorable context index format))
@@ -63,7 +105,49 @@
        (locally
            (declare (type (complex double-float) value))
          (setf (sap-ref-double sap 0) (realpart value)
-               (sap-ref-double sap 8) (imagpart value)))))))
+               (sap-ref-double sap 8) (imagpart value))))
+      #+sb-simd-pack
+      (simd-pack-int
+       (multiple-value-bind (a b) (%simd-pack-ub64s value)
+         (setf (sap-ref-64 sap 0) a
+               (sap-ref-64 sap 8) b)))
+      #+sb-simd-pack
+      (simd-pack-single
+       (multiple-value-bind (a b c d) (%simd-pack-singles value)
+         (setf (sap-ref-single sap 0) a
+               (sap-ref-single sap 4) b
+               (sap-ref-single sap 8) c
+               (sap-ref-single sap 12) d)))
+      #+sb-simd-pack
+      (simd-pack-double
+       (multiple-value-bind (a b) (%simd-pack-doubles value)
+         (setf (sap-ref-double sap 0) a
+               (sap-ref-double sap 8) b)))
+      #+sb-simd-pack-256
+      (simd-pack-256-int
+       (multiple-value-bind (a b c d) (%simd-pack-256-ub64s value)
+         (setf (sap-ref-64 sap 0) a
+               (sap-ref-64 sap 8) b
+               (sap-ref-64 sap 16) c
+               (sap-ref-64 sap 24) d)))
+      #+sb-simd-pack-256
+      (simd-pack-256-single
+       (multiple-value-bind (a b c d e f g h) (%simd-pack-256-singles value)
+         (setf (sap-ref-single sap 0) a
+               (sap-ref-single sap 4) b
+               (sap-ref-single sap 8) c
+               (sap-ref-single sap 12) d
+               (sap-ref-single sap 16) e
+               (sap-ref-single sap 20) f
+               (sap-ref-single sap 24) g
+               (sap-ref-single sap 28) h)))
+      #+sb-simd-pack-256
+      (simd-pack-256-double
+       (multiple-value-bind (a b c d) (%simd-pack-256-doubles value)
+         (setf (sap-ref-double sap 0) a
+               (sap-ref-double sap 8) b
+               (sap-ref-double sap 16) c
+               (sap-ref-double sap 24) d))))))
 
 ;;; Given a signal context, return the floating point modes word in
 ;;; the same format as returned by FLOATING-POINT-MODES.
@@ -106,10 +190,9 @@
                      (let* ((data (sap-ref-8 pc 1)) ; encodes dst register and size
                             (value (sb-vm:context-register context (ash data -2)))
                             (nbytes (ash 1 (logand data #b11)))
-                            ;; EMIT-SAP-REF always loads the EA into TEMP-REG-TN
-                            ;; which points to the shadow, not the user memory now.
-                            (ea (logxor (sb-vm:context-register
-                                         context (tn-offset sb-vm::temp-reg-tn))
+                            ;; EMIT-SAP-REF wires the EA to a predetermined register,
+                            ;; which now points to the shadow space, not the user memory.
+                            (ea (logxor (sb-vm:context-register context msan-temp-reg-number)
                                         msan-mem-to-shadow-xor-const)))
                        `(:raw ,ea ,nbytes ,value)))))
           (t
@@ -118,15 +201,9 @@
 
 #+immobile-space
 (defun alloc-immobile-fdefn ()
-  (or #+nil ; Avoid creating new objects in the text segment for now
-      (and (= (alien-funcall (extern-alien "lisp_code_in_elf" (function int))) 1)
-           (alloc-immobile-code (* fdefn-size n-word-bytes)
-                                  (logior (ash undefined-fdefn-header 16)
-                                          fdefn-widetag) ; word 0
-                                  0 other-pointer-lowtag nil)) ; word 1, lowtag, errorp
-      (alloc-immobile-fixedobj fdefn-size
-                               (logior (ash undefined-fdefn-header 16)
-                                       fdefn-widetag)))) ; word 0
+  (alloc-immobile-fixedobj fdefn-size
+                           (logior (ash undefined-fdefn-header 16)
+                                   fdefn-widetag))) ; word 0
 
 #+immobile-code
 (progn
@@ -219,7 +296,7 @@
               (truly-the word (+ addr insts-offs))
               (sap-ref-word sap insts-offs) #xFFFFFFE9058B48  ; MOV RAX,[RIP-23]
               (sap-ref-32 sap (+ insts-offs 7)) #x00FD60FF))) ; JMP [RAX-3]
-    (%set-funcallable-instance-info gf 0 slot-vector)
+    (setf (%funcallable-instance-info gf 0) slot-vector)
     gf))
 
 (defun fdefn-has-static-callers (fdefn)
@@ -309,11 +386,16 @@
       (return (loop (cond ((>= (incf i) len) (return t))
                           ((eq thing (svref things i)) (return nil))))))))
 
-;;; Allocate a code object.
-(defun alloc-dynamic-space-code (total-words)
-  (values (%primitive alloc-dynamic-space-code (the fixnum total-words))))
-
-;;; Remove calls via fdefns from CODE when compiling into memory.
+(define-load-time-global *never-statically-link* '(find-package))
+;;; Remove calls via fdefns from CODE. This is called after compiling
+;;; to memory, or when saving a core.
+;;; Do not replace globally notinline functions, because notinline has
+;;; an extra connotation of ensuring that replacement of the function
+;;; under that name always works. It usually works to replace a statically
+;;; linked function, but with a caveat: un-statically-linking requires calling
+;;; MAP-OBJECTS-IN-RANGE, which is unreliable in the presence of
+;;; multiple threads. Unfortunately, some users dangerously redefine
+;;; builtin functions, and moreover, while there are multiple threads.
 (defun statically-link-code-obj (code fixups)
   (declare (ignorable code fixups))
   (unless (immobile-space-obj-p code)
@@ -336,7 +418,9 @@
       (let* ((fdefn (code-header-ref code (+ fdefns-start i)))
              (fun (when (fdefn-p fdefn) (fdefn-fun fdefn))))
         (when (and (immobile-space-obj-p fun)
-                   (not (fun-requires-simplifying-trampoline-p fun)))
+                   (not (fun-requires-simplifying-trampoline-p fun))
+                   (not (member (fdefn-name fdefn) *never-statically-link* :test 'equal))
+                   (neq (info :function :inlinep (fdefn-name fdefn)) 'notinline))
           (setf any-replacements t (aref replacements i) fun))))
     (dotimes (i fdefns-count)
       (when (and (aref replacements i)

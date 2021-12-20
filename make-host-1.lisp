@@ -11,11 +11,12 @@
 (in-package "SB-COLD")
 #+sbcl
 (declaim (sb-ext:muffle-conditions
-          (satisfies unable-to-optimize-note-p)
-          (satisfies optional+key-style-warning-p)
-          sb-ext:code-deletion-note))
+          sb-ext:compiler-note
+          (satisfies optional+key-style-warning-p)))
 (progn
-  (setf *host-obj-prefix* "obj/from-host/")
+  (setf *host-obj-prefix* (if (boundp 'cl-user::*sbcl-host-obj-prefix*)
+                              (symbol-value 'cl-user::*sbcl-host-obj-prefix*)
+                              "obj/from-host/"))
   (load "src/cold/set-up-cold-packages.lisp")
   (load "src/cold/defun-load-or-cload-xcompiler.lisp")
 
@@ -42,13 +43,9 @@
                          (signal c) ; won't do SETQ if MUFFLE-WARNING is invoked
                          (setq style-warnp 'style-warning)))
                       (simple-warning
-                       (lambda (c &aux (fc (simple-condition-format-control c)))
-                         ;; hack for PPC. See 'build-order.lisp-expr'
-                         ;; Ignore the warning, and the warning about the warning.
-                         (unless (and (stringp fc)
-                                      (or (search "not allowed by the operand type" fc)
-                                          (search "ignoring FAILURE-P return" fc)))
-                           (setq warnp 'warning)))))
+                        (lambda (c)
+                          (declare (ignore c))
+                          (setq warnp 'warning))))
          (with-compilation-unit () ,@forms))
        (when (and (or warnp style-warnp) *fail-on-warnings*)
          (cerror "Proceed anyway"
@@ -154,12 +151,6 @@
                  unused-inputs extra-inputs
                  unused-outputs extra-outputs))))))
 
-;;; I don't know the best combination of OPTIMIZE qualities to produce a correct
-;;; and reasonably fast cross-compiler in ECL. At over half an hour to complete
-;;; make-host-{1,2}, I don't really want to waste any more time finding out.
-;;; These settings work, while the defaults do not.
-#+ecl (proclaim '(optimize (safety 2) (debug 2)))
-
 (maybe-with-compilation-unit
   ;; If make-host-1 is parallelized, it will produce host fasls without loading
   ;; them. The host will have interpreted definitions of most everything,
@@ -171,4 +162,5 @@
  (host-cload-stem "src/compiler/generic/genesis" nil)
 ) ; END with-compilation-unit
 
-(sb-cold:genesis :c-header-dir-name "src/runtime/genesis")
+(unless (member :crossbuild-test sb-xc:*features*)
+  (sb-cold:genesis :c-header-dir-name "src/runtime/genesis"))

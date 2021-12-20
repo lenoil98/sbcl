@@ -32,11 +32,11 @@
        ,inner (progn ,@body)
               (if (setq ,tn (tn-next ,tn)) (go ,inner) (go ,outer)))))
 
-(defun set-ir2-physenv-live-tns (value instance)
-  (setf (ir2-physenv-live-tns instance) value))
+(defun set-ir2-environment-live-tns (value instance)
+  (setf (ir2-environment-live-tns instance) value))
 
-(defun set-ir2-physenv-debug-live-tns (value instance)
-  (setf (ir2-physenv-debug-live-tns instance) value))
+(defun set-ir2-environment-debug-live-tns (value instance)
+  (setf (ir2-environment-debug-live-tns instance) value))
 
 (defun set-ir2-component-alias-tns (value instance)
   (setf (ir2-component-alias-tns instance) value))
@@ -81,14 +81,14 @@
                (case (tn-kind tn)
                  (:environment
                   (clear-live tn
-                              #'ir2-physenv-live-tns
-                              #'set-ir2-physenv-live-tns))
+                              #'ir2-environment-live-tns
+                              #'set-ir2-environment-live-tns))
                  (:debug-environment
                   (clear-live tn
-                              #'ir2-physenv-debug-live-tns
-                              #'set-ir2-physenv-debug-live-tns))))
+                              #'ir2-environment-debug-live-tns
+                              #'set-ir2-environment-debug-live-tns))))
              (clear-live (tn getter setter)
-               (let ((env (physenv-info (tn-physenv tn))))
+               (let ((env (environment-info (tn-environment tn))))
                  (funcall setter (delete tn (funcall getter env)) env))))
       (declare (inline used-p delete-some delete-1 clear-live))
       (delete-some #'ir2-component-alias-tns
@@ -170,24 +170,24 @@
   (make-tn (incf (ir2-component-global-tn-counter (component-info *component-being-compiled*)))
            :unused nil nil))
 
-;;; Make TN be live throughout PHYSENV. Return TN. In the DEBUG case,
-;;; the TN is treated normally in blocks in the environment which
+;;; Make TN be live throughout ENV. Return TN. In the DEBUG case, the
+;;; TN is treated normally in blocks in the environment which
 ;;; reference the TN, allowing targeting to/from the TN. This results
 ;;; in move efficient code, but may result in the TN sometimes not
 ;;; being live when you want it.
-(defun physenv-live-tn (tn physenv)
-  (declare (type tn tn) (type physenv physenv))
+(defun environment-live-tn (tn env)
+  (declare (type tn tn) (type environment env))
   (aver (eq (tn-kind tn) :normal))
   (setf (tn-kind tn) :environment)
-  (setf (tn-physenv tn) physenv)
-  (push tn (ir2-physenv-live-tns (physenv-info physenv)))
+  (setf (tn-environment tn) env)
+  (push tn (ir2-environment-live-tns (environment-info env)))
   tn)
-(defun physenv-debug-live-tn (tn physenv)
-  (declare (type tn tn) (type physenv physenv))
+(defun environment-debug-live-tn (tn env)
+  (declare (type tn tn) (type environment env))
   (aver (eq (tn-kind tn) :normal))
   (setf (tn-kind tn) :debug-environment)
-  (setf (tn-physenv tn) physenv)
-  (push tn (ir2-physenv-debug-live-tns (physenv-info physenv)))
+  (setf (tn-environment tn) env)
+  (push tn (ir2-environment-debug-live-tns (environment-info env)))
   tn)
 
 ;;; Make TN be live throughout the current component. Return TN.
@@ -336,6 +336,18 @@
           (push-in tn-ref-next res (tn-writes tn))
           (push-in tn-ref-next res (tn-reads tn))))
     res))
+
+(defun reference-tn-refs (refs write-p)
+  (when refs
+    (let* ((first (reference-tn (tn-ref-tn refs) write-p) )
+           (prev first))
+      (loop for tn-ref = (tn-ref-across refs) then (tn-ref-across tn-ref)
+            while tn-ref
+            do
+            (let ((ref (reference-tn  (tn-ref-tn tn-ref) write-p)))
+              (setf (tn-ref-across prev) ref)
+              (setq prev ref)))
+      first)))
 
 ;;; Make TN-REFS to reference each TN in TNs, linked together by
 ;;; TN-REF-ACROSS. WRITE-P is the WRITE-P value for the refs. MORE is

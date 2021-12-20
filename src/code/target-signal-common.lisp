@@ -54,6 +54,19 @@
            (receive-pending-interrupt))
          (funcall function))))
 
+(defmacro pthread-sigmask (how new old)
+  `(let ((how ,how) (new ,new) (old ,old))
+     (alien-funcall (extern-alien
+                     #+sb-thread ,(or #+unix "pthread_sigmask" #-unix "sb_pthread_sigmask")
+                     #-sb-thread ,(or #+netbsd "sb_sigprocmask" #-netbsd "sigprocmask")
+                     (function void int system-area-pointer system-area-pointer))
+                    how
+                    (cond ((system-area-pointer-p new) new)
+                          (new (vector-sap new))
+                          (t (int-sap 0)))
+                    (cond ((system-area-pointer-p old) old)
+                          (old (vector-sap old))
+                          (t (int-sap 0))))))
 
 (defun invoke-interruption (function)
   (without-interrupts
@@ -69,16 +82,18 @@
         (sb-thread::without-thread-waiting-for (:already-without-interrupts t)
           (allow-with-interrupts
             (nlx-protect (funcall function)
-              ;; We've been running with deferrables
-              ;; blocked in Lisp called by a C signal
-              ;; handler. If we return normally the sigmask
-              ;; in the interrupted context is restored.
-              ;; However, if we do an nlx the operating
-              ;; system will not restore it for us.
-              (when *unblock-deferrables-on-enabling-interrupts-p*
-                ;; This means that storms of interrupts
-                ;; doing an nlx can still run out of stack.
-                (unblock-deferrable-signals)))
+                         ;; We've been running with blockable
+                         ;; blocked in Lisp called by a C signal
+                         ;; handler. If we return normally the sigmask
+                         ;; in the interrupted context is restored.
+                         ;; However, if we do an nlx the operating
+                         ;; system will not restore it for us.
+                         (when *unblock-deferrables-on-enabling-interrupts-p*
+                           ;; This means that storms of interrupts
+                           ;; doing an nlx can still run out of stack.
+                           (pthread-sigmask SIG_UNBLOCK
+                                            (foreign-symbol-sap "blockable_sigset" t)
+                                            nil)))
             ;; The return value doesn't matter, just return 0
             0))))))
 
@@ -86,4 +101,3 @@
   "Convenience macro on top of INVOKE-INTERRUPTION."
   `(dx-flet ((interruption () ,@body))
      (invoke-interruption #'interruption)))
-

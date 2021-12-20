@@ -241,7 +241,7 @@
          (store-symbol-value flag-tn *allocation-pointer*))
         #+gencgc
         (t
-         (let ((region-disp (- boxed-region nil-value))
+         (let ((region-disp (- mixed-region nil-value))
                (alloc (gen-label))
                (back-from-alloc (gen-label)))
            (inst ldr result-tn (@ null-tn region-disp)) ; free ptr
@@ -280,9 +280,8 @@
        (allocation nil (pad-data-block ,size) ,lowtag ,result-tn
                    :flag-tn ,flag-tn
                    :stack-allocate-p ,stack-allocate-p)
-       (when ,type-code
-         (load-immediate-word ,flag-tn (compute-object-header ,size ,type-code))
-         (storew ,flag-tn ,result-tn 0 ,lowtag))
+       (load-immediate-word ,flag-tn (compute-object-header ,size ,type-code))
+       (storew ,flag-tn ,result-tn 0 ,lowtag)
        ,@body)))
 
 ;;;; Error Code

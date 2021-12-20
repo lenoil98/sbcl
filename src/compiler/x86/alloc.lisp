@@ -75,21 +75,21 @@
          #+(and sb-thread win32) (scratch-tn (pop scratch-tns))
          #+(and sb-thread win32) (swap-tn (pop scratch-tns))
          (free-pointer
-           ;; thread->boxed_tlab.free_pointer
+           ;; thread->mixed_tlab.free_pointer
            (make-ea :dword
                     :base (or #+(and sb-thread win32)
                               scratch-tn)
                     :disp
-                    #+sb-thread (* n-word-bytes thread-boxed-tlab-slot)
-                    #-sb-thread boxed-region))
+                    #+sb-thread (* n-word-bytes thread-mixed-tlab-slot)
+                    #-sb-thread mixed-region))
          (end-addr
-            ;; thread->boxed_tlab.end_addr
+            ;; thread->mixed_tlab.end_addr
            (make-ea :dword
                     :base (or #+(and sb-thread win32)
                               scratch-tn)
                     :disp
-                    #+sb-thread (* n-word-bytes (1+ thread-boxed-tlab-slot))
-                    #-sb-thread (+ boxed-region n-word-bytes))))
+                    #+sb-thread (* n-word-bytes (1+ thread-mixed-tlab-slot))
+                    #-sb-thread (+ mixed-region n-word-bytes))))
     (unless (and (tn-p size) (location= alloc-tn size))
       (inst mov alloc-tn size))
     #+(and sb-thread win32)
@@ -168,7 +168,7 @@
      (allocation-inline type alloc-tn size))
     (t
      (allocation-notinline type alloc-tn size)))
-  (when (and lowtag (not dynamic-extent))
+  (when (and lowtag (/= lowtag 0) (not dynamic-extent))
     ;; This is dumb, it should be an ADD or an OR, but a better solution
     ;; would be to pass lowtag into the allocation-inline function so that
     ;; for a fixed size we don't emit code such as "SUB r, 8 ; ADD r, 3".
@@ -188,24 +188,15 @@
               result-tn 0 other-pointer-lowtag)))
 
 ;;;; CONS, LIST and LIST*
-(define-vop (list-or-list*)
+(define-vop (list)
   (:args (things :more t))
   (:temporary (:sc unsigned-reg) ptr temp)
   (:temporary (:sc unsigned-reg :to (:result 0) :target result) res)
-  (:info num)
+  (:info star cons-cells)
   (:results (result :scs (descriptor-reg)))
-  (:variant-vars star)
-  (:policy :safe)
   (:node-var node)
   (:generator 0
-    (cond ((zerop num)
-           ;; (move result nil-value)
-           (inst mov result nil-value))
-          ((and star (= num 1))
-           (move result (tn-ref-tn things)))
-          (t
-           (macrolet
-               ((store-car (tn list &optional (slot cons-car-slot))
+    (macrolet ((store-car (tn list &optional (slot cons-car-slot))
                   `(let ((reg
                           (sc-case ,tn
                             ((any-reg descriptor-reg) ,tn)
@@ -213,9 +204,8 @@
                              (move temp ,tn)
                              temp))))
                      (storew reg ,list ,slot list-pointer-lowtag))))
-             (let ((cons-cells (if star (1- num) num))
-                   (stack-allocate-p (node-stack-allocate-p node)))
-               (pseudo-atomic (:elide-if stack-allocate-p)
+      (let ((stack-allocate-p (node-stack-allocate-p node)))
+        (pseudo-atomic (:elide-if stack-allocate-p)
                 (allocation 'list (* (pad-data-block cons-size) cons-cells)
                             list-pointer-lowtag node stack-allocate-p res)
                 (move ptr res)
@@ -233,13 +223,7 @@
                        (storew nil-value ptr cons-cdr-slot
                                list-pointer-lowtag)))
                 (aver (null (tn-ref-across things)))))
-             (move result res))))))
-
-(define-vop (list list-or-list*)
-  (:variant nil))
-
-(define-vop (list* list-or-list*)
-  (:variant t))
+      (move result res))))
 
 ;;;; special-purpose inline allocators
 
@@ -386,41 +370,16 @@
     (inst mov result (make-fixup 'funcallable-instance-tramp :assembly-routine))))
 
 (define-vop (fixed-alloc)
-  (:args)
   (:info name words type lowtag stack-allocate-p)
   (:ignore name)
   (:results (result :scs (descriptor-reg)))
   (:node-var node)
   (:generator 50
-    ;; We special case the allocation of conses, because they're
-    ;; extremely common and because the pseudo-atomic sequence on x86
-    ;; is relatively heavyweight.  However, if the user asks for top
-    ;; speed, we accomodate him.  The primary reason that we don't
-    ;; also check for (< SPEED SPACE) is because we want the space
-    ;; savings that these out-of-line allocation routines bring whilst
-    ;; compiling SBCL itself.  --njf, 2006-07-08
-    (if (and (not stack-allocate-p)
-             (= lowtag list-pointer-lowtag) (policy node (< speed 3)))
-        (let ((dst
-               ;; FIXME: out-of-line dx-allocation
-               #.(loop for offset in *dword-regs*
-                    collect `(,offset
-                              ',(intern (format nil "ALLOCATE-CONS-TO-~A"
-                                                (svref +dword-register-names+
-                                                       offset)))) into cases
-                    finally (return `(case (tn-offset result)
-                                       ,@cases)))))
-          (aver (null type))
-          (inst call (make-fixup dst :assembly-routine)))
-        (pseudo-atomic (:elide-if stack-allocate-p)
-         (let ((nbytes (* (pad-data-block words)
-                          #+bignum-assertions (if (eql type bignum-widetag) 2 1))))
-           (allocation nil nbytes lowtag node stack-allocate-p result))
-         (when type
-           (storew (compute-object-header words type)
-                   result
-                   0
-                   lowtag))))))
+    (pseudo-atomic (:elide-if stack-allocate-p)
+      (let ((nbytes (* (pad-data-block words)
+                       #+bignum-assertions (if (eql type bignum-widetag) 2 1))))
+        (allocation nil nbytes lowtag node stack-allocate-p result))
+      (storew (compute-object-header words type) result 0 lowtag))))
 
 (define-vop (var-alloc)
   (:args (extra :scs (any-reg)))

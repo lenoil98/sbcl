@@ -368,7 +368,7 @@
                          (car list)))
                   (declare (type index count)))
                 (locally
-                    (declare (optimize (sb-c::insert-array-bounds-checks 0)))
+                    (declare (optimize (sb-c:insert-array-bounds-checks 0)))
                   (when (>= index (length sequence))
                     (signal-index-too-large-error sequence index))
                   (aref sequence index))
@@ -1092,7 +1092,7 @@ many elements are copied."
 (macrolet ((def (name element-type &rest dispatch)
              `(defun ,name (&rest sequences)
                 (declare (explicit-check)
-                         (optimize (sb-c::insert-array-bounds-checks 0)))
+                         (optimize (sb-c:insert-array-bounds-checks 0)))
                 (let ((length 0))
                   (declare (index length))
                   (do-rest-arg ((seq) sequences)
@@ -1223,7 +1223,7 @@ many elements are copied."
                     (progn
                       (setf (car in-apply-args) (funcall elt s state))
                       (setf (caar in-iters) (funcall step s state from-end)))))))))))))
-#-sb-devel
+
 (declaim (start-block map %map))
 
 (defun %map-to-list (fun sequences)

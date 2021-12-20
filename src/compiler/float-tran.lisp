@@ -15,10 +15,10 @@
 
 ;;;; coercions
 
-(deftransform float ((n f) (* single-float) *)
+(deftransform float ((n f) (t single-float) *)
   '(%single-float n))
 
-(deftransform float ((n f) (* double-float) *)
+(deftransform float ((n f) (t double-float) *)
   '(%double-float n))
 
 (deftransform float ((n) *)
@@ -29,13 +29,25 @@
 (deftransform %single-float ((n) (single-float) *)
   'n)
 
+(deftransform %single-float ((n) (ratio) *)
+  '(sb-kernel::float-ratio n 'single-float))
+
+(deftransform %single-float ((n) (bignum) *)
+  '(bignum-to-float n 'single-float))
+
 (deftransform %double-float ((n) (double-float) *)
   'n)
+
+(deftransform %double-float ((n) (ratio) *)
+  '(sb-kernel::float-ratio n 'double-float))
+
+(deftransform %double-float ((n) (bignum) *)
+  '(bignum-to-float n 'double-float))
 
 ;;; RANDOM
 (macrolet ((frob (fun type)
              `(deftransform random ((num &optional state)
-                                    (,type &optional *) *)
+                                    (,type &optional t) *)
                 "Use inline float operations."
                 '(,fun num (or state *random-state*)))))
   (frob %random-single-float single-float)
@@ -67,7 +79,7 @@
 ;;; a division to get the random value into the desired range.
 (deftransform random ((num &optional state)
                       ((constant-arg (integer 1 #.(expt 2 sb-vm:n-word-bits)))
-                       &optional *)
+                       &optional t)
                       *
                       :policy (and (> speed compilation-speed)
                                    (> speed space)))
@@ -220,7 +232,7 @@
 (deftransform integer-decode-float ((x) (double-float) *)
   '(integer-decode-double-float x))
 
-(deftransform scale-float ((f ex) (single-float *) *)
+(deftransform scale-float ((f ex) (single-float t) *)
   (cond #+x86
         ((csubtypep (lvar-type ex)
                     (specifier-type '(signed-byte 32)))
@@ -228,7 +240,7 @@
         (t
          '(scale-single-float f ex))))
 
-(deftransform scale-float ((f ex) (double-float *) *)
+(deftransform scale-float ((f ex) (double-float t) *)
   (cond #+x86
         ((csubtypep (lvar-type ex)
                     (specifier-type '(signed-byte 32)))
@@ -844,7 +856,7 @@
        (list (interval-expt-> x y-)
              (interval-expt-> x y+))))))
 
-;;; Handle the case when x <= 1
+;;; Handle the case when 0 <= x <= 1
 (defun interval-expt-< (x y)
   (case (interval-range-info x $0d0)
     (+
@@ -875,9 +887,13 @@
                 (interval-expt-< x y+))))))
     (-
      ;; The case where x <= 0. Y MUST be an INTEGER for this to work!
-     ;; The calling function must insure this! For now we'll just
-     ;; return the appropriate unbounded float type.
-     (list (make-interval :low nil :high nil)))
+     ;; The calling function must insure this!
+     (loop for interval in (flatten-list (interval-expt (interval-neg x) y))
+           for low = (interval-low interval)
+           for high = (interval-high interval)
+           collect interval
+           when (or high low)
+           collect (interval-neg interval)))
     (t
      (destructuring-bind (neg pos)
          (interval-split 0 x t t)
@@ -1529,7 +1545,7 @@
 
 (macrolet ((define-frobs (fun ufun)
              `(deftransform ,fun ((x &optional by)
-                                  (* &optional (constant-arg (member 1))))
+                                  (t &optional (constant-arg (member 1))))
                   '(let ((res (,ufun x)))
                     (values res (locally
                                     (declare (flushable %single-float
@@ -1673,7 +1689,7 @@
     (values (complex re im)
             (locally (declare (notinline complex)) (complex re im)))))
 
-#+(and (not sb-xc-host) (not riscv)) ; broken on riscv
+#-sb-xc-host
 (dolist (test '(try-folding-complex-single try-folding-complex-double))
   (multiple-value-bind (a b) (funcall test)
     (assert (eql a b)))

@@ -21,37 +21,16 @@
   (:generator 1
     (loadw result object offset lowtag)))
 
+;;; This vop is magical in (at least) 2 ways:
+;;; 1. it is always selected by name (in ir2-convert-setter or -setfer)
+;;; 2. the ir2 converter makes it return a value despite absence of :results
 (define-vop (set-slot)
   (:args (object :scs (descriptor-reg))
          (value :scs (descriptor-reg any-reg immediate)))
   (:info name offset lowtag)
-  (:results)
+  (:ignore name)
   (:generator 1
-    (cond ((emit-code-page-write-barrier-p name)
-           (inst push (encode-value-if-immediate value))
-           (inst push offset)
-           (inst push object)
-           (when (= lowtag fun-pointer-lowtag)
-             (inst push eax-tn) ; spill eax to use as a temp
-             (loadw eax-tn object 0 fun-pointer-lowtag)
-             (inst shr eax-tn n-widetag-bits)
-             ;; increment index by number of boxed words
-             (inst add (make-ea :dword :base esp-tn :disp 8) eax-tn)
-             ;; and compute the code pointer from the fun pointer
-             (inst lea eax-tn
-                   (make-ea :dword :index eax-tn :scale n-word-bytes
-                            :disp (- fun-pointer-lowtag other-pointer-lowtag)))
-             (inst sub (make-ea :dword :base esp-tn :disp 4) eax-tn)
-             (inst pop eax-tn)) ; restore
-           (inst call (make-fixup 'code-header-set :assembly-routine)))
-          (t
-           (storew (encode-value-if-immediate value) object offset lowtag)))))
-
-(define-vop (init-slot set-slot)
-  (:info name dx-p offset lowtag)
-  (:generator 1
-    (storew (encode-value-if-immediate value) object offset lowtag))
-  (:ignore name dx-p))
+    (storew (encode-value-if-immediate value) object offset lowtag)))
 
 (define-vop (compare-and-swap-slot)
   (:args (object :scs (descriptor-reg) :to :eval)
@@ -283,13 +262,11 @@
 (define-vop (fdefn-makunbound)
   (:policy :fast-safe)
   (:translate fdefn-makunbound)
-  (:args (fdefn :scs (descriptor-reg) :target result))
-  (:results (result :scs (descriptor-reg)))
+  (:args (fdefn :scs (descriptor-reg)))
   (:generator 38
     (storew nil-value fdefn fdefn-fun-slot other-pointer-lowtag)
     (storew (make-fixup 'undefined-tramp :assembly-routine)
-            fdefn fdefn-raw-addr-slot other-pointer-lowtag)
-    (move result fdefn)))
+            fdefn fdefn-raw-addr-slot other-pointer-lowtag)))
 
 ;;;; binding and unbinding
 
@@ -414,9 +391,8 @@
   closure-info-offset fun-pointer-lowtag
   (any-reg descriptor-reg) * %closure-index-ref)
 
-(define-full-setter set-funcallable-instance-info *
-  funcallable-instance-info-offset fun-pointer-lowtag
-  (any-reg descriptor-reg) * %set-funcallable-instance-info)
+(define-full-setter %closure-index-set * closure-info-offset fun-pointer-lowtag
+  (any-reg descriptor-reg) * %closure-index-set)
 
 (define-full-reffer funcallable-instance-info *
   funcallable-instance-info-offset fun-pointer-lowtag
@@ -489,14 +465,32 @@
   (:translate code-header-set)
   (:policy :fast-safe)
   (:args (object :scs (descriptor-reg))
-         (index :scs (unsigned-reg))
+         (index :scs (any-reg))
          (value :scs (any-reg descriptor-reg)))
-  (:arg-types * unsigned-num *)
+  (:arg-types * tagged-num *)
+  (:temporary (:sc unsigned-reg) table card)
   (:generator 10
-    (inst push value)
-    (inst push index)
-    (inst push object)
-    (inst call (make-fixup 'code-header-set :assembly-routine))))
+    ;; Find card mark table base. If the linkage entry contained the
+    ;; *value* of gc_card_mark pointer, we could eliminate one deref.
+    ;; Putting it in a statc symbol would also work, but this vop is
+    ;; not performance-critical by any stretch of the imagination.
+    (inst mov table (make-ea :dword :disp (make-fixup "gc_card_mark" :foreign-dataref)))
+    (inst mov table (make-ea :dword :base table))
+    (pseudo-atomic ()
+      ;; Compute card mark index and touch the mark byte
+      (inst mov card object)
+      (inst shr card gencgc-card-shift)
+      (inst and card (make-fixup nil :gc-barrier))
+      (inst mov (make-ea :byte :base table :index card) 0)
+      ;; set 'written' flag in the code header
+      ;; this doesn't need to use :LOCK because the only other writer
+      ;; would be a GCing thread, but we're pseudo-atomic here.
+      ;; If two threads actually did write the byte, then they would write
+      ;; the same value, and that works fine.
+      (inst or (make-ea :byte :base object :disp (- 3 other-pointer-lowtag)) #x40)
+      ;; store
+      (inst mov (make-ea :dword :base object :index index :disp (- other-pointer-lowtag))
+            value))))
 
 ;;;; raw instance slot accessors
 

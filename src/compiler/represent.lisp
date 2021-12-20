@@ -217,7 +217,6 @@
 (defconstant-eqx ignore-cost-vops '(set type-check-error) #'equal)
 (defconstant-eqx suppress-note-vops '(type-check-error) #'equal)
 
-#-sb-devel
 (declaim (start-block select-tn-representation))
 
 ;;; We special-case the move VOP, since using this costs for the
@@ -324,9 +323,9 @@
                      (vop-block (tn-ref-vop ref)))))
            (tails (lambda-tail-set lambda)))
       (flet ((frob (fun)
-               (setf (ir2-physenv-number-stack-p
-                      (physenv-info
-                       (lambda-physenv fun)))
+               (setf (ir2-environment-number-stack-p
+                      (environment-info
+                       (lambda-environment fun)))
                      t)))
         (frob lambda)
         (when tails
@@ -620,7 +619,7 @@
                   (succ (ir2-block-block 2block))
                   (start (make-ctran))
                   (block (ctran-starts-block start))
-                  (no-op-node (make-no-op))
+                  (no-op-node (make-exit))
                   (new-2block (make-ir2-block block))
                   (vop-next (vop-next vop)))
              (link-node-to-previous-ctran no-op-node start)
@@ -804,6 +803,53 @@
                 (cdr (the (not null) (assoc old-offset renumbering)))))))
     sorted))
 
+#+arm64
+(defun choose-zero-tn (tn)
+  (let (zero-tn)
+    (flet ((zero-tn ()
+             (or zero-tn
+                 (setf zero-tn
+                       (component-live-tn
+                        (make-wired-tn nil
+                                       sb-vm:any-reg-sc-number
+                                       sb-vm::zr-offset))))))
+      (do ((tn tn (tn-next tn)))
+          ((null tn))
+        (when (and (constant-tn-p tn)
+                   (eql (tn-value tn) 0))
+          (loop with next
+                for read = (tn-reads tn) then next
+                while read
+                do
+                (setf next (tn-ref-next read))
+                (do* ((vop (tn-ref-vop read))
+                      (info (vop-info vop))
+                      (cost (vop-info-arg-costs info) (cdr cost))
+                      (op (vop-args vop) (tn-ref-across op)))
+                     ((null cost))
+                  (when (eq op read)
+                    (when (eql (svref (car cost) sb-vm:zero-sc-number) 0)
+                      (change-tn-ref-tn read (zero-tn)))
+                    (return)))))))))
+
+;;; The call VOPs allocate a temporary register wired to
+;;; nfp-save-offset, but don't use it if there's no nfp-tn in the
+;;; current frame, but the stack space is still allocated.
+#-c-stack-is-control-stack
+(defun unwire-nfp-save-tn (2comp)
+  (unless (ir2-component-nfp 2comp)
+    (do ((prev)
+         (tn (ir2-component-wired-tns 2comp) (tn-next tn)))
+        ((null tn))
+      (cond ((and (sc-is tn sb-vm::control-stack)
+                  (eql (tn-offset tn) sb-vm:nfp-save-offset))
+             (setf (tn-kind tn) :unused)
+             (if prev
+                 (setf (tn-next prev) (tn-next tn))
+                 (setf (ir2-component-wired-tns 2comp) (tn-next tn))))
+            (t
+             (setf prev tn))))))
+
 ;;; This is the entry to representation selection. First we select the
 ;;; representation for all normal TNs, setting the TN-SC. After
 ;;; selecting the TN representations, we set the SC for all :ALIAS TNs
@@ -863,6 +909,10 @@
 
     (do-ir2-blocks (block component)
       (emit-moves-and-coercions block))
+
+    #+arm64
+    (choose-zero-tn (ir2-component-constant-tns 2comp))
+
     ;; Give the optimizers a second opportunity to alter newly inserted vops
     ;; by looking for patterns that have a shorter expression as a single vop.
     (run-vop-optimizers component)
@@ -873,5 +923,7 @@
                     (note-if-number-stack tn 2comp ,restricted))))
       (frob ir2-component-normal-tns nil)
       (frob ir2-component-wired-tns t)
-      (frob ir2-component-restricted-tns t)))
+      (frob ir2-component-restricted-tns t)
+      #-c-stack-is-control-stack
+      (unwire-nfp-save-tn 2comp)))
   (values))

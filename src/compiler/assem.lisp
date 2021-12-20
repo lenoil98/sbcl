@@ -319,6 +319,7 @@
 
 (defstruct asmstream
   (data-section (make-section) :read-only t)
+  (indirections-section (make-section) :read-only t)
   (code-section (make-section) :read-only t)
   (elsewhere-section (make-section) :read-only t)
   (data-origin-label (gen-label "data start") :read-only t)
@@ -329,6 +330,14 @@
   ;; into the data section
   (constant-table (make-hash-table :test #'equal) :read-only t)
   (constant-vector (make-array 16 :adjustable t :fill-pointer 0) :read-only t)
+  ;; for deterministic allocation profiler (or possibly other tooling)
+  ;; that wants to monkey patch the instructions at runtime.
+  (alloc-points)
+  ;; for shrinking the size of the code fixups, we can choose to emit at most one call
+  ;; from a dynamic space code component to a given assembly routine. The call goes
+  ;; through an extra indirection in the component.
+  ;; This table is stored as an alist of (NAME . LABEL).
+  (indirection-table)
   ;; tracking where we last wrote an instruction so that SB-C::TRACE-INSTRUCTION
   ;; can print "in the {x} section" whenever it changes.
   (tracing-state (list nil nil) :read-only t)) ; segment and vop
@@ -336,6 +345,12 @@
 ;;; FIXME: suboptimal since *asmstream* was declaimed earlier because reasons.
 ;;; (so we're missing uses of the known type even though the special var is known)
 (declaim (type asmstream *asmstream*))
+
+(defun get-allocation-points (asmstream)
+  ;; Convert the label positions to a packed integer
+  ;; Utilize PACK-CODE-FIXUP-LOCS to perform compression.
+  (awhen (mapcar 'label-posn (asmstream-alloc-points asmstream))
+    (sb-c:pack-code-fixup-locs it nil nil)))
 
 ;;; Insert STMT after PREDECESSOR.
 (defun insert-stmt (stmt predecessor)
@@ -368,7 +383,7 @@
           (if (singleton-p list) (car list) list))))
 
 ;;; This is used only to keep track of which vops emit which insts.
-(defvar **current-vop**)
+(defvar *current-vop*)
 
 ;;; Return the final statement emitted.
 (defun emit (section &rest things)
@@ -377,7 +392,7 @@
   ;; - a list (mnemonic . operands) for a machine instruction or assembler directive
   ;; - a function to emit a postit
   (let ((last (section-tail section))
-        (vop (if (boundp '**current-vop**) **current-vop**)))
+        (vop (if (boundp '*current-vop*) *current-vop*)))
     (dolist (thing things (setf (section-tail section) last))
       (if (label-p thing) ; Accumulate multiple labels until the next instruction
           (if (stmt-mnemonic last)
@@ -439,9 +454,10 @@
                      ,(case dest
                         (:code '(asmstream-code-section *asmstream*))
                         (:elsewhere '(asmstream-elsewhere-section *asmstream*))
+                        (:indirections
+                         '(asmstream-indirections-section *asmstream*))
                         (t dest)))))
-              ,@(when vop
-                  `((**current-vop** ,vop)))
+              ,@(when vop `((*current-vop* ,vop)))
               ,@(mapcar (lambda (name)
                           `(,name (gen-label)))
                         new-labels))
@@ -1422,7 +1438,7 @@
 
 ;;; Combine INPUTS into one assembly stream and assemble into SEGMENT
 (defun %assemble (segment section)
-  (let ((**current-vop** nil)
+  (let ((*current-vop* nil)
         (in-without-scheduling)
         (was-scheduling))
     ;; HEADER-SKEW is 1 word (in bytes) if the boxed code header word count is odd.
@@ -1447,9 +1463,9 @@
       (dump-symbolic-asm section sb-c::*compiler-trace-output*))
     (do ((statement (stmt-next (section-start section)) (stmt-next statement)))
         ((null statement))
-      (awhen (stmt-vop statement) (setq **current-vop** it))
+      (awhen (stmt-vop statement) (setq *current-vop* it))
       (dolist (label (ensure-list (stmt-labels statement)))
-        (%emit-label segment **current-vop** label))
+        (%emit-label segment *current-vop* label))
       (let ((mnemonic (stmt-mnemonic statement))
             (operands (stmt-operands statement)))
         (if (functionp mnemonic)
@@ -1486,8 +1502,10 @@
          (end-text (gen-label))
          (combined
            (append-sections
-             (append-sections (asmstream-data-section asmstream)
-                              (asmstream-code-section asmstream))
+            (append-sections (asmstream-data-section asmstream)
+                             (append-sections
+                              (asmstream-code-section asmstream)
+                              (asmstream-indirections-section asmstream)))
              (let ((section (asmstream-elsewhere-section asmstream)))
                (emit section
                      end-text
@@ -1569,7 +1587,7 @@
             (if (eq section (asmstream-code-section asmstream))
                 :regular
                 :elsewhere)))
-      (sb-c::trace-instruction section-name **current-vop** mnemonic operands
+      (sb-c::trace-instruction section-name *current-vop* mnemonic operands
                                (asmstream-tracing-state asmstream)))))
 
 (defmacro inst (&whole whole mnemonic &rest args)
@@ -1650,13 +1668,6 @@
     (trace-inst s :align bits)
     (emit s `(.align ,bits ,pattern))))
 
-;; ECL bug workaround: it miscompiles LABEL-POSITION with this decl
-;; This might be unnecessary now that I'm proclaiming an OPTIMIZE policy
-;; that seems to fix everything. It certainly was needed without that.
-;; At least by keeping this we might be able to report some specific bugs
-;; against ECL in the hope it gets fixed. Of course we can't actually ever
-;; remove workarounds.
-#-host-quirks-ecl
 (declaim (ftype (sfunction (label &optional t index) (or null index))
                 label-position))
 (defun label-position (label &optional if-after delta)
@@ -1911,7 +1922,7 @@
                 ',fun-name
                 (named-lambda ,(string fun-name) (,segment-name ,@operands)
                   (declare ,@decls)
-                  (let ,(and vop-name `((,vop-name **current-vop**)))
+                  (let ,(and vop-name `((,vop-name *current-vop*)))
                     (block ,fun-name ,@emitter)))
                 ',accept-prefixes))))
        ',fun-name)))
@@ -1937,7 +1948,7 @@
 
 (%def-inst-encoder '.align
                    (lambda (segment bits &optional (pattern 0))
-                     (%emit-alignment segment **current-vop** bits pattern)))
+                     (%emit-alignment segment *current-vop* bits pattern)))
 (%def-inst-encoder '.byte
                    (lambda (segment &rest bytes)
                      (dolist (byte bytes) (emit-byte segment byte))))

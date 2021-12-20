@@ -40,7 +40,7 @@
       ;; Exercise for the reader: these next 4 instructions can be
       ;; replaced by just 2: one RLWINM and one RLWIMI
       (inst andi. ndescr ndescr (fixnumize array-rank-mask))
-      (inst slwi ndescr ndescr array-rank-byte-pos)
+      (inst slwi ndescr ndescr array-rank-position)
       (inst or ndescr ndescr type)
       (inst srwi ndescr ndescr n-fixnum-tag-bits)
       (storew ndescr header 0 other-pointer-lowtag))
@@ -53,7 +53,7 @@
   (:policy :fast-safe)
   (:variant array-dimensions-offset other-pointer-lowtag))
 
-(define-vop (%set-array-dimension word-index-set-nr)
+(define-vop (%set-array-dimension word-index-set)
   (:translate %set-array-dimension)
   (:policy :fast-safe)
   (:variant array-dimensions-offset other-pointer-lowtag))
@@ -106,15 +106,48 @@
        (:arg-types ,type positive-fixnum)
        (:results (value :scs ,scs))
        (:result-types ,element-type))
-     (define-vop (,(symbolicate "DATA-VECTOR-SET/" (string type))
-                  ,(symbolicate (string variant) "-SET-NR"))
+     ,(if (eq type 'simple-vector)
+    `(define-vop (,(symbolicate "DATA-VECTOR-SET/" (string type)))
+       (:note "inline array store")
+       (:translate data-vector-set)
+       (:arg-types ,type positive-fixnum ,element-type)
+       (:args (object :scs (descriptor-reg))
+              (index :scs (any-reg immediate))
+              (value :scs ,scs))
+       (:arg-types  simple-vector positive-fixnum *)
+       (:policy :fast-safe)
+       (:temporary (:scs (non-descriptor-reg)) ea t1)
+       (:vop-var vop)
+       (:generator 5
+         ;; To ensure the right card gets marked, the exact element address must
+         ;; be computed. Alternatively, we could allow some leeway in which card(s)
+         ;; we look at in GC to decide whether a vector page was touched.
+         ;; i.e there are games that could be played to make the boundaries fuzzy
+         ;; which might obviate the need to perform two ADDs here,
+         ;; at the expense of some precision in which cards to re-protect.
+         ;; Probably better to just compute effective address precisely.
+         (cond ((sc-is index immediate)
+                (let ((disp (- (ash (+ vector-data-offset (tn-value index)) word-shift)
+                               other-pointer-lowtag)))
+                  (cond ((typep disp '(signed-byte 16))
+                         (inst addi ea object disp))
+                        (t ; doesn't fit in ADDI
+                         (inst lr ea disp)
+                         (inst add ea object ea)))))
+               (t
+                (inst addi ea index (- (ash vector-data-offset word-shift) other-pointer-lowtag))
+                (inst add ea object ea)))
+         (emit-gc-store-barrier object ea (list t1) (vop-nth-arg 2 vop) value)
+         (inst std value ea 0)))
+    `(define-vop (,(symbolicate "DATA-VECTOR-SET/" (string type))
+                  ,(symbolicate (string variant) "-SET"))
        (:note "inline array store")
        (:variant vector-data-offset other-pointer-lowtag)
        (:translate data-vector-set)
        (:arg-types ,type positive-fixnum ,element-type)
        (:args (object :scs (descriptor-reg))
               (index :scs (any-reg immediate))
-              (value :scs ,scs))))))
+              (value :scs ,scs)))))))
   (def-data-vector-frobs simple-base-string byte-index
     character character-reg)
   #+sb-unicode
@@ -472,7 +505,7 @@
   (:result-types unsigned-num)
   (:variant vector-data-offset other-pointer-lowtag))
 
-(define-vop (set-vector-raw-bits word-index-set-nr)
+(define-vop (set-vector-raw-bits word-index-set)
   (:note "setf vector-raw-bits VOP")
   (:translate %set-vector-raw-bits)
   (:args (object :scs (descriptor-reg))
@@ -491,7 +524,7 @@
   (:results (value :scs (signed-reg)))
   (:result-types tagged-num))
 
-(define-vop (data-vector-set/simple-array-signed-byte-8 byte-index-set-nr)
+(define-vop (data-vector-set/simple-array-signed-byte-8 byte-index-set)
   (:note "inline array store")
   (:variant vector-data-offset other-pointer-lowtag)
   (:translate data-vector-set)
@@ -509,7 +542,7 @@
   (:results (value :scs (signed-reg)))
   (:result-types tagged-num))
 
-(define-vop (data-vector-set/simple-array-signed-byte-16 16-bits-index-set-nr)
+(define-vop (data-vector-set/simple-array-signed-byte-16 16-bits-index-set)
   (:note "inline array store")
   (:variant vector-data-offset other-pointer-lowtag)
   (:translate data-vector-set)
@@ -527,7 +560,7 @@
   (:results (value :scs (signed-reg)))
   (:result-types tagged-num))
 
-(define-vop (data-vector-set/simple-array-signed-byte-32 32-bits-index-set-nr)
+(define-vop (data-vector-set/simple-array-signed-byte-32 32-bits-index-set)
   (:note "inline array store")
   (:variant vector-data-offset other-pointer-lowtag)
   (:translate data-vector-set)

@@ -144,7 +144,7 @@
                (delete-filter node lvar (cast-value node))))))))
 
 (defglobal *two-arg-functions*
-    `((* two-arg-*)
+    `((* two-arg-* (,(specifier-type 'fixnum) ,(specifier-type 'fixnum)) multiply-fixnums)
       (+ two-arg-+)
       (- two-arg--)
       (/ two-arg-/ (,(specifier-type 'integer) ,(specifier-type 'integer)) sb-kernel::integer-/-integer)
@@ -241,13 +241,16 @@
                                                   (constant-value leaf)))
                                    (replacement
                                      (cond ((and fun-name (symbolp fun-name))
-                                            (translate-two-args fun-name))
+                                            (or (translate-two-args fun-name)
+                                                (and (not (memq (info :function :kind fun-name)
+                                                                '(:macro :special-form)))
+                                                     fun-name)))
                                            ((and (global-var-p leaf)
                                                  (eq (global-var-kind leaf) :global-function))
                                             (translate-two-args (global-var-%source-name leaf)))))
                                    (*compiler-error-context* node))
                               (and replacement
-                                   (find-free-fun replacement "ir1-finalize")))))
+                                   (find-global-fun replacement t)))))
                    (cond ((ref-p ref)
                           (let ((replacement (translate ref)))
                             (when replacement

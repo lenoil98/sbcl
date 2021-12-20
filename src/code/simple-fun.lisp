@@ -48,16 +48,7 @@
   (and (logtest (function-header-word closure) closure-extra-data-indicator)
        (evenp (get-closure-length closure))))
 
-(macrolet ((%closure-index-set (closure index val)
-             ;; Use the identical convention as %CLOSURE-INDEX-REF for the index.
-             ;; There are no closure slot setters, and in fact SLOT-SET
-             ;; does not exist in a variant that takes a non-constant index.
-             `(setf (sap-ref-lispobj (int-sap (get-lisp-obj-address ,closure))
-                                     (+ (ash ,index sb-vm:word-shift)
-                                        (- (ash sb-vm:closure-info-offset sb-vm:word-shift)
-                                           sb-vm:fun-pointer-lowtag)))
-                    ,val))
-           (new-closure (nvalues)
+(macrolet ((new-closure (nvalues)
              ;; argument is the number of INFO words
              #-(or x86 x86-64)
              `(sb-vm::%alloc-closure ,nvalues (%closure-fun closure))
@@ -68,24 +59,24 @@
                 ;; until after the new closure is made.
                 (sb-vm::%alloc-closure ,nvalues (sb-vm::%closure-callee closure))))
            (copy-slots (has-extra-data)
-             `(do ((sap (sap+ (int-sap (get-lisp-obj-address copy))
-                              (- sb-vm:fun-pointer-lowtag)))
-                   (i (ash sb-vm:closure-info-offset sb-vm:word-shift)
-                      (+ i sb-vm:n-word-bytes))
-                   (j 0 (1+ j)))
+             `(do ((j 0 (1+ j)))
                   ((>= j nvalues)
-                   ,@(when has-extra-data
-                       `((setf (sap-ref-word sap 0)
-                               (logior (function-header-word copy)
-                                       closure-extra-data-indicator))))
-                   #+immobile-space ; copy the layout
-                   (setf (sap-ref-32 sap 4) ; ASSUMPTION: little-endian
-                         (logior (get-lisp-obj-address
-                                  (wrapper-friend ,(find-layout 'function)))))
-                   #+metaspace ; copy the CODE (not accessible by index-ref)
-                   (setf (sap-ref-lispobj sap (ash sb-vm::closure-code-slot sb-vm:word-shift))
-                         (sb-vm::%closure-code closure)))
-                (setf (sap-ref-lispobj sap i) (%closure-index-ref closure j)))))
+                   (with-pinned-objects (copy)
+                     (let ((sap (sap+ (int-sap (get-lisp-obj-address copy))
+                                      (- sb-vm:fun-pointer-lowtag))))
+                       (declare (ignorable sap))
+                       ,@(when has-extra-data
+                           `((setf (sap-ref-word sap 0)
+                                   (logior (function-header-word copy)
+                                           closure-extra-data-indicator))))
+                       #+immobile-space ; copy the layout
+                       (setf (sap-ref-32 sap 4) ; ASSUMPTION: little-endian
+                             (logior (get-lisp-obj-address
+                                      (wrapper-friend ,(find-layout 'function)))))
+                       #+metaspace ; copy the CODE (not accessible by index-ref)
+                       (setf (sap-ref-lispobj sap (ash sb-vm::closure-code-slot sb-vm:word-shift))
+                             (sb-vm::%closure-code closure)))))
+                (%closure-index-set copy j (%closure-index-ref closure j)))))
 
   ;; This is factored out because of a cutting-edge implementation
   ;; of tracing wrappers that I'm trying to finish.
@@ -94,7 +85,7 @@
     (let* ((nvalues (closure-len->nvalues
                      (get-closure-length (truly-the function closure))))
            (copy (new-closure nvalues)))
-      (with-pinned-objects (copy) (copy-slots nil))
+      (copy-slots nil)
       copy))
 
   ;;; Assign CLOSURE a new name and/or docstring in VALUES, and return the
@@ -303,7 +294,7 @@
                           ((not simple-vector) info))))
     ;; For backward-compatibility we expand SFUNCTION -> FUNCTION.
     (if (and (listp internal-type) (eq (car internal-type) 'sfunction))
-        (sb-ext:typexpand-1 internal-type)
+        (values (sb-ext:typexpand-1 internal-type))
         internal-type)))
 
 (defun %simple-fun-xrefs (fun)
@@ -379,6 +370,14 @@
 
 ;;;; CODE-COMPONENT
 
+;;; software mark bits on pages of code require that all assignments to
+;;; header slots go through the CODE-HEADER-SET vop,
+;;; which is slightly different from the general soft card mark implementation
+;;; for historical reasons.
+(defun (setf %code-debug-info) (newval code)
+  (setf (code-header-ref code sb-vm:code-debug-info-slot) newval)
+  newval)
+
 (defun %code-debug-info (code-obj)
   ;; Extract the unadulterated debug-info emitted by the compiler. The slot
   ;; value might be a cons of that and info stuffed in by the debugger.
@@ -387,6 +386,10 @@
         (car info)
         ;; return it unchanged in all other cases
         info)))
+
+(defun (setf sb-vm::%code-fixups) (newval code)
+  (code-header-set code sb-vm::code-fixups-slot newval)
+  newval)
 
 (declaim (inline code-obj-is-filler-p))
 (defun code-obj-is-filler-p (code-obj)

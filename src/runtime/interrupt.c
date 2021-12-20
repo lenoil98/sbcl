@@ -393,8 +393,12 @@ static void sigaddset_deferrable(sigset_t *s) {
     sigaddset(s, SIGXCPU);
 #endif
     sigaddset(s, SIGXFSZ);
+#if !(defined SIG_STOP_FOR_GC && SIG_STOP_FOR_GC == SIGVTALRM)
     sigaddset(s, SIGVTALRM);
+#endif
+#if !(defined SIG_STOP_FOR_GC && SIG_STOP_FOR_GC == SIGWINCH)
     sigaddset(s, SIGWINCH);
+#endif
 }
 
 static void
@@ -427,6 +431,7 @@ sigaddset_blockable(sigset_t *sigset)
 /* initialized in interrupt_init */
 sigset_t deferrable_sigset;
 sigset_t blockable_sigset;
+sigset_t thread_start_sigset;
 /* gc_sigset will have exactly 1 bit on, for SIG_STOP_FOR_GC, or no bits on.
  * We always use SIGUSR2 as SIG_STOP_FOR_GC, though in days past it may have
  * varied by OS. Also, long ago, there was a different signal to resume after
@@ -470,20 +475,34 @@ deferrables_blocked_p(sigset_t *sigset)
      * not affect behavior of correct code - it is just to decide whether we understand
      * the signal mask to be in a valid state, but it was overly restrictive.
      *
-     * Also SIGPWR is conspicuously absent. SB-THREAD:INTERRUPT-THREAD used it long ago,
-     * but I don't know why it was never in sigaddset_deferrable.
+     * Also SIGXCPU and SIGPWR are conspicuously absent. SB-THREAD:INTERRUPT-THREAD
+     * used SIGPWR long ago, but I don't know why it was never in deferrable_sigset.
      */
-    int mask = (sigismember(sigset, SIGHUP)    << 10) |
-               (sigismember(sigset, SIGINT)    << 9) |
-               (sigismember(sigset, SIGTERM)   << 8) |
-               (sigismember(sigset, SIGQUIT)   << 7) |
-               (sigismember(sigset, SIGURG)    << 6) |
-               (sigismember(sigset, SIGTSTP)   << 5) |
-               (sigismember(sigset, SIGCHLD)   << 4) |
-               (sigismember(sigset, SIGXFSZ)   << 3) |
-               (sigismember(sigset, SIGVTALRM) << 2) |
-               (sigismember(sigset, SIGWINCH)  << 1);
-    if (mask == 0x7fe) return 1;
+    const int expected_mask = 0x3ff
+#if (defined SIG_STOP_FOR_GC && SIG_STOP_FOR_GC == SIGVTALRM)
+                              - (1<<1)
+#endif
+#if (defined SIG_STOP_FOR_GC && SIG_STOP_FOR_GC == SIGWINCH)
+                              - (1<<0)
+#endif
+                              ;
+
+    int mask = (sigismember(sigset, SIGHUP)    << 9)
+             | (sigismember(sigset, SIGINT)    << 8)
+             | (sigismember(sigset, SIGTERM)   << 7)
+             | (sigismember(sigset, SIGQUIT)   << 6)
+             | (sigismember(sigset, SIGURG)    << 5)
+             | (sigismember(sigset, SIGTSTP)   << 4)
+             | (sigismember(sigset, SIGCHLD)   << 3)
+             | (sigismember(sigset, SIGXFSZ)   << 2)
+#if !(defined SIG_STOP_FOR_GC && SIG_STOP_FOR_GC == SIGVTALRM)
+             | (sigismember(sigset, SIGVTALRM) << 1)
+#endif
+#if !(defined SIG_STOP_FOR_GC && SIG_STOP_FOR_GC == SIGWINCH)
+             | (sigismember(sigset, SIGWINCH)  << 0)
+#endif
+               ;
+    if (mask == expected_mask) return 1;
     if (!mask) return 0;
     char buf[3*64]; // assuming worst case 64 signals present in sigset
     sigset_tostring(sigset, buf, sizeof buf);
@@ -785,7 +804,24 @@ check_interrupt_context_or_lose(os_context_t *context)
 /*
  * utility routines used by various signal handlers
  */
+#ifdef LISP_FEATURE_ARM64
+static void
+build_fake_control_stack_frames(struct thread __attribute__((unused)) *th,
+                                os_context_t __attribute__((unused)) *context)
+{
 
+    lispobj oldcont;
+    /* Ignore the two words above CSP, which can be used without adjusting CSP */
+    lispobj* csp = (lispobj *)(uword_t) (*os_context_register_addr(context, reg_CSP)) + 2;
+    access_control_frame_pointer(th) = (lispobj *)(uword_t) csp;
+
+    oldcont = (lispobj)(*os_context_register_addr(context, reg_CFP));
+
+    access_control_frame_pointer(th)[1] = *os_context_pc_addr(context);
+    access_control_frame_pointer(th)[0] = oldcont;
+    access_control_stack_pointer(th) = csp + 2;
+}
+#else
 static void
 build_fake_control_stack_frames(struct thread __attribute__((unused)) *th,
                                 os_context_t __attribute__((unused)) *context)
@@ -849,6 +885,7 @@ build_fake_control_stack_frames(struct thread __attribute__((unused)) *th,
 #endif
 #endif
 }
+#endif
 
 /* Stores the context for gc to scavange and builds fake stack
  * frames. */
@@ -885,8 +922,6 @@ void fake_foreign_function_call_noassert(os_context_t *context)
                   thread);
 #endif
 
-    build_fake_control_stack_frames(thread,context);
-
     /* Do dynamic binding of the active interrupt context index
      * and save the context in the context array. */
     context_index =
@@ -900,10 +935,17 @@ void fake_foreign_function_call_noassert(os_context_t *context)
 
     nth_interrupt_context(context_index, thread) = context;
 
-#if !defined(LISP_FEATURE_X86) && !defined(LISP_FEATURE_X86_64)
+    build_fake_control_stack_frames(thread, context);
+
+#if !defined(LISP_FEATURE_X86) && !defined(LISP_FEATURE_X86_64) &&  \
+  !(defined(LISP_FEATURE_ARM64) && defined(LISP_FEATURE_SB_THREAD))
     /* x86oid targets don't maintain the foreign function call flag at
      * all, so leave them to believe that they are never in foreign
-     * code. */
+     * code.
+
+     And ARM64 uses control_stack_pointer, which is set in
+     build_fake_control_stack_frames. */
+
     foreign_function_call_active_p(thread) = 1;
 #endif
 }
@@ -2009,6 +2051,14 @@ interrupt_init(void)
     sigaddset_deferrable(&deferrable_sigset);
     sigaddset_blockable(&blockable_sigset);
     sigaddset_gc(&gc_sigset);
+
+    sigaddset_deferrable(&thread_start_sigset);
+    /* sigprof_handler may interrupt a thread that doesn't have
+     current_thread set up yet, which can be a thread-local variable,
+     and sigprof_handler will try to allocate it, but thread-local
+     initialization is not guaranteed to be async safe. */
+    sigaddset(&thread_start_sigset, SIGPROF);
+
 
 #ifdef LISP_FEATURE_BACKTRACE_ON_SIGNAL
     // Use this only if you know what you're doing

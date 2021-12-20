@@ -502,20 +502,6 @@
                   (eval `(let (,@(mapcar 'list vars vals))
                       ,read-form)))))))
 
-(let ((foo (cons :foo nil)))
-  (defun cas-foo (old new)
-    (cas (cdr foo) old new)))
-
-(defcas foo () cas-foo)
-
-(with-test (:name :cas-and-macroexpansion)
-  (assert (not (cas (foo) nil t)))
-  (assert (eq t (cas (foo) t nil)))
-  (symbol-macrolet ((bar (foo)))
-    (assert (not (cas bar nil :ok)))
-    (assert (eq :ok (cas bar :ok nil)))
-    (assert (not (cas bar nil t)))))
-
 (with-test (:name :atomic-push
             :skipped-on (not :sb-thread))
   (let ((store (cons nil nil))
@@ -552,17 +538,6 @@
                      (declare (special x))
                      (atomic-pop (symbol-value 'x))))))
       1)))
-
-#+x86-64 ; missing symbol sb-vm::signed-sap-cas-32 otherwise
-(with-test (:name :cas-sap-ref ; FIXME: remove
-            :skipped-on :interpreter)
-  (let ((v (make-array 2 :element-type '(signed-byte 32)
-                         :initial-element -1)))
-    (let ((old (sb-sys:%primitive sb-vm::signed-sap-cas-32
-                                  (sb-sys:vector-sap v)
-                                  0 -1 1)))
-      (assert (= old -1))
-      (assert (eql (aref v 0) 1)))))
 
 (in-package "SB-VM")
 

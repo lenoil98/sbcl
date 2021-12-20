@@ -11,7 +11,8 @@
 
 (in-package "SB-VM")
 
-(defconstant-eqx +fixup-kinds+ #(:absolute :absolute64 :layout-id :b :ba :ha :l) #'equalp)
+(defconstant-eqx +fixup-kinds+ #(:absolute :absolute64 :layout-id :b :ba :ha :l :rldic-m)
+  #'equalp)
 
 ;;; NUMBER-STACK-DISPLACEMENT
 ;;;
@@ -76,8 +77,10 @@
   (defreg thread 30)
   (defreg lip 31)
 
+  ;; nl5 is reserved for the GC card table base. It's restored after every
+  ;; foreign call, since it coincides with the sixth C arg-passing register.
   (defregset non-descriptor-regs
-      nl0 nl1 nl2 nl3 nl4 nl5 nl6 cfunc nargs nfp)
+      nl0 nl1 nl2 nl3 nl4 #|nl5|# nl6 cfunc nargs nfp)
 
   (defregset descriptor-regs
       fdefn a0 a1 a2 a3  ocfp lra lexenv l0 l1)
@@ -358,8 +361,8 @@
                      (destructuring-bind (size posn integer)
                          (sb-c::basic-combination-args node)
                        (declare (ignore integer))
-                       (<= (+ (sb-c::lvar-value size)
-                              (sb-c::lvar-value posn))
+                       (<= (+ (sb-c:lvar-value size)
+                              (sb-c:lvar-value posn))
                            width)))))
          (if (or (validp 'fixnum 29)
                  (validp '(signed-byte 32) 32)

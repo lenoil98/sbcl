@@ -39,13 +39,13 @@
 ;;; them at a known location.
 (defun make-old-fp-save-location (env)
   (specify-save-tn
-   (physenv-debug-live-tn (make-normal-tn *fixnum-primitive-type*) env)
+   (environment-debug-live-tn (make-normal-tn *fixnum-primitive-type*) env)
    (make-wired-tn *fixnum-primitive-type*
                   control-stack-arg-scn
                   ocfp-save-offset)))
 (defun make-return-pc-save-location (env)
   (specify-save-tn
-   (physenv-debug-live-tn (make-normal-tn *backend-t-primitive-type*) env)
+   (environment-debug-live-tn (make-normal-tn *backend-t-primitive-type*) env)
    (make-wired-tn *backend-t-primitive-type*
                   control-stack-arg-scn
                   lra-save-offset)))
@@ -142,7 +142,7 @@
     (move res csp-tn)
     (inst addi csp-tn csp-tn
           (* n-word-bytes (sb-allocated-size 'control-stack)))
-    (when (ir2-physenv-number-stack-p callee)
+    (when (ir2-environment-number-stack-p callee)
       (let* ((nbytes (bytes-needed-for-non-descriptor-stack-frame)))
         (when (> nbytes number-stack-displacement)
           (inst stdu nsp-tn nsp-tn (- (bytes-needed-for-non-descriptor-stack-frame)))
@@ -354,8 +354,7 @@ default-value-8
               values-start)
   (:temporary (:sc any-reg :offset nargs-offset
                :from :eval :to (:result 1))
-              nvals)
-  (:temporary (:scs (non-descriptor-reg)) temp))
+              nvals))
 
 
 ;;; This hook in the codegen pass lets us insert code before fall-thru entry
@@ -742,9 +741,6 @@ default-value-8
                   ;; Conditionally insert a conditional trap:
                   (when step-instrumenting
                     ;; Get the symbol-value of SB-IMPL::*STEPPING*
-                    #-sb-thread
-                    (load-symbol-value stepping sb-impl::*stepping*)
-                    #+sb-thread
                     (loadw stepping thread-base-tn thread-stepping-slot)
                     (inst cmpwi stepping 0)
                     ;; If it's not null, trap.
@@ -1134,6 +1130,20 @@ default-value-8
   (:variant 0 0)
   (:translate %more-arg))
 
+(define-vop (more-arg-or-nil)
+  (:policy :fast-safe)
+  (:args (object :scs (descriptor-reg) :to (:result 1))
+         (count :scs (any-reg)))
+  (:info index)
+  (:results (value :scs (descriptor-reg any-reg)))
+  (:result-types *)
+  (:generator 3
+    (inst cmpwi count (fixnumize index))
+    (move value null-tn)
+    (inst ble done)
+    (loadw value object index)
+    done))
+
 ;;; Turn more arg (context, count) into a list.
 (define-vop ()
   (:translate %listify-rest-args)
@@ -1252,9 +1262,6 @@ default-value-8
   (:vop-var vop)
   (:generator 3
     ;; Get the symbol-value of SB-IMPL::*STEPPING*
-    #-sb-thread
-    (load-symbol-value stepping sb-impl::*stepping*)
-    #+sb-thread
     (loadw stepping thread-base-tn thread-stepping-slot)
     (inst cmpwi stepping 0)
     ;; If it's not zero, trap.

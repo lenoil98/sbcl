@@ -78,7 +78,7 @@
   (find id (cdr spaces) :key #'space-id))
 (defun compute-nil-object (spaces)
   (let ((space (get-space static-core-space-id spaces)))
-    (%make-lisp-obj (logior (space-addr space) #x117))))
+    (%make-lisp-obj (logior (space-addr space) #x117)))) ; SUPER KLUDGE
 
 ;;; Given OBJ which is tagged pointer into the target core, translate it into
 ;;; the range at which the core is now mapped during execution of this tool,
@@ -103,6 +103,8 @@
                  (:constructor %make-core))
   (spaces)
   (nil-object)
+  ;; mapping from small integer ID to package
+  (pkg-id->package)
   ;; mapping from string naming a package to list of symbol names (strings)
   ;; that are external in the package.
   (packages (make-hash-table :test 'equal))
@@ -244,11 +246,12 @@
          (let ((p (position #\/ x :from-end t)))
            (if p (subseq x (1+ p)) x)))
         ((symbolp x)
-         (let ((name (translate (symbol-name x) spaces)))
-           (when (eq (symbol-package x) core-nil) ; uninterned
+         (let ((package-id (sb-impl::symbol-package-id x))
+               (name (translate (symbol-name x) spaces)))
+           (when (eq package-id 0) ; uninterned
              (return-from recurse (string-downcase name)))
            (let* ((package (truly-the package
-                                      (translate (symbol-package x) spaces)))
+                                      (aref (core-pkg-id->package core) package-id)))
                   (package-name (translate (package-%name package) spaces)))
              ;; The name-cleaning code wants to compare against symbols
              ;; in CL, PCL, and KEYWORD, so use real symbols for those.
@@ -393,8 +396,10 @@
           (pairs (cons (descriptorize (svref cells i))
                        (descriptorize (svref cells (1+ i))))))))))
 
+(defmacro package-id (name) (sb-impl::package-id (find-package name)))
+
 ;;; Return either the physical or logical address of the specified symbol.
-(defun find-target-symbol (package-name symbol-name spaces
+(defun find-target-symbol (package-id symbol-name spaces
                            &optional (address-mode :physical))
   (dolist (id `(,immobile-fixedobj-core-space-id ,static-core-space-id))
     (let* ((space (get-space id spaces))
@@ -407,12 +412,7 @@
              (size (primitive-object-size obj)))
         (when (and (symbolp obj)
                    (string= symbol-name (translate (symbol-name obj) spaces))
-                   (%instancep (symbol-package obj))
-                   (string= package-name
-                            (translate
-                             (package-%name
-                              (truly-the package (translate (symbol-package obj) spaces)))
-                             spaces)))
+                   (= (sb-impl::symbol-package-id obj) package-id))
           (return-from find-target-symbol
             (%make-lisp-obj
                    (logior (ecase address-mode
@@ -420,14 +420,14 @@
                              (:logical (+ (space-addr space) (- physaddr start))))
                            other-pointer-lowtag))))
         (incf physaddr size)))))
-  (bug "Can't find symbol ~A::~A" package-name symbol-name))
+  (bug "Can't find symbol ~A::~A" package-id symbol-name))
 
 (defparameter label-prefix (if (member :darwin *features*) "_" ""))
 (defun labelize (x) (concatenate 'string label-prefix x))
 
 (defun compute-linkage-symbols (spaces)
   (let* ((linkage-info (symbol-global-value
-                        (find-target-symbol "SB-SYS" "*LINKAGE-INFO*"
+                        (find-target-symbol (package-id "SB-SYS") "*LINKAGE-INFO*"
                                             spaces :physical)))
          (hashtable (car (translate linkage-info spaces)))
          (pairs (target-hash-table-alist hashtable spaces))
@@ -452,12 +452,12 @@
   (let* ((linkage-bounds
           (make-bounds
            (symbol-global-value
-            (find-target-symbol "SB-VM" "LINKAGE-TABLE-SPACE-START" spaces :physical))
+            (find-target-symbol (package-id "SB-VM") "LINKAGE-TABLE-SPACE-START" spaces :physical))
            (symbol-global-value
-            (find-target-symbol "SB-VM" "LINKAGE-TABLE-SPACE-END" spaces :physical))))
+            (find-target-symbol (package-id "SB-VM") "LINKAGE-TABLE-SPACE-END" spaces :physical))))
          (linkage-entry-size
           (symbol-global-value
-           (find-target-symbol "SB-VM" "LINKAGE-TABLE-ENTRY-SIZE"
+           (find-target-symbol (package-id "SB-VM") "LINKAGE-TABLE-ENTRY-SIZE"
                                spaces :physical)))
          (linkage-symbols (compute-linkage-symbols spaces))
          (nil-object (compute-nil-object spaces))
@@ -477,7 +477,8 @@
            :enable-pie enable-pie)))
     (let ((package-table
            (symbol-global-value
-            (find-target-symbol "SB-KERNEL" "*PACKAGE-NAMES*" spaces :physical)))
+            (find-target-symbol (package-id "SB-KERNEL") "*PACKAGE-NAMES*" spaces :physical)))
+          (package-alist)
           (symbols (make-hash-table :test 'equal)))
       (dovector (x (translate (%instance-ref (translate package-table spaces) 0) spaces))
         (when (%instancep x) ; package
@@ -487,8 +488,14 @@
                       (pushnew (get-lisp-obj-address sym) (gethash str symbols)))
                     table core)))
             (let ((package (truly-the package (translate x spaces))))
+              (push (cons (sb-impl::package-id package) package) package-alist)
               (scan (package-external-symbols package))
               (scan (package-internal-symbols package))))))
+      (let ((package-by-id (make-array (1+ (reduce #'max package-alist :key #'car))
+                                       :initial-element nil)))
+        (loop for (id . package) in package-alist
+              do (setf (aref package-by-id id) package))
+        (setf (core-pkg-id->package core) package-by-id))
       (dohash ((string symbols) symbols)
         (when (cdr symbols)
           (setf (gethash string ambiguous-symbols) t))))
@@ -577,7 +584,7 @@
                                       (- operand (bounds-low (core-code-bounds core))))))
                    (push (list* (dstate-cur-offs dstate) 5 "mov" text) list)))
                 ((and (eq (inst-name inst) 'mov) ; match "mov qword ptr [R+disp8], imm32"
-                      (eql (sap-ref-8 sap (1- offs))    #x48)
+                      (member (sap-ref-8 sap (1- offs)) '(#x48 #x49)) ; REX.w and maybe REX.b
                       (eql (sap-ref-8 sap offs)         #xC7)
                       ;; modRegRm = #b01 #b000 #b___
                       (eql (logand (sap-ref-8 sap (1+ offs)) #o370) #o100))
@@ -888,7 +895,7 @@
                   collect (sap-ref-8 text-sap i)))
     (when additional-relative-fixups
       (binding* ((existing-fixups (sb-vm::%code-fixups code))
-                 ((absolute relative)
+                 ((absolute relative immediate)
                   (sb-c::unpack-code-fixup-locs
                    (if (fixnump existing-fixups)
                        existing-fixups
@@ -903,9 +910,8 @@
                                                    sb-vm:word-shift))))
                                 additional-relative-fixups)
                         #'<)))
-        (sb-c::pack-code-fixup-locs
-         absolute
-         (merge 'list relative new-sorted #'<))))))
+        (sb-c:pack-code-fixup-locs
+         absolute (merge 'list relative new-sorted #'<) immediate)))))
 
 (defconstant +gf-name-slot+ 5)
 
@@ -1751,14 +1757,15 @@
                       ;; adjust this entry's start page in the new core
                       (decf data-page page-adjust)))))
             (#.page-table-core-entry-type-code
-             (aver (= len 3))
-             (symbol-macrolet ((nbytes (%vector-raw-bits core-header (1+ ptr)))
-                               (data-page (%vector-raw-bits core-header (+ ptr 2))))
+             (aver (= len 4))
+             (symbol-macrolet ((n-ptes (%vector-raw-bits core-header (+ ptr 1)))
+                               (nbytes (%vector-raw-bits core-header (+ ptr 2)))
+                               (data-page (%vector-raw-bits core-header (+ ptr 3))))
                (aver (= data-page original-total-npages))
                (aver (= (ceiling (space-nwords
                                   (find dynamic-core-space-id spaces :key #'space-id))
-                                 (/ +backend-page-bytes+ n-word-bytes))
-                        (%vector-raw-bits core-header ptr))) ; number of PTEs
+                                 (/ sb-vm:gencgc-card-bytes n-word-bytes))
+                        n-ptes))
                (when verbose
                  (format t "PTE: page=~5x~40tbytes=~8x~%" data-page nbytes))
                (push (cons data-page nbytes) copy-actions)
@@ -1840,8 +1847,8 @@
                             ("*COMPILE-TO-MEMORY-SPACE*" . "DYNAMIC")))
               (destructuring-bind (symbol . value) item
                 (%set-symbol-global-value
-                 (find-target-symbol "SB-C" symbol map)
-                 (find-target-symbol "KEYWORD" value map :logical))))
+                 (find-target-symbol (package-id "SB-C") symbol map)
+                 (find-target-symbol (package-id "KEYWORD") value map :logical))))
             ;;
             (dolist (space data-spaces) ; Copy pages from memory
               (let ((start (space-physaddr space map))
@@ -1900,9 +1907,9 @@
                (when (plusp nwords)
                  (push (make-space id addr data-page 0 nwords) spaces))))
             (#.page-table-core-entry-type-code
-             (aver (= len 3))
-             (symbol-macrolet ((nbytes (%vector-raw-bits core-header (1+ ptr)))
-                               (data-page (%vector-raw-bits core-header (+ ptr 2))))
+             (aver (= len 4))
+             (symbol-macrolet ((nbytes (%vector-raw-bits core-header (+ ptr 2)))
+                               (data-page (%vector-raw-bits core-header (+ ptr 3))))
                (aver (= data-page total-npages))
                (setq core-size (+ (* total-npages +backend-page-bytes+) nbytes))))))
         (incf core-size +backend-page-bytes+) ; add in core header page

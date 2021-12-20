@@ -1855,7 +1855,9 @@ session."
                       (with-pinned-objects (mask)
                         (sb-unix::pthread-sigmask sb-unix::SIG_SETMASK mask nil))
                       ;; Otherwise just do the usual thing
-                      (sb-unix::unblock-deferrable-signals)))))
+                      (sb-unix::pthread-sigmask sb-unix::SIG_UNBLOCK
+                                                (foreign-symbol-sap "thread_start_sigset" t)
+                                                nil)))))
          ;; notinline keeps array off the call stack by getting it out of the curent frame
          (declare (notinline unmask-signals))
          ;; Signals other than stop-for-GC  are masked. The WITH/WITHOUT noise is
@@ -2009,7 +2011,7 @@ See also: RETURN-FROM-THREAD, ABORT-THREAD."
       ;; before the various interrupt-related special vars are set up.
       ;; Preserve the current mask into SAVED-SIGMASK and CHILD-SIGMASK.
       (sb-unix::pthread-sigmask sb-unix::SIG_BLOCK
-                                (foreign-symbol-sap "deferrable_sigset" t)
+                                (foreign-symbol-sap "thread_start_sigset" t)
                                 saved-sigmask)
       (replace child-sigmask saved-sigmask)
       ;; Ensure that timers and interrupt-thread are directed only to "user" threads.
@@ -2643,12 +2645,11 @@ mechanism for inter-thread communication."
                 (mapcar 'allocator-histogram (list-all-threads))))
       (with-deathlok (thread c-thread)
         (unless (= c-thread 0)
-          (let ((a (make-array sb-vm:n-word-bits :element-type 'fixnum)))
-            (declare (notinline position)) ; style-warning for some reason
-            (dotimes (i sb-vm:n-word-bits)
+          (dx-let ((a (make-array (+ sb-vm::histogram-small-bins sb-vm:n-word-bits)
+                                  :element-type 'fixnum)))
+            (dotimes (i (length a))
               (setf (aref a i) (histogram-value c-thread i)))
-            (list (subseq a sb-vm:n-lowtag-bits ; discard uninteresting entries
-                          (1+ (position 0 a :from-end t :test #'/=)))
+            (list (subseq a 0 (1+ (or (position 0 a :from-end t :test #'/=) -1)))
                   (metric c-thread sb-vm::thread-tot-bytes-alloc-boxed-slot)
                   (metric c-thread sb-vm::thread-tot-bytes-alloc-unboxed-slot)
                   (metric c-thread sb-vm::thread-slow-path-allocs-slot)
@@ -2662,26 +2663,32 @@ mechanism for inter-thread communication."
       (setf (metric c-thread sb-vm::thread-tot-bytes-alloc-boxed-slot) 0
             (metric c-thread sb-vm::thread-tot-bytes-alloc-unboxed-slot) 0
             (metric c-thread sb-vm::thread-slow-path-allocs-slot) 0)
-      (dotimes (i sb-vm:n-word-bits)
+      (dotimes (i (+ sb-vm::histogram-small-bins sb-vm:n-word-bits))
         (setf (histogram-value c-thread i) 0)))))
 
 (defun print-allocator-histogram (&optional (thread *current-thread*))
   (destructuring-bind (bins tot-bytes-boxed tot-bytes-unboxed n-slow-path lock find clear)
       (allocator-histogram thread)
     (let ((total-objects (reduce #'+ bins))
-          (size (* 4 sb-vm:n-word-bytes)) ; "<=" this size is the smallest bin
           (cumulative 0))
       (format t "~&       Size      Count    Cum%~%")
-      (dovector (count bins)
+      (loop for index from 0
+            for count across bins
+            for size-exact-p = (< index sb-vm::histogram-small-bins)
+            for size = (if size-exact-p
+                           (* (1+ index) 2 sb-vm:n-word-bytes)
+                           (ash 1 (+ (- index sb-vm::histogram-small-bins) 10)))
+        do
         (incf cumulative count)
         (format t "~& ~10@a : ~8d  ~6,2,2f~%"
-                (if (< size 1048576)
-                    (format nil "< ~d" size)
-                    (format nil "< 2^~d" (1- (integer-length size))))
+                (cond (size-exact-p size)
+                      ((< size 1048576) (format nil "< ~d" size))
+                      (t (format nil "< 2^~d" (1- (integer-length size)))))
                 count (/ cumulative total-objects))
         (setq size (* size 2)))
-      (format t "Total: ~D+~D bytes, ~D objects, ~,2,2f% fast path~%"
-              tot-bytes-boxed tot-bytes-unboxed total-objects
-              (/ (- total-objects n-slow-path) total-objects))
+      (when (plusp total-objects)
+        (format t "Total: ~D+~D bytes, ~D objects, ~,2,2f% fast path~%"
+                tot-bytes-boxed tot-bytes-unboxed total-objects
+                (/ (- total-objects n-slow-path) total-objects)))
       (format t "Times (sec): lock=~,,-9f find=~,,-9f clear=~,,-9f~%"
               lock find clear)))))

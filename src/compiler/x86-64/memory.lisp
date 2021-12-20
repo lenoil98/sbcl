@@ -18,8 +18,45 @@
                  (+ nil-value (static-symbol-offset symbol) offset)
                  (make-fixup symbol :immobile-symbol offset)))))
 
-(defun gen-cell-set (ea value)
-  (if (sc-is value immediate)
+;;; TODOs:
+;;; 1. Sometimes people write constructors like
+;;;     (defun make-foo (&key a b c)
+;;;      (let ((new-foo (really-make-foo)))
+;;;        (when should-set-a (setf (foo-a new-foo) a))
+;;;        (when should-set-b (setf (foo-b new-foo) b))
+;;;        ...
+;;;    In this case, the asssignments are constructor-like. Even though
+;;;    they look mutating, the store barrier can be omitted.
+;;;    I think the general idea is that if a slot of a newly
+;;;    constructed thing receives the value of an incoming
+;;;    argument, the object in that argument can't possibly
+;;;    be younger than the newly constructed thing.
+;;; 2. hash-table k/v pair should mark once only.
+;;;    (the vector elements are certainly on the same card)
+(defun emit-gc-store-barrier (object cell-address scratch-reg &optional value-tn-ref value-tn)
+  (when (sc-is object constant immediate)
+    (aver (symbolp (tn-value object))))
+  (when (require-gc-store-barrier-p object value-tn-ref value-tn)
+    (if cell-address ; for SIMPLE-VECTOR, the page holding the specific element index gets marked
+        (inst lea scratch-reg cell-address)
+        ;; OBJECT could be a symbol in immobile space
+        (inst mov scratch-reg (encode-value-if-immediate object)))
+    (inst shr scratch-reg gencgc-card-shift)
+    ;; gc_allocate_ptes() asserts mask to be < 32 bits, which is hugely generous.
+    (inst and :dword scratch-reg card-index-mask)
+    ;; I wanted to use thread-tn as the source of the store, but it isn't 256-byte-aligned
+    ;; due to presence of negatively indexed thread header slots.
+    ;; Probably word-alignment is enough, because we can just check the lowest bit,
+    ;; borrowing upon the idea from PSEUDO-ATOMIC which uses RBP-TN as the source.
+    ;; I'd like to measure to see if using a register is actually better.
+    ;; If all threads store 0, it might be easier on the CPU's store buffer.
+    ;; Otherwise, it has to remember who "wins". 0 makes it indifferent.
+    (inst mov :byte (ea gc-card-table-reg-tn scratch-reg)
+          (or #| #+(or (not sb-thread) gs-seg) |# 0 thread-tn))))
+
+(defun gen-cell-set (ea value val-temp)
+  (sc-case value
+   (immediate
       (let ((bits (encode-value-if-immediate value)))
         ;; Try to move imm-to-mem if BITS fits
         (acond ((or (and (fixup-p bits)
@@ -29,9 +66,13 @@
                     (plausible-signed-imm32-operand-p bits))
                 (inst mov :qword ea it))
                (t
-                (inst mov temp-reg-tn bits)
-                (inst mov ea temp-reg-tn))))
-      (inst mov :qword ea value)))
+                (inst mov val-temp bits)
+                (inst mov ea val-temp)))))
+   (constant
+      (inst mov val-temp value)
+      (inst mov :qword ea val-temp))
+   (t
+      (inst mov :qword ea value))))
 
 ;;; CELL-REF and CELL-SET are used to define VOPs like CAR, where the
 ;;; offset to be read or written is a property of the VOP used.
@@ -49,8 +90,12 @@
          (value :scs (descriptor-reg any-reg immediate)))
   (:variant-vars offset lowtag)
   (:policy :fast-safe)
+  (:temporary (:sc unsigned-reg) val-temp)
+  (:vop-var vop)
   (:generator 4
-    (gen-cell-set (object-slot-ea object offset lowtag) value)))
+    (emit-gc-store-barrier object nil val-temp (vop-nth-arg 1 vop) value)
+    (let ((ea (object-slot-ea object offset lowtag)))
+      (gen-cell-set ea value val-temp))))
 
 ;;; X86 special
 (define-vop (cell-xadd)

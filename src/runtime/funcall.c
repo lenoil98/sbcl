@@ -18,7 +18,6 @@
 #include "sbcl.h"
 #include "runtime.h"
 #include "globals.h"
-#include "os.h"
 #include "interrupt.h"
 
 extern lispobj call_into_lisp(lispobj fun, lispobj *args, int nargs)
@@ -28,7 +27,8 @@ extern lispobj call_into_lisp(lispobj fun, lispobj *args, int nargs)
 #endif
     ;
 
-#ifdef LISP_FEATURE_C_STACK_IS_CONTROL_STACK
+#if defined(LISP_FEATURE_C_STACK_IS_CONTROL_STACK) || defined(LISP_FEATURE_ARM64) \
+    || defined(LISP_FEATURE_ARM)
 /* These functions are an interface to the Lisp call-in facility.
  * Since this is C we can know nothing about the calling environment.
  * The control stack might be the C stack if called from the monitor

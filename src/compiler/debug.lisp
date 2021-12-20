@@ -498,7 +498,11 @@
      (dolist (exit (entry-exits node))
        (unless (node-deleted exit)
          (check-node-reached node))))
-    (enclose)
+    (enclose
+     (dolist (fun (enclose-funs node))
+       (let ((enclose (functional-enclose fun)))
+         (unless (eq node enclose)
+           (barf "~S is not the ENCLOSE for its FUN ~S." node enclose)))))
     (exit
      (let ((entry (exit-entry node))
            (value (exit-value node)))
@@ -780,13 +784,13 @@
 ;;; TNs to access the full call passing locations.
 (defun check-environment-lifetimes (component)
   (dolist (fun (component-lambdas component))
-    (let* ((env (lambda-physenv fun))
-           (2env (physenv-info env))
+    (let* ((env (lambda-environment fun))
+           (2env (environment-info env))
            (vars (lambda-vars fun))
-           (closure (ir2-physenv-closure 2env))
-           (pc (ir2-physenv-return-pc-pass 2env))
-           (fp (ir2-physenv-old-fp 2env))
-           (2block (block-info (lambda-block (physenv-lambda env)))))
+           (closure (ir2-environment-closure 2env))
+           (pc (ir2-environment-return-pc-pass 2env))
+           (fp (ir2-environment-old-fp 2env))
+           (2block (block-info (lambda-block (environment-lambda env)))))
       (do ((conf (ir2-block-global-tns 2block)
                  (global-conflicts-next-blockwise conf)))
           ((null conf))
@@ -915,14 +919,19 @@
     (constant (format stream "'~S" (constant-value leaf)))
     (global-var
      (format stream "~S {~A}" (leaf-debug-name leaf) (global-var-kind leaf)))
+    (clambda
+     (format stream "lambda ~@[~S ~]~:S"
+             (and (leaf-has-source-name-p leaf)
+                  (functional-debug-name leaf))
+             (mapcar #'leaf-debug-name (lambda-vars leaf))))
+    (optional-dispatch
+     (format stream "optional-dispatch ~S" (mapcar #'leaf-debug-name (optional-dispatch-arglist leaf))))
     (functional
-     (format stream "~S ~S ~S" (type-of leaf) (functional-debug-name leaf)
-             (mapcar #'leaf-debug-name
-                     (typecase leaf
-                       (clambda
-                        (lambda-vars leaf))
-                       (optional-dispatch
-                        (optional-dispatch-arglist leaf))))))))
+     (case (functional-kind leaf)
+       (:toplevel-xep
+        (format stream "TL-XEP ~S" (entry-info-name (leaf-info leaf))))
+       (t
+        (format stream "~S ~S" (type-of leaf) (functional-debug-name leaf)))))))
 
 ;;; Attempt to find a block given some thing that has to do with it.
 (declaim (ftype (sfunction (t) cblock) block-or-lose))
@@ -948,13 +957,19 @@
   (values))
 (defun print-lvar (cont)
   (declare (type lvar cont))
-  (format t "v~D " (cont-num cont))
+  (if (and (lvar-info cont)
+           (eq (ir2-lvar-kind (lvar-info cont))
+               :unknown))
+      (format t "uv~D " (cont-num cont))
+      (format t "v~D " (cont-num cont)))
   (values))
 
 (defun print-lvar-stack (stack &optional (stream *standard-output*))
   (loop for (lvar . rest) on stack
         do (format stream "~:[u~;d~]v~D~@[ ~]"
                    (lvar-dynamic-extent lvar) (cont-num lvar) rest)))
+
+(defvar *debug-print-types* nil)
 
 ;;; Print out the nodes in BLOCK in a format oriented toward
 ;;; representing what the code does.
@@ -1019,11 +1034,15 @@
                ((:dynamic-extent)
                 (format t "entry DX~{ v~D~}"
                         (mapcar (lambda (lvar-or-cell)
-                                  (if (consp lvar-or-cell)
-                                      (cons (car lvar-or-cell)
-                                            (cont-num (cdr lvar-or-cell)))
-                                      (cont-num lvar-or-cell)))
-                                (cleanup-info cleanup))))
+                                  (typecase lvar-or-cell
+                                    (cons
+                                     (cons (car lvar-or-cell)
+                                           (cont-num (cdr lvar-or-cell))))
+                                    (enclose
+                                     lvar-or-cell)
+                                    (t
+                                     (cont-num lvar-or-cell))))
+                                (cleanup-nlx-info cleanup))))
                (t
                 (format t "entry ~S" (entry-exits node))))))
           (exit
@@ -1035,19 +1054,24 @@
                     (format t "exit <no value>"))
                    (t
                     (format t "exit <degenerate>")))))
+          (delay
+           (write-string "delay ")
+           (print-lvar (delay-value node)))
           (cast
            (let ((value (cast-value node)))
              (format t "cast v~D ~A[~S -> ~S]" (cont-num value)
                      (if (cast-%type-check node) #\+ #\-)
                      (cast-type-to-check node)
                      (cast-asserted-type node))))
-          (no-op
-           (princ "no-op"))
           (enclose
            (write-string "enclose ")
            (dolist (leaf (enclose-funs node))
              (print-leaf leaf)
              (write-char #\space))))
+        (when (and *debug-print-types*
+                   (valued-node-p node))
+          (write-char #\space)
+          (princ (type-specifier (node-derived-type node))))
         (pprint-newline :mandatory)))
 
     (awhen (block-info block)
@@ -1073,7 +1097,13 @@
            (format stream "t~D" (tn-id tn))))
     (when (and (tn-sc tn) (tn-offset tn))
       (format stream "[~A]" (location-print-name tn)))
-    (format stream " ~s" (tn-kind tn))))
+    (format stream " ~s~@[ ~a~]~@[ ~a~]" (tn-kind tn)
+            (and *debug-print-types*
+                 (and (tn-sc tn)
+                      (sc-name (tn-sc tn))))
+            (and *debug-print-types*
+                 (and (tn-primitive-type tn)
+                      (primitive-type-name (tn-primitive-type tn)))))))
 
 ;;; Print the TN-REFs representing some operands to a VOP, linked by
 ;;; TN-REF-ACROSS.
@@ -1115,7 +1145,7 @@
                  ;; depending on the call context. Resetting depth to 0 seems
                  ;; like the best way to get consistent output.
                  ;; We shouldn't bind the printer limits to NIL, because
-                 ;; hairy internal objects such as PHYSENV can be printed.
+                 ;; hairy internal objects such as ENVIRONMENT can be printed.
                  ;; See also the comment above FUNCALL-WITH-DEBUG-IO-SYNTAX.
                  (let (#-sb-xc-host (*current-level-in-print* 0)
                        (*print-level* 2)
@@ -1296,31 +1326,100 @@
          (vop (ir2-block-start-vop block) (vop-next vop)))
         ((= i n) vop))))
 
+(defun show-transform-p (showp fun-name)
+  (or (and (listp showp) (member fun-name showp :test 'equal))
+      (eq showp t)))
+
+(defun show-transform (kind name new-form &optional combination)
+  (let ((*print-length* 100)
+        (*print-level* 50)
+        (*print-right-margin* 128))
+    (format *trace-output* "~&xform (~a) ~S ~% -> ~S~%"
+            kind
+            (if combination
+                (cons name
+                      (loop for arg in (combination-args combination)
+                            collect (if (constant-lvar-p arg)
+                                        (lvar-value arg)
+                                        (type-specifier (lvar-type arg)))))
+                name)
+            new-form)))
+
+(defun show-type-derivation (combination type)
+  (let ((*print-length* 100)
+        (*print-level* 50)
+        (*print-right-margin* 128))
+    (unless (type= (node-derived-type combination)
+                   (coerce-to-values type))
+      (format *trace-output* "~&~a derived to ~a"
+              (cons (combination-fun-source-name combination)
+                    (loop for arg in (combination-args combination)
+                          collect (if (constant-lvar-p arg)
+                                      (lvar-value arg)
+                                      (type-specifier (lvar-type arg)))))
+              (type-specifier type)))))
+
+;;;; producing a graphviz file
+
+(defun replace-all (string part replacement &key (test #'char=))
+  "Returns a new string in which all the occurences of the part
+is replaced with replacement."
+  (with-output-to-string (out)
+    (loop with part-length = (length part)
+          for old-pos = 0 then (+ pos part-length)
+          for pos = (search part string
+                            :start2 old-pos
+                            :test test)
+          do (write-string string out
+                           :start old-pos
+                           :end (or pos (length string)))
+          when pos do (write-string replacement out)
+            while pos)))
+
 (defun ir1-to-dot (component output-file)
   (with-open-file (stream output-file :if-exists :supersede
                                       :if-does-not-exist :create
                                       :direction :output)
     (write-line "digraph G {" stream)
-    (do-blocks (block component)
-      (when (typep (block-out block) '(cons (eql :graph) cons))
-        (format stream "~a[style=filled color=~a];~%"
-                (block-number block)
-                (case (cadr (block-out block))
-                  (:marked "green")
-                  (:remarked "aquamarine")
-                  (:start "lightblue")
-                  (:end "red"))))
-      (let ((succ (block-pred block)))
-        (when succ
-          (loop for succ in succ
-                for attr = "[style=bold]" then ""
-                do
-                (format stream "~a -> ~a~a;~%"
-                        (block-number block)
-                        (block-number succ)
-                        attr)))
-        (when (nle-block-p block)
-          (format stream "~a -> ~a [style=dotted];~%"
-                  (block-number block)
-                  (block-number (nle-block-entry-block block))))))
+    (write-line "node [fontname = \"monospace\"];" stream)
+    (write-line "node [shape=box];" stream)
+    ;; Give a unique label to every block, since BLOCK-NUMBERs may be
+    ;; uninitialized during optimization.
+    (let ((label 0)
+          (block-labels (make-hash-table :test #'eq)))
+      (do-blocks (block component :both)
+        (setf (gethash block block-labels) label)
+        (incf label))
+      (flet ((block-label (block)
+               (gethash block block-labels)))
+        (do-blocks (block component :both)
+          (cond ((eq block (component-head component))
+                 (format stream "~a [label=head];"
+                         (block-label block)))
+                ((eq block (component-tail component))
+                 (format stream "~a [label=tail];"
+                         (block-label block)))
+                (t
+                 (format stream "~a [label=\"~a\"];~%"
+                         (block-label block)
+                         (replace-all
+                          (replace-all (with-output-to-string (*standard-output*)
+                                         (print-nodes block))
+                                       (string #\Newline)
+                                       "\\l")
+                          "\""
+                          "\\"))))
+          (let ((succ (block-succ block)))
+            (when succ
+              (loop for succ in succ
+                    for attr = "[style=bold]" then ""
+                    do
+                       (format stream "~a -> ~a~a;~%"
+                               (block-label block)
+                               (block-label succ)
+                               attr)))
+            (when (nle-block-p block)
+              (format stream "~a -> ~a [style=dotted];~%"
+                      (block-label block)
+                      (block-label (nle-block-entry-block block))))))))
     (write-line "}" stream)))

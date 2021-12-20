@@ -423,17 +423,23 @@
 
 (define-load-time-global *show-new-code* nil)
 (define-fop 16 :not-host (fop-load-code ((:operands header n-code-bytes n-fixups)))
-  (let* ((n-named-calls (read-unsigned-byte-32-arg (fasl-input-stream)))
+  (let* ((n-simple-funs (read-unsigned-byte-32-arg (fasl-input-stream)))
+         (n-named-calls (read-unsigned-byte-32-arg (fasl-input-stream)))
          (n-boxed-words (ash header -1))
          (n-constants (- n-boxed-words sb-vm:code-constants-offset)))
     ;; stack has (at least) N-CONSTANTS words plus debug-info
     (with-fop-stack ((stack (operand-stack)) ptr (1+ n-constants))
-      (let* ((n-boxed-words (+ sb-vm:code-constants-offset n-constants))
-             (code (sb-c:allocate-code-object
-                    (if (oddp header) :immobile :dynamic)
-                    n-named-calls
-                    (align-up n-boxed-words sb-c::code-boxed-words-align)
-                    n-code-bytes)))
+      ;; We've already ensured that all FDEFNs the code uses exist.
+      ;; This happened by virtue of calling fop-fdefn for each.
+      (let ((stack-index (+ ptr (* n-simple-funs sb-vm:code-slots-per-simple-fun))))
+        (dotimes (i n-named-calls)
+          (aver (typep (svref stack stack-index) 'fdefn))
+          (incf stack-index)))
+      (let ((code (sb-c:allocate-code-object
+                   (if (oddp header) :immobile :dynamic)
+                   n-named-calls
+                   (align-up n-boxed-words sb-c::code-boxed-words-align)
+                   n-code-bytes)))
         (with-pinned-objects (code)
           ;; * DO * NOT * SEPARATE * THESE * STEPS *
           ;; For a full explanation, refer to the comment above MAKE-CORE-COMPONENT
@@ -445,6 +451,7 @@
             (read-n-bytes (fasl-input-stream) buf 0 n-code-bytes)
             (with-pinned-objects (buf)
               (sb-vm::jit-memcpy (code-instructions code) (vector-sap buf) n-code-bytes)))
+          (aver (= (code-n-entries code) n-simple-funs))
           ;; Serial# shares a word with the jump-table word count,
           ;; so we can't assign serial# until after all raw bytes are copied in.
           (sb-c::assign-code-serialno code)
@@ -458,7 +465,7 @@
           (let* ((header-index sb-vm:code-constants-offset)
                  (stack-index ptr))
             (declare (type index header-index stack-index))
-            (dotimes (n (code-n-entries code))
+            (dotimes (n n-simple-funs)
               (dotimes (i sb-vm:code-slots-per-simple-fun)
                 (setf (code-header-ref code header-index) (svref stack stack-index))
                 (incf header-index)
@@ -475,7 +482,7 @@
           (sb-c::apply-fasl-fixups stack code n-fixups))
         (when *show-new-code*
           (let ((*print-pretty* nil))
-            (format t "~&~X New code(load): ~A~%" (get-lisp-obj-address code) code)))
+            (format t "~&New code(~Db,load): ~A~%" (code-object-size code) code)))
         #-sb-xc-host
         (when (typep (code-header-ref code (1- n-boxed-words))
                      '(cons (eql sb-c::coverage-map)))
@@ -494,25 +501,13 @@
 (define-fop 18 :not-host (fop-known-fun (name))
   (%coerce-name-to-fun name))
 
-;; This FOP is only encountered in cross-compiled files for cold-load.
+;; This FOP is only encountered in cross-compiled FASLs for cold load,
+;; and is a no-op except in cold load. A developer may want to load a
+;; cross-compiled FASL into a running system, and this FOP doesn't
+;; have to do anything, as the system can load top level forms and
+;; will define the function normally.
 (define-fop 74 :not-host (fop-fset (name fn) nil)
-  ;; Ordinary, not-for-cold-load code shouldn't need to mess with this
-  ;; at all, since it's only used as part of the conspiracy between
-  ;; the cross-compiler and GENESIS to statically link FDEFINITIONs
-  ;; for cold init.
-  (warn "~@<FOP-FSET seen in ordinary load (not cold load) -- quite
-strange! ~ If you didn't do something strange to cause this, please
-report it as a ~ bug.~:@>")
-  ;; Unlike CMU CL, we don't treat this as a no-op in ordinary code.
-  ;; If the user (or, more likely, developer) is trying to reload
-  ;; compiled-for-cold-load code into a warm SBCL, we'll do a warm
-  ;; assignment. (This is partly for abstract tidiness, since the warm
-  ;; assignment is the closest analogy to what happens at cold load,
-  ;; and partly because otherwise our compiled-for-cold-load code will
-  ;; fail, since in SBCL things like compiled-for-cold-load %DEFUN
-  ;; depend more strongly than in CMU CL on FOP-FSET actually doing
-  ;; something.)
-  (setf (fdefinition name) fn))
+  (declare (ignore name fn)))
 
 ;;; Modify a slot of the code boxed constants.
 (define-fop 19 (fop-alter-code ((:operands index) code value) nil)

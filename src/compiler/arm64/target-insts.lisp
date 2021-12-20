@@ -9,22 +9,28 @@
 (defun 32-bit-register-p (dstate)
   (not (logbitp 31 (current-instruction dstate))))
 
-(defun print-lsl-alias-name (value stream dstate)
+(defun print-ubfm-alias-name (value stream dstate)
   (declare (ignore dstate))
   (destructuring-bind (immr imms) value
-    (princ (if (and (/= imms 63)
-                    (= (1+ imms) immr))
-               'lsl
-               'ubfm)
+    (princ (cond ((and (/= imms 63)
+                       (= (1+ imms) immr))
+                  'lsl)
+                 ((< imms immr)
+                  'ubfiz)
+                 (t
+                  'ubfm))
            stream)))
 
-(defun print-lsl-alias (value stream dstate)
+(defun print-ubfm-alias (value stream dstate)
   (declare (ignore dstate))
   (destructuring-bind (immr imms) value
-    (if (and (/= imms 63)
-             (= (1+ imms) immr))
-        (format stream "#~d" (- 63 imms))
-        (format stream "#~d, #~d" immr imms))))
+    (cond ((and (/= imms 63)
+                (= (1+ imms) immr))
+           (format stream "#~d" (- 63 imms)))
+          ((< imms immr)
+           (format stream "#~d, #~d" (- 64 immr) (1+ imms)))
+          (t
+           (format stream "#~d, #~d" immr imms)))))
 
 (defun print-mem-bar-kind (value stream dstate)
   (declare (ignore dstate))
@@ -377,8 +383,9 @@
                         dstate))))
 
 (defun annotate-ldr-str-pair (value stream dstate)
-  (declare (ignore stream))
+  (declare (ignore stream) (ignorable dstate))
   (destructuring-bind (reg offset) value
+    (declare (ignorable offset))
     (case reg
       #+sb-thread
       (#.sb-vm::thread-offset
@@ -390,7 +397,7 @@
               (slot2 (find (1+ offset) thread-slots :key #'slot-offset)))
          (when slot1
            (note (lambda (stream)
-                   (if (memq (slot-name slot1) '(sb-vm::boxed-tlab
+                   (if (memq (slot-name slot1) '(sb-vm::mixed-tlab
                                                  sb-vm::unboxed-tlab))
                        (format stream "~(~a~).{free-pointer, end-addr}" (slot-name slot1))
                        (format stream "~(~A, ~A~)" (slot-name slot1) (slot-name slot2))))

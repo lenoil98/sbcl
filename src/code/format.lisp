@@ -33,8 +33,9 @@
                  t)))
     (if (logtest (get-header-data string)
                  ;; shareable = readonly
-                 (logior sb-vm:+vector-shareable+
-                         sb-vm:+vector-shareable-nonstd+))
+                 (ash (logior sb-vm:+vector-shareable+
+                              sb-vm:+vector-shareable-nonstd+)
+                      sb-vm:array-flags-data-position))
         (memoize (compute-it))
         (compute-it))))
 
@@ -194,6 +195,36 @@
          (nreverse params) colonp atsignp (char-upcase char)
          (when (eql char #\/) (car symbols))))))))
 
+;;;; specials used to communicate information
+
+;;; Used both by the expansion stuff and the interpreter stuff. When it is
+;;; non-NIL, up-up-and-out (~:^) is allowed. Otherwise, ~:^ isn't allowed.
+(defvar *up-up-and-out-allowed* nil)
+
+;;; Used by the interpreter stuff. When it's non-NIL, it's a function
+;;; that will invoke PPRINT-POP in the right lexical environemnt.
+(defvar *logical-block-popper* nil)
+(declaim (type (or null function) *logical-block-popper*)
+         (always-bound *logical-block-popper*))
+
+;;; Used by the expander stuff. This is bindable so that ~<...~:>
+;;; can change it.
+(defvar *expander-next-arg-macro* 'expander-next-arg)
+
+;;; Used by the expander stuff. Initially starts as T, and gets set to NIL
+;;; if someone needs to do something strange with the arg list (like use
+;;; the rest, or something).
+(defvar *only-simple-args*)
+
+;;; Used by the expander stuff. We do an initial pass with this as NIL.
+;;; If someone doesn't like this, they (THROW 'NEED-ORIG-ARGS NIL) and we try
+;;; again with it bound to T. If this is T, we don't try to do anything
+;;; fancy with args.
+(defvar *orig-args-available* nil)
+
+;;; Used by the expander stuff. List of (symbol . offset) for simple args.
+(defvar *simple-args*)
+
 ;;; Make a few simplifications to the directive list in INPUT,
 ;;; including translation of ~% to literal newline.
 ;;; I think that this does not have implications on conditional newlines
@@ -331,7 +362,7 @@
     (let ((*orig-args-available* t)
           (*only-simple-args* nil))
       `(named-lambda ,lambda-name (stream &rest orig-args)
-         (declare (ignorable stream))
+         (declare (ignorable stream) (muffle-conditions compiler-note))
          (let ((args orig-args))
            ,(expand-control-string control-string)
            ,(and need-retval 'args))))))

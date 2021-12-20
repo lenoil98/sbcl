@@ -46,6 +46,7 @@ extern void *gc_general_alloc(sword_t nbytes,int page_type_flag);
 
 #define note_transported_object(old, new) /* do nothing */
 
+extern uword_t gc_copied_nwords;
 static inline lispobj
 gc_general_copy_object(lispobj object, size_t nwords, int page_type_flag)
 {
@@ -55,6 +56,7 @@ gc_general_copy_object(lispobj object, size_t nwords, int page_type_flag)
     lispobj *new = gc_general_alloc(nwords*N_WORD_BYTES, page_type_flag);
 
     /* Copy the object. */
+    gc_copied_nwords += nwords;
     memcpy(new,native_pointer(object),nwords*N_WORD_BYTES);
 
     note_transported_object(object, new);
@@ -70,6 +72,7 @@ gc_copy_object_resizing(lispobj object, long nwords, int page_type_flag,
 {
     CHECK_COPY_PRECONDITIONS(object, nwords);
     lispobj *new = gc_general_alloc(nwords*N_WORD_BYTES, page_type_flag);
+    gc_copied_nwords += old_nwords;
     memcpy(new, native_pointer(object), old_nwords*N_WORD_BYTES);
     note_transported_object(object, new);
     return make_lispobj(new, lowtag_of(object));
@@ -103,7 +106,7 @@ extern boolean test_weak_triggers(int (*)(lispobj), void (*)(lispobj));
 
 lispobj  copy_unboxed_object(lispobj object, sword_t nwords);
 lispobj  copy_object(lispobj object, sword_t nwords);
-lispobj  copy_large_object(lispobj object, sword_t nwords, int page_type_flag);
+lispobj  copy_possibly_large_object(lispobj object, sword_t nwords, int page_type_flag);
 
 lispobj *search_read_only_space(void *pointer);
 lispobj *search_static_space(void *pointer);
@@ -134,11 +137,11 @@ static inline int header_rememberedp(lispobj header) {
   return (header & (OBJ_WRITTEN_FLAG << 24)) != 0;
 }
 
-#ifndef LISP_FEATURE_IMMOBILE_SPACE
+static inline boolean filler_obj_p(lispobj* obj) {
+    return widetag_of(obj) == CODE_HEADER_WIDETAG && obj[1] == 0;
+}
 
-static inline boolean filler_obj_p(lispobj __attribute__((unused)) *obj) { return 0; }
-
-#else
+#ifdef LISP_FEATURE_IMMOBILE_SPACE
 
 extern void enliven_immobile_obj(lispobj*,int);
 
@@ -203,10 +206,6 @@ static inline void assign_generation(lispobj* obj, generation_index_t gen)
 #error "Need to define immobile_obj_gen_bits() for big-endian"
 #endif /* little-endian */
 
-static inline boolean filler_obj_p(lispobj* obj) {
-    return widetag_of(obj) == CODE_HEADER_WIDETAG && obj[1] == 0;
-}
-
 #endif /* immobile space */
 
 #define WEAK_POINTER_CHAIN_END (void*)(intptr_t)-1
@@ -247,7 +246,7 @@ static inline struct bitmap get_layout_bitmap(struct layout* layout)
     const int layout_id_vector_fixed_capacity = 7;
 #ifdef LISP_FEATURE_64_BIT
     sword_t depthoid = layout->flags;
-    // Depthoid is stored in the upper 4 bytes of the header, as a fixnum.
+    // Depthoid is stored in the upper 4 bytes of 'flags', as a fixnum.
     depthoid >>= (32 + N_FIXNUM_TAG_BITS);
     int extra_id_words =
       (depthoid > layout_id_vector_fixed_capacity) ?
@@ -299,7 +298,7 @@ static inline boolean bitmap_logbitp(unsigned int index, struct bitmap bitmap)
  * It has to do with the way the sanitizer intercepts calls
  * to sigaction() - it mucks with your sa_mask :-(.
  *
- * This macro take an aribtrary expression as the 'operation' rather than
+ * This macro take an arbitrary expression as the 'operation' rather than
  * an address and value to assign, for two reasons:
  * 1. there may be more than one store operation that has to be
  *    within the scope of the lifted write barrier,
@@ -312,12 +311,17 @@ static inline boolean bitmap_logbitp(unsigned int index, struct bitmap bitmap)
  * but seems only to be a problem in fullcgc)
  */
 
+extern char* gc_card_mark;
+#ifdef LISP_FEATURE_SOFT_CARD_MARKS
+#define NON_FAULTING_STORE(operation, addr) { operation; }
+#else
 #define NON_FAULTING_STORE(operation, addr) { \
   page_index_t page_index = find_page_index(addr); \
-  if (page_index < 0 || !page_table[page_index].write_protected) { operation; } \
+  if (page_index < 0 || !PAGE_WRITEPROTECTED_P(page_index)) { operation; } \
   else { unprotect_page_index(page_index); \
          operation; \
          protect_page(page_address(page_index), page_index); }}
+#endif
 
 #ifdef LISP_FEATURE_DARWIN_JIT
 #define OS_VM_PROT_JIT_READ OS_VM_PROT_READ
@@ -327,22 +331,24 @@ static inline boolean bitmap_logbitp(unsigned int index, struct bitmap bitmap)
 #define OS_VM_PROT_JIT_ALL OS_VM_PROT_ALL
 #endif
 
-/* This is used bu the fault handler, and potentially during GC */
+/* This is used by the fault handler, and potentially during GC */
 static inline void unprotect_page_index(page_index_t page_index)
 {
+#ifdef LISP_FEATURE_SOFT_CARD_MARKS
+    int card = page_to_card_index(page_index);
+    if (gc_card_mark[card] == 1) gc_card_mark[card] = 0; // NEVER CHANGE '2' to '0'
+#else
     os_protect(page_address(page_index), GENCGC_CARD_BYTES, OS_VM_PROT_JIT_ALL);
     unsigned char *pflagbits = (unsigned char*)&page_table[page_index].gen - 1;
     __sync_fetch_and_or(pflagbits, WP_CLEARED_FLAG);
-    __sync_fetch_and_and(pflagbits, ~WRITE_PROTECTED_FLAG);
+    SET_PAGE_PROTECTED(page_index, 0);
+#endif
 }
 
-static inline void protect_page(void* page_addr, page_index_t page_index)
+static inline void protect_page(void* page_addr,
+                                __attribute__((unused)) page_index_t page_index)
 {
-#ifdef LISP_FEATURE_DARWIN_JIT
-    if ((page_table[page_index].type & PAGE_TYPE_MASK) == CODE_PAGE_TYPE) {
-      return;
-    }
-#endif
+#ifndef LISP_FEATURE_SOFT_CARD_MARKS
     os_protect((void *)page_addr, GENCGC_CARD_BYTES, OS_VM_PROT_JIT_READ);
 
     /* Note: we never touch the write_protected_cleared bit when protecting
@@ -358,19 +364,36 @@ static inline void protect_page(void* page_addr, page_index_t page_index)
      * But nothing is really gained by resetting the cleared flag.
      * It is explicitly zeroed on pages marked as free though.
      */
-    page_table[page_index].write_protected = 1;
+#endif
+    gc_card_mark[addr_to_card_index(page_addr)] = 1;
+}
+
+// Two helpers to avoid invoking the memory fault signal handler.
+// For clarity, distinguish between words which *actually* need to frob
+// physical (MMU-based) protection versus those which don't,
+// but are forced to call mprotect() because it's the only choice.
+// Unlike with NON_FAULTING_STORE, in this case we actually do want to record that
+// the ensuing store toggles the WP bit without invoking the fault handler.
+static inline void ensure_ptr_word_writable(void* addr) {
+    page_index_t index = find_page_index(addr);
+    gc_assert(index >= 0);
+    if (PAGE_WRITEPROTECTED_P(index)) unprotect_page_index(index);
+}
+static inline void ensure_non_ptr_word_writable(__attribute__((unused)) void* addr)
+{
+  // don't need to do anything if not using hardware page protection
+#ifndef LISP_FEATURE_SOFT_CARD_MARKS
+    ensure_ptr_word_writable(addr);
+#endif
 }
 
 #else
 
+/* cheneygc */
+#define ensure_ptr_word_writable(dummy)
+#define ensure_non_ptr_word_writable(dummy)
 #define NON_FAULTING_STORE(operation, addr) operation
 
-#endif
-
-#if defined(LISP_FEATURE_X86_64) || defined(LISP_FEATURE_X86)
-# define CODE_PAGES_USE_SOFT_PROTECTION 1
-#else
-# define CODE_PAGES_USE_SOFT_PROTECTION 0
 #endif
 
 #define KV_PAIRS_HIGH_WATER_MARK(kvv) fixnum_value(kvv[0])

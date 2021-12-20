@@ -375,9 +375,8 @@
       ;; optimize this.
       (loop for masker in maskers
             for shift = 1 then (ash shift 1) do
-              (inst li mask masker) ; NL1
+              (inst li mask masker)
               (let ((input (if (= shift 1) arg num)))
-                ; TEMP = NL2 ARG = NL3 NUM = NL0
                 (inst srli temp input shift)
                 (inst and num input mask))
               (inst and temp temp mask)
@@ -602,7 +601,7 @@
 
   (deftransform ash-left-mod32 ((integer count)
                                 ((unsigned-byte 32) (unsigned-byte 5)))
-    (when (sb-c::constant-lvar-p count)
+    (when (sb-c:constant-lvar-p count)
       (sb-c::give-up-ir1-transform))
     '(%primitive fast-ash-left-mod32/unsigned=>unsigned integer count)))
 
@@ -617,7 +616,7 @@
 
   (deftransform ash-left-mod64 ((integer count)
                                 ((unsigned-byte 64) (unsigned-byte 6)))
-    (when (sb-c::constant-lvar-p count)
+    (when (sb-c:constant-lvar-p count)
       (sb-c::give-up-ir1-transform))
     '(%primitive fast-ash-left-mod64/unsigned=>unsigned integer count)))
 

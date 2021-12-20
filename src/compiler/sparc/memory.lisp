@@ -34,16 +34,15 @@
 ;;;; Indexed references:
 
 ;;; Define some VOPs for indexed memory reference.
-(macrolet ((define-indexer (name write-p op shift &key (result t))
+(macrolet ((define-indexer (name write-p op shift)
               `(define-vop (,name)
                  (:args (object :scs (descriptor-reg))
                         (index :scs (any-reg zero immediate))
-                        ,@(when write-p
-                            `((value :scs (any-reg descriptor-reg) ,@(when result '(:target result))))))
+                        ,@(when write-p '((value :scs (any-reg descriptor-reg)))))
                  (:arg-types * tagged-num ,@(when write-p '(*)))
                  (:temporary (:scs (non-descriptor-reg)) temp)
-                 ,@(when result
-                     `((:results (,(if write-p 'result 'value) :scs (any-reg descriptor-reg)))
+                 ,@(unless write-p
+                     `((:results (value :scs (any-reg descriptor-reg)))
                        (:result-types *)))
                  (:variant-vars offset lowtag)
                  (:policy :fast-safe)
@@ -67,17 +66,12 @@
                               `((inst srl temp index ,shift)))
                     (inst add temp ,(if (zerop shift) 'index 'temp)
                           (- (ash offset word-shift) lowtag))
-                    (inst ,op value object temp)))
-                  ,@(when (and write-p result)
-                          '((move result value)))))))
+                    (inst ,op value object temp)))))))
   (define-indexer word-index-ref nil ld 0)
-  (define-indexer word-index-set-nr t st 0 :result nil)
   (define-indexer word-index-set t st 0)
   (define-indexer halfword-index-ref nil lduh 1)
   (define-indexer signed-halfword-index-ref nil ldsh 1)
-  (define-indexer halfword-index-set-nr t sth 1 :result nil)
   (define-indexer halfword-index-set t sth 1)
   (define-indexer byte-index-ref nil ldub 2)
   (define-indexer signed-byte-index-ref nil ldsb 2)
-  (define-indexer byte-index-set-nr t stb 2 :result nil)
   (define-indexer byte-index-set t stb 2))

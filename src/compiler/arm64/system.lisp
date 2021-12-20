@@ -225,7 +225,7 @@
     (inst add func code ndescr)))
 ;;;
 
-(defun load-symbol-info-vector (result symbol temp)
+(defun load-symbol-dbinfo (result symbol temp)
   (assemble ()
     (loadw result symbol symbol-info-slot other-pointer-lowtag)
     ;; If RESULT has list-pointer-lowtag, take its CDR. If not, use it as-is.
@@ -235,27 +235,14 @@
     (loadw result result cons-cdr-slot list-pointer-lowtag)
     NE))
 
-(define-vop (symbol-info-vector)
+(define-vop (symbol-dbinfo)
   (:policy :fast-safe)
-  (:translate symbol-info-vector)
+  (:translate symbol-dbinfo)
   (:args (x :scs (descriptor-reg)))
   (:results (res :scs (descriptor-reg)))
   (:temporary (:sc unsigned-reg) temp)
   (:generator 1
-    (load-symbol-info-vector res x temp)))
-
-(define-vop (symbol-plist)
-  (:policy :fast-safe)
-  (:translate symbol-plist)
-  (:args (x :scs (descriptor-reg)))
-  (:results (res :scs (descriptor-reg)))
-  (:generator 1
-    (loadw res x symbol-info-slot other-pointer-lowtag)
-    ;; Instruction pun: (CAR x) is the same as (VECTOR-LENGTH x)
-    ;; so if the info slot holds a vector, this gets a fixnum- it's not a plist.
-    (loadw res res cons-car-slot list-pointer-lowtag)
-    (inst tst res fixnum-tag-mask)
-    (inst csel res null-tn res :eq)))
+    (load-symbol-dbinfo res x temp)))
 
 ;;;; other miscellaneous VOPs
 
@@ -288,10 +275,10 @@
     (:result-types system-area-pointer)
     (:translate current-thread-offset-sap)
     (:info n)
-    (:arg-types (:constant (satisfies ldr-str-offset-encodable)))
+    (:arg-types (:constant (satisfies ldr-str-word-offset-encodable)))
     (:policy :fast-safe)
     (:generator 1
-                (inst ldr sap (@ thread-tn (ash n word-shift)))))
+      (inst ldr sap (@ thread-tn (ash n word-shift)))))
 
   (define-vop (current-thread-offset-sap)
     (:results (sap :scs (sap-reg)))
@@ -301,7 +288,7 @@
     (:arg-types signed-num)
     (:policy :fast-safe)
     (:generator 2
-                (inst ldr sap (@ thread-tn (extend n :lsl word-shift))))))
+      (inst ldr sap (@ thread-tn (extend n :lsl word-shift))))))
 
 ;;; Barriers
 (define-vop (%compiler-barrier)

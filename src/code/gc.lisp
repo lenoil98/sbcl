@@ -77,6 +77,16 @@ SB-PROFILE package does), or to design a more microefficient interface
 and submit it as a patch."
   (+ (dynamic-usage)
      *n-bytes-freed-or-purified*))
+
+(defun primitive-object-size (object)
+  "Return number of bytes of heap or stack directly consumed by OBJECT"
+  (cond ((not (sb-vm:is-lisp-pointer (get-lisp-obj-address object))) 0)
+        ((eq object nil) (ash sb-vm::sizeof-nil-in-words sb-vm:word-shift))
+        ((simple-fun-p object) (code-object-size (fun-code-header object)))
+        (t
+         (with-alien ((sizer (function unsigned unsigned) :extern "primitive_object_size"))
+           (with-pinned-objects (object)
+             (alien-funcall sizer (get-lisp-obj-address object)))))))
 
 ;;;; GC hooks
 

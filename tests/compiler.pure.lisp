@@ -2326,7 +2326,7 @@
                            x)))
     (assert (= a (random most-positive-fixnum)))))
 
-;;; MISC.641: LET-conversion after physical environment analysis lost NLX-INFOs
+;;; MISC.641: LET-conversion after environment analysis lost NLX-INFOs
 (with-test (:name (compile let :conversion :lost :nlx-infos :misc.641))
   (checked-compile-and-assert (:allow-style-warnings t :optimize nil)
       `(lambda ()
@@ -5077,13 +5077,12 @@
 
 (with-test (:name :interr-type-specifier-hashing)
   (let ((specifiers
-         (remove
-          'simple-vector
+         (remove nil
           (map 'list
-               (lambda (saetp)
-                 (sb-c::type-specifier
-                  (sb-c::specifier-type
-                   `(simple-array ,(sb-vm:saetp-specifier saetp) (*)))))
+               (lambda (saetp &aux (et (sb-vm:saetp-specifier saetp)))
+                 (unless (member et '(nil t))
+                   (sb-c::type-specifier
+                    (sb-c::specifier-type `(simple-array ,et (*))))))
                sb-vm:*specialized-array-element-type-properties*))))
     (assert (sb-c::%interr-symbol-for-type-spec `(or ,@specifiers)))
     (assert (sb-c::%interr-symbol-for-type-spec
@@ -5980,6 +5979,20 @@
                10
                (multiple-value-call #',name (1- x))))
       ((3) 10))))
+
+(with-test (:name :bug-1951889)
+  (checked-compile-and-assert
+   (:optimize '(:debug 2))
+   `(lambda ()
+      (block nil
+        (flet ((%f6 (x &key)
+                 (declare (ignore x))
+                 (return 0)))
+          (loop for lv3 below 1 count
+                                (if (%f6 0)
+                                    (%f6 0)
+                                    (eval (%f6 0)))))))
+   (() 0)))
 
 (with-test (:name (yes-or-no-p type))
   (checked-compile `(lambda ()

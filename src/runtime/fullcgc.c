@@ -75,7 +75,7 @@ static page_index_t free_page;
 
 /* The whole-page allocator works backwards from the end of dynamic space.
  * If it collides with 'next_free_page', then you lose.
- * TOOD: It would be reasonably simple to have this request more memory from
+ * TODO: It would be reasonably simple to have this request more memory from
  * the OS instead of failing on overflow */
 static void* get_free_page() {
     --free_page;
@@ -358,6 +358,19 @@ static void trace_object(lispobj* where)
         return;
 #endif
         break;
+#ifdef LISP_FEATURE_COMPACT_SYMBOL
+    case SYMBOL_WIDETAG:
+        {
+        struct symbol* s = (void*)where;
+        gc_mark_obj(decode_symbol_name(s->name));
+        gc_mark_obj(s->value);
+        gc_mark_obj(s->info);
+        gc_mark_obj(s->fdefn);
+        // process the unnamed slot of augmented symbols
+        if ((s->header & 0xFF00) == (SYMBOL_SIZE<<8)) gc_mark_obj(*(1+&s->fdefn));
+        }
+        return;
+#endif
     case FDEFN_WIDETAG:
         gc_mark_obj(fdefn_callee_lispobj((struct fdefn*)where));
         scan_to = 3;
@@ -402,6 +415,7 @@ void execute_full_mark_phase()
     struct rusage before, after;
     getrusage(RUSAGE_SELF, &before);
 #endif
+    trace_object((lispobj*)NIL_SYMBOL_SLOTS_START);
     lispobj* where = (lispobj*)STATIC_SPACE_OBJECTS_START;
     lispobj* end = static_space_free_pointer;
     while (where < end) {
@@ -418,6 +432,8 @@ void execute_full_mark_phase()
         where += listp(obj) ? 2 : sizetab[widetag_of(where)](where);
     }
 #endif
+    // In case this is not the same as (symbol-value '*id->package*)
+    gc_mark_obj(lisp_package_vector);
     do {
         lispobj ptr = gc_dequeue();
         gc_dcheck(ptr != 0);
@@ -634,12 +650,15 @@ void execute_full_sweep_phase()
     if (sweeplog)
         fflush(sweeplog);
 
+#ifdef LISP_FEATURE_SOFT_CARD_MARKS
+    free_page = next_free_page;
+#else
     page_index_t first_page, last_page;
     for (first_page = 0; first_page < next_free_page; ++first_page)
-        if (page_table[first_page].write_protected
+        if (PAGE_WRITEPROTECTED_P(first_page)
             && protection_mode(first_page) == PHYSICAL) {
             last_page = first_page;
-            while (page_table[last_page+1].write_protected
+            while (PAGE_WRITEPROTECTED_P(last_page+1)
                    && protection_mode(last_page+1) == PHYSICAL)
                 ++last_page;
             os_protect(page_address(first_page),
@@ -647,6 +666,7 @@ void execute_full_sweep_phase()
                        OS_VM_PROT_READ | OS_VM_PROT_EXECUTE);
             first_page = last_page;
         }
+#endif
     while (free_page < page_table_pages) {
         page_table[free_page++].type = FREE_PAGE_FLAG;
     }

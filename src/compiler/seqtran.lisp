@@ -335,7 +335,7 @@
   `(%fun-name (svref sb-impl::%%vector-map-into-funs%% ,typecode)))
 
 (deftransform map-into ((result fun &rest seqs)
-                        (vector * &rest *)
+                        (vector t &rest t)
                         * :node node)
   "open code"
   (let* ((seqs-names (make-gensym-list (length seqs)))
@@ -387,20 +387,20 @@
 ;;; FIXME: once the confusion over doing transforms with known-complex
 ;;; arrays is over, we should also transform the calls to (AND (ARRAY
 ;;; * (*)) (NOT (SIMPLE-ARRAY * (*)))) objects.
-(deftransform elt ((s i) ((simple-array * (*)) *) *)
+(deftransform elt ((s i) ((simple-array * (*)) t) *)
   '(aref s i))
 
-(deftransform elt ((s i) (list *) * :policy (< safety 3))
+(deftransform elt ((s i) (list t) * :policy (< safety 3))
   '(nth i s))
 
-(deftransform %setelt ((s i v) ((simple-array * (*)) * *) *)
+(deftransform %setelt ((s i v) ((simple-array * (*)) t t) *)
   '(setf (aref s i) v))
 
-(deftransform %setelt ((s i v) (list * *) * :policy (< safety 3))
+(deftransform %setelt ((s i v) (list t t) * :policy (< safety 3))
   '(setf (car (nthcdr i s)) v))
 
 (deftransform %check-vector-sequence-bounds ((vector start end)
-                                             (vector * *) *
+                                             (vector t t) *
                                              :node node)
   (if (policy node (= 0 insert-array-bounds-checks))
       '(or end (length vector))
@@ -1051,13 +1051,15 @@
      ,(flet ((down ()
                '(do ((i (truly-the (or (eql -1) index) (+ start1 replace-len -1)) (1- i))
                      (j (truly-the (or (eql -1) index) (+ start2 replace-len -1)) (1- j)))
-                 ((< i start1))
+                 ((< j start2))
+                 (declare (optimize (insert-array-bounds-checks 0)))
                  (setf (aref seq1 i) (data-vector-ref seq2 j))))
              (up ()
                '(do ((i start1 (1+ i))
                      (j start2 (1+ j))
                      (end (+ start1 replace-len)))
                  ((>= i end))
+                 (declare (optimize (insert-array-bounds-checks 0)))
                  (setf (aref seq1 i) (data-vector-ref seq2 j)))))
         ;; "If sequence-1 and sequence-2 are the same object and the region being modified
         ;;  overlaps the region being copied from, then it is as if the entire source region
@@ -1100,6 +1102,85 @@
                        :node node)
   (transform-replace nil node)))
 
+(defoptimizer (replace ir2-hook) ((seq1 seq2 &key &allow-other-keys) node block)
+  (declare (ignore block))
+  (block nil
+    (flet ((element-type (lvar)
+             (let ((type (lvar-type lvar)))
+               (unless (csubtypep type (specifier-type 'array))
+                 (return))
+               (multiple-value-bind (upgraded other)
+                   (array-type-upgraded-element-type type)
+                 (or other upgraded)))))
+      (let ((type1 (element-type seq1))
+            (type2 (element-type seq2)))
+        (unless (or (eq type1 *wild-type*)
+                    (eq type2 *wild-type*)
+                    (types-equal-or-intersect type1 type2))
+          (let ((*compiler-error-context* node))
+            (compiler-warn "Incompatible array element types: ~a and ~a"
+                           (type-specifier type1)
+                           (type-specifier type2))))))))
+
+(defoptimizer (%make-array ir2-hook) ((dimensions widetag n-bits &key initial-contents &allow-other-keys)
+                                      node block)
+  (declare (ignore dimensions n-bits block))
+  (when (and (constant-lvar-p widetag)
+             initial-contents)
+    (let* ((saetp (find (lvar-value widetag) sb-vm:*specialized-array-element-type-properties*
+                        :key #'sb-vm:saetp-typecode))
+           (element-type (sb-vm:saetp-ctype saetp))
+           (initial-contents-type (lvar-type initial-contents)))
+      (when (csubtypep initial-contents-type (specifier-type 'array))
+        (let ((initial-contents-element-type
+                (multiple-value-bind (upgraded other)
+                    (array-type-upgraded-element-type initial-contents-type)
+                  (or other upgraded))))
+          (unless (or (eq initial-contents-element-type *wild-type*)
+                      (types-equal-or-intersect element-type initial-contents-element-type))
+            (let ((*compiler-error-context* node))
+              (compiler-warn "Incompatible :initial-contents ~s for :element-type ~a."
+                             (type-specifier initial-contents-type)
+                             (sb-vm:saetp-specifier saetp)))))))))
+
+(defun check-substitute-args (new seq node)
+  (let ((seq-type (lvar-type seq))
+        (new-type (lvar-type new)))
+    (when (and (neq new-type *wild-type*)
+               (csubtypep seq-type (specifier-type 'array)))
+      (let ((element-type (multiple-value-bind (upgraded other)
+                              (array-type-upgraded-element-type seq-type)
+                            (or other upgraded))))
+        (unless (or (eq element-type *wild-type*)
+                    (types-equal-or-intersect new-type element-type))
+          (let ((*compiler-error-context* node))
+            (compiler-warn "Can't substitute ~a into ~a"
+                           (type-specifier new-type)
+                           (type-specifier seq-type))))))))
+
+(defoptimizer (substitute ir2-hook) ((new old seq &key &allow-other-keys) node block)
+  (declare (ignore old block))
+  (check-substitute-args new seq node))
+
+(defoptimizer (substitute-if ir2-hook) ((new predicate seq &key &allow-other-keys) node block)
+  (declare (ignore predicate block))
+  (check-substitute-args new seq node))
+
+(defoptimizer (substitute-if-not ir2-hook) ((new predicate seq &key &allow-other-keys) node block)
+  (declare (ignore predicate block))
+  (check-substitute-args new seq node))
+
+(defoptimizer (nsubstitute ir2-hook) ((new old seq &key &allow-other-keys) node block)
+  (declare (ignore old block))
+  (check-substitute-args new seq node))
+
+(defoptimizer (nsubstitute-if ir2-hook) ((new predicate seq &key &allow-other-keys) node block)
+  (declare (ignore predicate block))
+  (check-substitute-args new seq node))
+
+(defoptimizer (nsubstitute-if-not ir2-hook) ((new predicate seq &key &allow-other-keys) node block)
+  (declare (ignore predicate block))
+  (check-substitute-args new seq node))
 
 ;;; Expand simple cases of UB<SIZE>-BASH-COPY inline.  "simple" is
 ;;; defined as those cases where we are doing word-aligned copies from
@@ -1118,32 +1199,32 @@
   (binding* ((n-elems-per-word (truncate sb-vm:n-word-bits n-bits-per-elem))
              ((src-word src-elt) (truncate (lvar-value src-offset) n-elems-per-word))
              ((dst-word dst-elt) (truncate (lvar-value dst-offset) n-elems-per-word)))
-        ;; Avoid non-word aligned copies.
-        (unless (and (zerop src-elt) (zerop dst-elt))
-          (give-up-ir1-transform))
-        ;; Avoid copies where we would have to insert code for
-        ;; determining the direction of copying.
-        (unless (= src-word dst-word)
-          (give-up-ir1-transform))
-        `(let ((end (+ ,src-word (truncate (the index length) ,n-elems-per-word)))
-               (extra (mod length ,n-elems-per-word)))
-           (declare (type index end))
-           ;; Handle any bits at the end.
-           (unless (zerop extra)
-             ;; MASK selects just the bits that we want from the ending word of
-             ;; the source array. The number of bits to shift out is
-             ;;   (- n-word-bits (* extra n-bits-per-elem))
-             ;; which is equal mod n-word-bits to the expression below.
-             (let ((mask (shift-towards-start
-                          most-positive-word (* extra ,(- n-bits-per-elem)))))
-               (%set-vector-raw-bits
-                dst end (logior (logand (%vector-raw-bits src end) mask)
-                                (logandc2 (%vector-raw-bits dst end) mask)))))
-           ;; Copy from the end to save a register.
-           (do ((i (1- end) (1- i)))
-               ((< i ,src-word))
-             (%set-vector-raw-bits dst i (%vector-raw-bits src i)))
-           (values))))
+    ;; Avoid non-word aligned copies.
+    (unless (and (zerop src-elt) (zerop dst-elt))
+      (give-up-ir1-transform))
+    ;; Avoid copies where we would have to insert code for
+    ;; determining the direction of copying.
+    (unless (= src-word dst-word)
+      (give-up-ir1-transform))
+    `(let ((end (+ ,src-word (truncate (the index length) ,n-elems-per-word)))
+           (extra (mod length ,n-elems-per-word)))
+       (declare (type index end))
+       ;; Handle any bits at the end.
+       (unless (zerop extra)
+         ;; MASK selects just the bits that we want from the ending word of
+         ;; the source array. The number of bits to shift out is
+         ;;   (- n-word-bits (* extra n-bits-per-elem))
+         ;; which is equal mod n-word-bits to the expression below.
+         (let ((mask (shift-towards-start
+                      most-positive-word (* extra ,(- n-bits-per-elem)))))
+           (%set-vector-raw-bits
+            dst end (logior (logand (%vector-raw-bits src end) mask)
+                            (logandc2 (%vector-raw-bits dst end) mask)))))
+       ;; Copy from the end to save a register.
+       (do ((i (1- end) (1- i)))
+           ((< i ,src-word))
+         (%set-vector-raw-bits dst i (%vector-raw-bits src i)))
+       (values))))
 
 ;;; Detect misuse with sb-devel. "Misuse" means mismatched array element types
 #-sb-devel
@@ -1347,7 +1428,7 @@
 
 (deftransform search ((pattern text &key start1 start2 end1 end2 test test-not
                                key from-end)
-                      ((constant-arg sequence) * &rest *))
+                      ((constant-arg sequence) t &rest t))
   (if key
       (give-up-ir1-transform)
       (let* ((pattern (lvar-value pattern))
@@ -1484,9 +1565,7 @@
          (constant-end2 (and end2
                              (constant-lvar-p end2)
                              (lvar-value end2)))
-         (not-from-end (or (not from-end)
-                           (and (constant-lvar-p from-end)
-                                (not (lvar-value from-end)))))
+         (not-from-end (unsupplied-or-nil from-end))
          (min-result (or constant-start2 0))
          (max-result (or constant-end2 (1- array-dimension-limit)))
          (max2 (sequence-lvar-dimensions sequence2))
@@ -1907,10 +1986,10 @@
   ;; :KEY is allowed only if IDENTITY or NIL.
   (when (and (or (not test)
                  (lvar-fun-is test '(eq eql))
-                 (and (constant-lvar-p test) (null (lvar-value test))))
+                 (lvar-value-is-nil test))
              (or (not key)
                  (lvar-fun-is key '(identity))
-                 (and (constant-lvar-p key) (null (lvar-value key)))))
+                 (lvar-value-is-nil key)))
     (type-union (lvar-type item) (specifier-type 'null))))
 
 ;;; We want to make sure that %FIND-POSITION is inline-expanded into
@@ -1948,8 +2027,7 @@
          (not (and (lvar-single-value-p (node-lvar node))
                    (constant-lvar-p start)
                    (eql (lvar-value start) 0)
-                   (constant-lvar-p end)
-                   (null (lvar-value end))))))
+                   (lvar-value-is-nil end)))))
     `(let ((find nil)
            (position nil))
        (flet ((bounds-error ()

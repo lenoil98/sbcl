@@ -59,8 +59,7 @@
 (deftransform typep ((object type &optional env) * * :node node)
   (unless (constant-lvar-p type)
     (give-up-ir1-transform "can't open-code test of non-constant type"))
-  (unless (or (null env)
-              (and (constant-lvar-p env) (null (lvar-value env))))
+  (unless (unsupplied-or-nil env)
     (give-up-ir1-transform "environment argument present and not null"))
   (multiple-value-bind (expansion fail-p)
       (source-transform-typep 'object (lvar-value type))
@@ -317,7 +316,9 @@
        (cond ((and (eql (numeric-type-class type) 'integer)
                    (and (fixnump low)
                         (fixnump high)
-                        (<= (1+ (- high low)) 2)))
+                        #+(or x86 x86-64 arm arm64)
+                        (/= low 0)
+                        (< (- high low) 2)))
               ;; The fixnum-mod-p case is worse than just EQ testing with
               ;; only 2 values in the range. (INTEGER 1 2) would have become
               ;;   (and (not (eq x 0)) (fixnump x) (not (> x 2))).
@@ -366,7 +367,7 @@
            ;; as soon as any unknown is present.
            `(classoid-cell-typep ,(find-classoid-cell spec :create t) ,object))
           ((unknown-type-p type)
-           #+sb-xc-host
+           #+(and sb-xc-host (not sb-devel))
            (warn "can't open-code test of unknown type ~S"
                  (type-specifier type))
            ;; This is not a policy-based decision to notify here,
@@ -539,13 +540,21 @@
           (t
            (multiple-value-bind (widetags more-types)
                (sb-kernel::widetags-from-union-type types)
-             (if widetags
-                 `(or (%other-pointer-subtype-p ,object ',widetags)
-                      (typep ,object '(or ,@(mapcar #'type-specifier more-types))))
-                 `(or
-                   ,@(mapcar (lambda (x)
-                               `(typep ,object ',(type-specifier x)))
-                             more-types))))))))
+             (multiple-value-bind (predicate more-union-types)
+                 (split-union-type-tests type)
+               (cond ((and predicate
+                           (< (length more-union-types)
+                              (length more-types)))
+                      `(or (,predicate ,object)
+                           (typep ,object '(or ,@(mapcar #'type-specifier more-union-types)))))
+                     (widetags
+                      `(or (%other-pointer-subtype-p ,object ',widetags)
+                           (typep ,object '(or ,@(mapcar #'type-specifier more-types)))))
+                     (t
+                      `(or
+                        ,@(mapcar (lambda (x)
+                                    `(typep ,object ',(type-specifier x)))
+                                  more-types))))))))))
 
 ;;; Do source transformation for TYPEP of a known intersection type.
 (defun source-transform-intersection-typep (object type)
@@ -677,11 +686,15 @@
     (unless (or (eq dims '*)
                 (equal dims (array-type-dimensions stype)))
       (cond ((cdr dims)
-             (values `(,header-test
-                       ,@(when (eq (array-type-dimensions stype) '*)
-                           (if (vop-existsp :translate %array-rank=)
-                               `((%array-rank= ,obj ,(length dims)))
-                               `((= (%array-rank ,obj) ,(length dims)))))
+             (values `(,@(if (and simple-array-header-p
+                                  (vop-existsp :translate simple-array-header-of-rank-p)
+                                  (eq (array-type-dimensions stype) '*))
+                             `((simple-array-header-of-rank-p ,obj ,(length dims)))
+                             `(,header-test
+                               ,@(when (eq (array-type-dimensions stype) '*)
+                                   (if (vop-existsp :translate %array-rank=)
+                                       `((%array-rank= ,obj ,(length dims)))
+                                       `((= (%array-rank ,obj) ,(length dims)))))))
                        ,@(loop for d in dims
                                for i from 0
                                unless (eq '* d)
@@ -797,7 +810,7 @@
 ;;; layout-EQ. If a structure then test for layout-EQ and then a
 ;;; general test based on layout-inherits. Otherwise, look up the indirect
 ;;; class-cell and call CLASS-CELL-TYPEP at runtime.
-(deftransform %instance-typep ((object spec) (* *) * :node node)
+(deftransform %instance-typep ((object spec) * * :node node)
   (aver (constant-lvar-p spec))
   (let* ((spec (lvar-value spec))
          (class (specifier-type spec))
@@ -1215,7 +1228,7 @@
           (t
            (fail)))))
 
-(deftransform coerce ((x type) (* *) * :node node)
+(deftransform coerce ((x type) * * :node node)
   (unless (constant-lvar-p type)
     (give-up-ir1-transform))
   (let* ((tval (lvar-value type))

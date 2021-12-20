@@ -15,6 +15,25 @@
 
 (in-package "SB-X86-64-ASM")
 
+(defun sb-disassem::pre-decode (chunk dstate)
+  (let ((byte (ldb (byte 8 0) chunk)))
+    (case byte
+      ((#x64  ; FS:
+        #x65  ; GS:
+        #x66  ; operand size modifier
+        #x67  ; address size modifier
+        #xf0  ; LOCK
+        #xf2  ; REPNE or SSE inst
+        #xf3) ; REP or SSE inst
+       ;; If the next byte is a REX prefix, then strip it out, recording the 'wrxb'
+       ;; bits in the dstate, and return the chunk as if the REX byte were absent.
+       (let ((next (ldb (byte 8 8) chunk)))
+         (when (= (logand next #xf0) #x40)
+           (dstate-setprop dstate (logior +rex+ (logand next #b1111)))
+           (let ((new (logior byte (ash (ldb (byte 48 16) chunk) 8))))
+             (return-from sb-disassem::pre-decode (values new 1))))))))
+  (values chunk 0))
+
 (defmethod print-object ((reg reg) stream)
   (if *print-readably*
       ;; cross-compiled DEFMETHOD can't use call-next-method
@@ -171,7 +190,7 @@
   (princ16 value stream))
 
 (defun print-xmmreg (value stream dstate)
-  (let* ((reg (get-fpr
+  (let* ((reg (get-fpr :xmm
                            ;; FIXME: why are we seeing a value from the GPR
                            ;; prefilter instead of XMM prefilter here sometimes?
                            (etypecase value
@@ -233,7 +252,7 @@
       (cond ((= mod #b11) ; register direct mode
              (case regclass
               (gpr (get-gpr :qword full-reg)) ; size is not really known here
-              (fpr (get-fpr full-reg))))
+              (fpr (get-fpr :xmm full-reg))))
             ((= r/m #b100) ; SIB byte - rex.b is "don't care"
              (let* ((sib (the (unsigned-byte 8) (read-suffix 8 dstate)))
                     (index-reg (extend +rex-x+ (ldb (byte 3 3) sib)))
@@ -306,6 +325,8 @@
       (princ '| PTR | stream))
     (when (dstate-getprop dstate +fs-segment+)
       (princ "FS:" stream))
+    (when (dstate-getprop dstate +gs-segment+)
+      (princ "GS:" stream))
     (write-char #\[ stream)
     (when base-reg
       (if (eql :rip base-reg)
@@ -380,14 +401,10 @@
                  ;; Q: what's the difference between "tls_index:" and "tls:" (below)?
                  (note (lambda (stream) (format stream "tls_index: ~S" symbol))
                        dstate))))
-            ((and (not base-reg) (not index-reg) disp)
-             (let ((addr (+ disp ; guess that DISP points to a symbol-value slot
-                            (- (ash sb-vm:symbol-value-slot sb-vm:word-shift))
-                            sb-vm:other-pointer-lowtag)))
-               (awhen (guess-symbol (lambda (s) (= (get-lisp-obj-address s) addr)))
-                 (note (lambda (stream) (format stream "~A" it)) dstate))))
-            ((and (eql base-reg #.(tn-offset sb-vm::thread-base-tn))
-                  (not (dstate-getprop dstate +fs-segment+)) ; not system TLS
+            ;; thread slots
+            ((and (eql base-reg sb-vm::thread-reg)
+                  #+gs-seg (dstate-getprop dstate +gs-segment+)
+                  #-gs-seg (not (dstate-getprop dstate +fs-segment+)) ; not system TLS
                   (not index-reg) ; no index
                   (typep disp '(integer 0 *)) ; positive displacement
                   (zerop (logand disp 7))) ; lispword-aligned
@@ -405,7 +422,14 @@
                (when symbol
                  (return-from print-mem-ref
                    (note (lambda (stream) (format stream "tls: ~S" symbol))
-                         dstate)))))))))
+                         dstate)))))
+            ((and (not base-reg) (not index-reg) disp)
+             (let ((addr (+ disp ; guess that DISP points to a symbol-value slot
+                            (- (ash sb-vm:symbol-value-slot sb-vm:word-shift))
+                            sb-vm:other-pointer-lowtag)))
+               (awhen (guess-symbol (lambda (s) (= (get-lisp-obj-address s) addr)))
+                 (note (lambda (stream) (format stream "~A" it)) dstate))))
+            ))))
 
 (defun lea-compute-label (value dstate)
   ;; If VALUE should be regarded as a label, return the address.
@@ -494,23 +518,6 @@
                            nil)) ; no error number after the trap instruction
                  (snarf-error-junk sap offset trap-number length-only)))
            trap stream dstate)))))))
-
-;;; Note: this really has nothing to do with the code fixups, and we're
-;;; merely utilizing PACK-CODE-FIXUP-LOCS to perform data compression.
-(defun sb-c::convert-alloc-point-fixups (code locs)
-  ;; Find the instruction which jumps over the profiling code,
-  ;; and record the offset, and not the instruction that makes the call
-  ;; to enable the counter. The instructions preceding the call comprise
-  ;; a test, jmp, and long nop. Luckily a long nop encoding never
-  ;; has the byte #xEB in it, so just scan backwards looking for that.
-  (pack-code-fixup-locs
-   (mapcar (lambda (loc)
-             (loop (cond ((zerop (decf loc))
-                          (bug "Failed to find allocation point"))
-                         ((eql (sap-ref-8 (code-instructions code) loc) #xEB)
-                          (return loc)))))
-           locs)
-   nil))
 
 ;;; Disassemble memory of CODE from START-ADDRESS for LENGTH bytes
 ;;; calling FUNCTION on each instruction that has a PC-relative operand.

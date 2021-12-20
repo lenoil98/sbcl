@@ -20,7 +20,7 @@
   (defknown (setf symbol-extra) (t t) t ())
   (def-setter '(setf symbol-extra) symbol-size other-pointer-lowtag))
 
-(defconstant extended-symbol-size (1+ symbol-size))
+(defconstant augmented-symbol-size (1+ symbol-size))
 
 #+sb-thread
 (dovector (slot (primitive-object-slots (primitive-object 'thread)))
@@ -29,10 +29,13 @@
           (ash (slot-offset slot) word-shift))))
 
 #+gencgc
-(defconstant large-object-size
-  (* 4 (max +backend-page-bytes+ gencgc-card-bytes
-            gencgc-alloc-granularity)))
-
+(progn
+;;; don't change allocation granularity
+(assert (= gencgc-alloc-granularity 0))
+;;; cards are not larger than pages
+(assert (<= gencgc-card-bytes +backend-page-bytes+))
+;;; largeness does not depend on the hardware page size
+(defconstant large-object-size (* 4 gencgc-card-bytes)))
 
 ;;; Keep this (mostly) lined up with 'early-objdef' for sanity's sake!
 #+sb-xc-host
@@ -67,7 +70,8 @@
     #-(or x86 x86-64 arm64) (return-pc "return_pc_header" "return_pc_header" "lose")
 
     (value-cell "boxed")
-    (symbol "tiny_boxed")
+    (symbol #-compact-symbol "tiny_boxed" #+compact-symbol "symbol"
+            "tiny_boxed") ; trans and size are always like tiny_boxed
     ;; Can't transport characters as "other" pointer objects.
     ;; It should be a cons cell half which would go through trans_list()
     (character "immediate")

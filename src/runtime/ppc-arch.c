@@ -321,8 +321,8 @@ allocation_trap_p(os_context_t * context)
     return 0;
 }
 
-#ifndef boxed_region
-#define boxed_region gc_alloc_region[0]
+#ifndef mixed_region
+#define mixed_region gc_alloc_region[0]
 #endif
 
 static int
@@ -377,12 +377,12 @@ handle_allocation_trap(os_context_t * context)
 
 #if INLINE_ALLOC_DEBUG
     fprintf(stderr, "Alloc %d to %s\n", size, lisp_register_names[target]);
-    if ((((unsigned long)boxed_region.end_addr + size) / GENCGC_CARD_BYTES) ==
-        (((unsigned long)boxed_region.end_addr) / GENCGC_CARD_BYTES)) {
+    if ((((unsigned long)mixed_region.end_addr + size) / GENCGC_CARD_BYTES) ==
+        (((unsigned long)mixed_region.end_addr) / GENCGC_CARD_BYTES)) {
       fprintf(stderr,"*** possibly bogus trap allocation of %d bytes at %p\n",
               size, (void*)target_ptr);
-      fprintf(stderr, "    dynamic_space_free_pointer: %p, boxed_region.end_addr %p\n",
-              dynamic_space_free_pointer, boxed_region.end_addr);
+      fprintf(stderr, "    dynamic_space_free_pointer: %p, mixed_region.end_addr %p\n",
+              dynamic_space_free_pointer, mixed_region.end_addr);
     }
     fprintf(stderr, "Ready to alloc\n");
     fprintf(stderr, "free_pointer = %p\n", dynamic_space_free_pointer);
@@ -834,4 +834,20 @@ arch_write_linkage_table_entry(int index, void *target_addr, int datap)
   *inst_ptr++ = inst;
 
   os_flush_icache((os_vm_address_t) reloc_addr, (char*) inst_ptr - reloc_addr);
+}
+
+void gcbarrier_patch_code(void* where, int nbits)
+{
+#ifdef LISP_FEATURE_64_BIT
+    int m_operand = 64 - nbits;
+    // the M field has a kooky encoding
+    int m_encoded = ((m_operand & 0x1F) << 1) | (m_operand >> 5);
+    unsigned int* pc = where;
+    unsigned int inst = *pc;
+    // .... ____ _xxx xxx_ ____ = 0x7E0;
+    //                  ^ deposit it here, in (BYTE 6 5) of the instruction.
+    *pc = (inst & ~0x7E0) | (m_encoded << 5);
+#else
+    lose("can't patch rldicl in 32-bit"); // illegal instruction
+#endif
 }

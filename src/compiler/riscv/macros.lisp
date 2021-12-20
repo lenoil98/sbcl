@@ -626,21 +626,21 @@ and
 
 (defun load-alloc-free-pointer (reg)
   #-sb-thread
-  (loadw reg null-tn 0 (- nil-value boxed-region))
+  (loadw reg null-tn 0 (- nil-value mixed-region))
   #+sb-thread
-  (loadw reg thread-base-tn thread-boxed-tlab-slot))
+  (loadw reg thread-base-tn thread-mixed-tlab-slot))
 
 (defun load-alloc-end-addr (reg)
   #-sb-thread
-  (loadw reg null-tn 1 (- nil-value boxed-region))
+  (loadw reg null-tn 1 (- nil-value mixed-region))
   #+sb-thread
-  (loadw reg thread-base-tn (+ thread-boxed-tlab-slot 1)))
+  (loadw reg thread-base-tn (+ thread-mixed-tlab-slot 1)))
 
 (defun store-alloc-free-pointer (reg)
   #-sb-thread
-  (storew reg null-tn 0 (- nil-value boxed-region))
+  (storew reg null-tn 0 (- nil-value mixed-region))
   #+sb-thread
-  (storew reg thread-base-tn thread-boxed-tlab-slot))
+  (storew reg thread-base-tn thread-mixed-tlab-slot))
 
 ;;; This is the main mechanism for allocating memory in the lisp heap.
 ;;;
@@ -743,7 +743,6 @@ and
                    :flag-tn ,flag-tn
                    :stack-allocate-p ,stack-allocate-p
                    ,@(when temp-tn `(:temp-tn ,temp-tn)))
-       (when ,type-code
-         (inst li ,flag-tn (compute-object-header ,size ,type-code))
-         (storew ,flag-tn ,result-tn 0 ,lowtag))
+       (inst li ,flag-tn (compute-object-header ,size ,type-code))
+       (storew ,flag-tn ,result-tn 0 ,lowtag)
        ,@body)))

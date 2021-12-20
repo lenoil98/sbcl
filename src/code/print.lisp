@@ -13,50 +13,49 @@
 
 ;;;; exported printer control variables
 
-;; NB: all of the following are initialized during genesis
-(defparameter *print-readably* nil
+(defvar *print-readably* nil
   "If true, all objects will be printed readably. If readable printing
   is impossible, an error will be signalled. This overrides the value of
   *PRINT-ESCAPE*.")
-(defparameter *print-escape* t
+(defvar *print-escape* t
   "Should we print in a reasonably machine-readable way? (possibly
   overridden by *PRINT-READABLY*)")
-(defparameter *print-pretty* nil ; (set later when pretty-printer is initialized)
+(defvar *print-pretty* nil ; (set later when pretty-printer is initialized)
   "Should pretty printing be used?")
-(defparameter *print-base* 10.
+(defvar *print-base* 10.
   "The output base for RATIONALs (including integers).")
-(defparameter *print-radix* nil
+(defvar *print-radix* nil
   "Should base be verified when printing RATIONALs?")
-(defparameter *print-level* nil
+(defvar *print-level* nil
   "How many levels should be printed before abbreviating with \"#\"?")
-(defparameter *print-length* nil
+(defvar *print-length* nil
   "How many elements at any level should be printed before abbreviating
   with \"...\"?")
-(defparameter *print-vector-length* nil
+(defvar *print-vector-length* nil
   "Like *PRINT-LENGTH* but works on strings and bit-vectors.
 Does not affect the cases that are already controlled by *PRINT-LENGTH*")
-(defparameter *print-circle* nil
+(defvar *print-circle* nil
   "Should we use #n= and #n# notation to preserve uniqueness in general (and
   circularity in particular) when printing?")
-(defparameter *print-case* :upcase
+(defvar *print-case* :upcase
   "What case should the printer should use default?")
-(defparameter *print-array* t
+(defvar *print-array* t
   "Should the contents of arrays be printed?")
-(defparameter *print-gensym* t
+(defvar *print-gensym* t
   "Should #: prefixes be used when printing symbols with null SYMBOL-PACKAGE?")
-(defparameter *print-lines* nil
+(defvar *print-lines* nil
   "The maximum number of lines to print per object.")
-(defparameter *print-right-margin* nil
+(defvar *print-right-margin* nil
   "The position of the right margin in ems (for pretty-printing).")
-(defparameter *print-miser-width* nil
+(defvar *print-miser-width* nil
   "If the remaining space between the current column and the right margin
    is less than this, then print using ``miser-style'' output. Miser
    style conditional newlines are turned on, and all indentations are
    turned off. If NIL, never use miser mode.")
 (defvar *print-pprint-dispatch*
-  (sb-pretty::make-pprint-dispatch-table #() nil nil) ; for type-correctness
+  (sb-pretty::make-pprint-dispatch-table #() nil nil)
   "The pprint-dispatch-table that controls how to pretty-print objects.")
-(defparameter *suppress-print-errors* nil
+(defvar *suppress-print-errors* nil
   "Suppress printer errors when the condition is of the type designated by this
 variable: an unreadable object representing the error is printed instead.")
 
@@ -406,14 +405,14 @@ variable: an unreadable object representing the error is printed instead.")
       (output-symbol object (sb-xc:symbol-package object) stream)
       ;; Write only the characters of the name, never the package
       (let ((rt *readtable*))
-        (funcall (truly-the function
-                  (choose-symbol-out-fun *print-case* (%readtable-case rt)))
-                 (symbol-name object) stream rt))))
+        (output-symbol-case-dispatch *print-case* (readtable-case rt)
+                                     (symbol-name object) stream rt))))
 
 (defun output-symbol (symbol package stream)
   (let* ((readably *print-readably*)
          (readtable (if readably *standard-readtable* *readtable*))
-         (out-fun (choose-symbol-out-fun *print-case* (%readtable-case readtable))))
+         (print-case *print-case*)
+         (readtable-case (readtable-case readtable)))
     (flet ((output-token (name)
              (declare (type simple-string name))
              (cond ((or (and (readtable-normalization readtable)
@@ -432,7 +431,8 @@ variable: an unreadable object representing the error is printed instead.")
                         (write-char char stream)))
                     (write-char #\| stream))
                    (t
-                    (funcall (truly-the function out-fun) name stream readtable)))))
+                    (output-symbol-case-dispatch print-case readtable-case
+                                                 name stream readtable)))))
       (let ((name (symbol-name symbol))
             (current (sane-package)))
         (cond
@@ -581,9 +581,9 @@ variable: an unreadable object representing the error is printed instead.")
            (bases +digit-bases+)
            (base *print-base*)
            (letter-attribute
-            (case (%readtable-case readtable)
-              (#.+readtable-upcase+ uppercase-attribute)
-              (#.+readtable-downcase+ lowercase-attribute)
+            (case (readtable-case readtable)
+              (:upcase uppercase-attribute)
+              (:downcase lowercase-attribute)
               (t (logior lowercase-attribute uppercase-attribute))))
            (index 0)
            (bits 0)
@@ -707,6 +707,8 @@ variable: an unreadable object representing the error is printed instead.")
 ;;;; case hackery: One of these functions is chosen to output symbol
 ;;;; names according to the values of *PRINT-CASE* and READTABLE-CASE.
 
+(declaim (start-block output-symbol-case-dispatch))
+
 ;;; called when:
 ;;; READTABLE-CASE      *PRINT-CASE*
 ;;; :UPCASE             :UPCASE
@@ -741,7 +743,7 @@ variable: an unreadable object representing the error is printed instead.")
 (defun output-capitalize-symbol (pname stream readtable)
   (declare (simple-string pname))
   (let ((prev-not-alphanum t)
-        (up (eql (%readtable-case readtable) +readtable-upcase+)))
+        (up (eq (readtable-case readtable) :upcase)))
     (dotimes (i (length pname))
       (let ((char (char pname i)))
         (write-char (if up
@@ -772,37 +774,23 @@ variable: an unreadable object representing the error is printed instead.")
           (t
            (write-string pname stream)))))
 
-(defun choose-symbol-out-fun (print-case readtable-case)
-  (macrolet
-      ((compute-fun-vector (&aux (vector (make-array 12)))
-         ;; Pack a 2D array of functions into a simple-vector.
-         ;; Major axis is *PRINT-CASE*, minor axis is %READTABLE-CASE.
-         (dotimes (readtable-case-index 4)
-           (dotimes (print-case-index 3)
-             (let ((readtable-case
-                    (elt '(:upcase :downcase :preserve :invert) readtable-case-index))
-                   (print-case
-                    (elt '(:upcase :downcase :capitalize) print-case-index)))
-               (setf (aref vector (logior (ash print-case-index 2)
-                                          readtable-case-index))
-                     (case readtable-case
-                       (:upcase
-                        (case print-case
-                          (:upcase 'output-preserve-symbol)
-                          (:downcase 'output-lowercase-symbol)
-                          (:capitalize 'output-capitalize-symbol)))
-                       (:downcase
-                        (case print-case
-                          (:upcase 'output-uppercase-symbol)
-                          (:downcase 'output-preserve-symbol)
-                          (:capitalize 'output-capitalize-symbol)))
-                       (:preserve 'output-preserve-symbol)
-                       (:invert 'output-invert-symbol))))))
-         `(load-time-value (vector ,@(map 'list (lambda (x) `(function ,x)) vector))
-                           t)))
-    (aref (compute-fun-vector)
-          (logior (case print-case (:upcase 0) (:downcase 4) (t 8))
-                  (truly-the (mod 4) readtable-case)))))
+;;; Call an output function based on PRINT-CASE and READTABLE-CASE.
+(defun output-symbol-case-dispatch (print-case readtable-case name stream readtable)
+  (ecase readtable-case
+    (:upcase
+     (ecase print-case
+       (:upcase (output-preserve-symbol name stream readtable))
+       (:downcase (output-lowercase-symbol name stream readtable))
+       (:capitalize (output-capitalize-symbol name stream readtable))))
+    (:downcase
+     (ecase print-case
+       (:upcase (output-uppercase-symbol name stream readtable))
+       (:downcase (output-preserve-symbol name stream readtable))
+       (:capitalize (output-capitalize-symbol name stream readtable))))
+    (:preserve (output-preserve-symbol name stream readtable))
+    (:invert (output-invert-symbol name stream readtable))))
+
+(declaim (end-block))
 
 ;;;; recursive objects
 
@@ -1124,7 +1112,7 @@ variable: an unreadable object representing the error is printed instead.")
   ;;   "The function SB-KERNEL:SIMPLE-CHARACTER-STRING-P is undefined."
   ;; but a symbol-macrolet is ok. This is a FIXME except I don't care.
   (symbol-macrolet ((chars "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
-    (declare (optimize (sb-c::insert-array-bounds-checks 0) speed))
+    (declare (optimize (sb-c:insert-array-bounds-checks 0) speed))
     (macrolet ((iterative-algorithm ()
                  `(loop (multiple-value-bind (q r)
                             (truncate (truly-the word integer) base)

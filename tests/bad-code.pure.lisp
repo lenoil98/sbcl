@@ -605,3 +605,52 @@
                      (checked-compile '(lambda (f z x)
                                         (mapcar f  (the integer z) (the integer x)))
                                       :allow-warnings 'sb-int:type-warning))))
+
+(with-test (:name :aref-too-many-subscripts)
+  (assert (nth-value 2
+                     (checked-compile `(lambda (a) (aref a ,@(loop repeat array-rank-limit collect 0)))
+                                      :allow-warnings 'warning))))
+
+(with-test (:name :defclass-bad-type)
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda () (defclass ,(gensym) () ((s :type (2)))))
+                      :allow-warnings 'warning))))
+
+(with-test (:name :macro-as-a-function)
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (x) (find-if 'and x))
+                      :allow-warnings 'warning)))
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (x) (funcall 'if x))
+                      :allow-warnings 'warning)))
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (x) (mapcar 'and x))
+                      :allow-warnings 'warning))))
+
+(with-test (:name :replace-type-mismatch)
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (x y)
+                         (declare (bit-vector x)
+                                  (string y))
+                         (replace x y :start1 10))
+                      :allow-warnings 'warning))))
+
+(with-test (:name :substitute-type-mismatch)
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (x)
+                         (declare (string x))
+                         (substitute 10 #\a x))
+                      :allow-warnings 'warning))))
+
+(with-test (:name :make-array-initial-contents-type-mismatch)
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (n c)
+                         (make-array n :element-type 'bit :initial-contents (the string c)))
+                      :allow-warnings 'warning))))

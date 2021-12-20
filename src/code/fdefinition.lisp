@@ -27,10 +27,8 @@
   (let ((fdefn (truly-the (values fdefn &optional)
                           (sb-vm::alloc-immobile-fdefn))))
     (sb-vm::%set-fdefn-name fdefn name)
-    ;; Return the result of FDEFN-MAKUNBOUND because it (strangely) returns its
-    ;; argument. Using FDEFN as the value of this function, as if we didn't know
-    ;; that FDEFN-MAKUNBOUND did that, would cause a redundant register move.
-    (truly-the fdefn (fdefn-makunbound fdefn))))
+    (fdefn-makunbound fdefn)
+    fdefn))
 
 (defun (setf fdefn-fun) (fun fdefn)
   (declare (type function fun)
@@ -39,31 +37,15 @@
   #+immobile-code (sb-vm::%set-fdefn-fun fdefn fun)
   #-immobile-code (setf (fdefn-fun fdefn) fun))
 
-;; Given Info-Vector VECT, return the fdefn that it contains for its root name,
-;; or nil if there is no value. NIL input is acceptable and will return NIL.
-;; (see src/compiler/info-vector for more details)
-(declaim (inline info-vector-fdefn))
-(defun info-vector-fdefn (vect)
-  (when vect
-    ;; This is safe: Info-Vector invariant requires that it have length >= 1.
-    (let ((word (the fixnum (svref vect 0))))
-      ;; Test that the first info-number is +fdefn-info-num+ and its n-infos
-      ;; field is nonzero. These conditions can be tested simultaneously
-      ;; using a SIMD-in-a-register idea. The low 6 bits must be nonzero
-      ;; and the next 6 must be exactly #b111111, so considered together
-      ;; as a 12-bit unsigned integer it must be >= #b111111000001
-      (when (>= (ldb (byte (* info-number-bits 2) 0) word)
-                (1+ (ash +fdefn-info-num+ info-number-bits)))
-        ;; DATA-REF-WITH-OFFSET doesn't know the info-vector length invariant,
-        ;; so depite (safety 0) eliding bounds check, FOLD-INDEX-ADDRESSING
-        ;; wasn't kicking in without (TRULY-THE (INTEGER 1 *)).
-        (aref vect (1- (truly-the (integer 1 *) (length vect))))))))
-
 ;; Return SYMBOL's fdefinition, if any, or NIL. SYMBOL must already
 ;; have been verified to be a symbol by the caller.
 (defun symbol-fdefn (symbol)
   (declare (optimize (safety 0)))
-  (info-vector-fdefn (symbol-info-vector symbol)))
+  (let ((fdefn (sb-vm::%symbol-fdefn symbol)))
+    ;; The slot default is 0, not NIL, because I'm thinking that it might also
+    ;; be used to store the property list if there is no FDEFN,
+    ;; or a cons of an FDEFN and list, so 0 is unambiguously "no value"
+    (if (eql fdefn 0) nil fdefn)))
 
 ;; Return the fdefn object for NAME, or NIL if there is no fdefn.
 ;; Signal an error if name isn't valid.
@@ -82,7 +64,7 @@
         (return-from find-fdefn it))
       :simple
       (progn
-        (awhen (symbol-info-vector key1)
+        (awhen (symbol-dbinfo key1)
           (multiple-value-bind (data-idx descriptor-idx field-idx)
               (info-find-aux-key/packed it key2)
             (declare (type index descriptor-idx)
@@ -95,14 +77,23 @@
               (when (eql (packed-info-field it descriptor-idx field-idx)
                          +fdefn-info-num+)
                 (return-from find-fdefn
-                  (aref it (1- (the index data-idx))))))))
+                  (%info-ref it (1- (the index data-idx))))))))
         (when (eq key1 'setf) ; bypass the legality test
           (return-from find-fdefn nil))))
   (legal-fun-name-or-type-error name))
 
 (declaim (ftype (sfunction (t) fdefn) find-or-create-fdefn))
 (defun find-or-create-fdefn (name)
-  (or (find-fdefn name)
+  (cond
+    ((symbolp name)
+     (let ((fdefn (sb-vm::%symbol-fdefn name)))
+       (if (eql fdefn 0)
+           (let* ((new (make-fdefn name))
+                  (actual (sb-vm::cas-symbol-fdefn name 0 new)))
+             (if (eql actual 0) new (the fdefn actual)))
+           fdefn)))
+    ((find-fdefn name))
+    (t
       ;; We won't reach here if the name was not legal
       (let (made-new)
         (dx-flet ((new (name)
@@ -120,7 +111,7 @@
             (when (and made-new
                        (typep name '(cons (eql sb-pcl::slot-accessor))))
               (sb-pcl::ensure-accessor name))
-            fdefn)))))
+            fdefn))))))
 
 ;;; Return T if FUNCTION is the error-signaling trampoline for a macro or a
 ;;; special operator. Test for this by seeing whether FUNCTION is the same
@@ -466,8 +457,8 @@
 ;;; https://fgiesen.wordpress.com/2015/02/22/triangular-numbers-mod-2n/
 ;;; contains a proof that triangular numbers mod 2^N visit every cell.
 
-;;; The intent here - which may be impossible to realize - was to allow GC
-;;; methods whose name is not reachable.  I couldn't get it to do the right thing.
+;;; The intent here - which may be impossible to realize - was to allow garbage-collection
+;;; of FDEFNs whose name is not reachable.  I couldn't get it to do the right thing.
 ;;; e.g. (defmethod foo (x (y cons)) ...) creates mappings:
 ;;; (SB-PCL::FAST-METHOD FOO (T CONS)) -> #<SB-KERNEL:FDEFN (SB-PCL::FAST-METHOD FOO (T CONS))>
 ;;; (SB-PCL::SLOW-METHOD FOO (T CONS)) -> #<SB-KERNEL:FDEFN (SB-PCL::SLOW-METHOD FOO (T CONS))>

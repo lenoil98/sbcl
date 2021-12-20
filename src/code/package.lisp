@@ -36,11 +36,27 @@
 ;;;       symbol whose name is spelled "NIL" have the identical strange hash
 ;;;       so that the hash is a pure function of the name's characters.
 
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defconstant package-id-bits 16)
+  ;; Give 48 bits to SYMBOL-NAME, which spans 256 TiB of memory.
+  ;; Omitting the lowtag bits could span up to 4 PiB because we could left-shift
+  ;; and re-tag to read the name.  That seems excessive though. Another viable
+  ;; technique would be to store a heap-base-relative pointer, which might be
+  ;; needed if dynamic-space is small but at a very high address.
+  ;; For now, it seems fine to treat the low 48 bits as a tagged pointer.
+  (defconstant symbol-name-bits (- sb-vm:n-word-bits package-id-bits)))
+(defconstant +package-id-overflow+ (1- (ash 1 package-id-bits)))
+(defconstant +package-id-none+     0)
+(defconstant +package-id-lisp+     1)
+(defconstant +package-id-keyword+  2)
+(defconstant +package-id-user+     3)
+(defconstant +package-id-kernel+   4)
+
 (sb-xc:defstruct (package-hashtable
                   (:constructor %make-package-hashtable
                                 (cells size &aux (free size)))
                   (:copier nil))
-  ;; The general-vector of symbols, with a hash-vector in its last cell.
+  ;; The general-vector of symbols
   (cells (missing-arg) :type simple-vector)
   ;; The total number of entries allowed before resizing.
   ;;
@@ -57,12 +73,14 @@
 
 (sb-xc:defstruct (package
                   (:constructor %make-package
-                                (%name internal-symbols external-symbols))
+                                (internal-symbols external-symbols))
                   (:copier nil)
                   (:predicate packagep))
   "the standard structure for the description of a package"
   ;; the name of the package, or NIL for a deleted package
   (%name nil :type (or simple-string null))
+  ;; A small integer ID, unless it overflows the global package index
+  (id nil :type (or (unsigned-byte #.package-id-bits) null))
   ;; nickname strings
   (%nicknames () :type list)
   ;; packages used by this package

@@ -20,7 +20,6 @@
 ;;;; Note: Take a look at the compiler-overview.tex section on "Hairy
 ;;;; function representation" before you seriously mess with this
 ;;;; stuff.
-#-sb-devel
 (declaim (start-block ir1-convert-lambda ir1-convert-lambda-body
                       ir1-convert-aux-bindings varify-lambda-arg
                       ir1-convert-lambdalike))
@@ -201,7 +200,8 @@
                                 debug-name
                                 (note-lexical-bindings t)
                                 post-binding-lexenv
-                                system-lambda)
+                                system-lambda
+                                local-policy)
   (declare (list body vars aux-vars aux-vals))
 
   ;; We're about to try to put new blocks into *CURRENT-COMPONENT*.
@@ -209,10 +209,13 @@
 
   (let* ((bind (make-bind))
          (lambda (make-lambda :vars vars
-                  :bind bind
-                  :%source-name source-name
-                  :%debug-name debug-name
-                  :system-lambda-p system-lambda))
+                              :bind bind
+                              :%source-name source-name
+                              :%debug-name debug-name
+                              :system-lambda-p system-lambda
+                              :lexenv (if local-policy
+                                          (make-lexenv :policy local-policy)
+                                          *lexenv*)))
          (result-ctran (make-ctran))
          (result-lvar (make-lvar)))
     ;; just to check: This function should fail internal assertions if
@@ -895,7 +898,8 @@
       (multiple-value-bind (vars keyp allow-other-keys aux-vars aux-vals)
           (make-lambda-vars (cadr form))
         (binding* (((*lexenv* result-type post-binding-lexenv
-                              lambda-list explicit-check source-form)
+                              lambda-list explicit-check source-form
+                              local-policy)
                     (process-decls decls (append aux-vars vars) nil
                                    :binding-form-p t :allow-lambda-list t))
                    (debug-catch-p (and maybe-add-debug-catch
@@ -924,7 +928,8 @@
                                                         :post-binding-lexenv post-binding-lexenv
                                                         :source-name source-name
                                                         :debug-name debug-name
-                                                        :system-lambda system-lambda)))))
+                                                        :system-lambda system-lambda
+                                                        :local-policy local-policy)))))
           (when explicit-check
             (setf (getf (functional-plist res) 'explicit-check) explicit-check))
           (setf (functional-inline-expansion res) (or source-form form))
@@ -1066,7 +1071,6 @@
             (allow (when (ll-kwds-allowp llks) '(&allow-other-keys))))
         (careful-specifier-type `(function (,@reqs ,@opts ,@rest ,@keys ,@allow) *))))))
 
-#-sb-devel
 (declaim (start-block maybe-inline-syntactic-closure))
 
 ;;; Take the lexenv surrounding an inlined function and extract things
@@ -1181,7 +1185,6 @@
 
 (declaim (end-block))
 
-#-sb-devel
 (declaim (start-block ir1-convert-inline-lambda))
 
 ;;; Convert the forms produced by RECONSTRUCT-LEXENV to LEXENV
@@ -1250,7 +1253,7 @@
                 (lexenv-flushable *lexenv*)
                 lexenv-lambda
                 *lexenv*)))
-         (*inlining* (not *transforming*))
+         (*inlining* (1+ *inlining*))
          (clambda (ir1-convert-lambda body
                                       :source-name source-name
                                       :debug-name debug-name

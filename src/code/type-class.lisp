@@ -424,16 +424,12 @@
                  (loop for name in type-class-fun-slots
                        append `(,(keywordicate name)
                                 (,(type-class-fun-slot name) parent))))))))
+    ;; Careful: type-classes are very complicated things to redefine.
+    ;; For the sake of parallelized make-host-1 we have to allow
+    ;; redefinition, but it has to be a no-op.
     #+sb-xc-host
-    `(progn
-       ;; Careful: type-classes are very complicated things to redefine.
-       ;; For the sake of parallelized make-host-1 we have to allow
-       ;; redefinition, but it has to be a no-op.
-       (unless (find ',name *type-classes* :key #'type-class-name)
-         (vector-push ,make-it *type-classes*))
-       ;; I have no idea what compiler bug could be worked around by adding a form here,
-       ;; but this certainly achieves something, somehow.
-       #+host-quirks-cmu (print (aref *type-classes* (1- (length *type-classes*)))))
+    `(unless (find ',name *type-classes* :key #'type-class-name)
+       (vector-push ,make-it *type-classes*))
 
     #+sb-xc
     (let ((type-class-index
@@ -984,7 +980,7 @@
            ;; It should always work to dispatch by class-id, but ALIEN-TYPE-TYPE
            ;; is a problem in the cross-compiler due to not having a type-class-id
            ;; when 'src/code/cross-type' is compiled. I briefly tried moving
-           ;; it later, but then class-init failed to compile.
+           ;; it later, but then type-init failed to compile.
            #+sb-xc-host
            (etypecase type ,@clauses)
            #-sb-xc-host

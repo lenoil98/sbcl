@@ -343,6 +343,9 @@
 (defknown %multiply-high (word word) word
     (movable foldable flushable))
 
+(defknown multiply-fixnums (fixnum fixnum) integer
+  (movable foldable flushable))
+
 (defknown %signed-multiply-high (sb-vm:signed-word sb-vm:signed-word) sb-vm:signed-word
     (movable foldable flushable))
 
@@ -1862,9 +1865,9 @@
 (defknown (%check-bound check-bound) (array index t) index
   (dx-safe))
 (defknown data-vector-ref (simple-array index) t
-  (foldable unsafely-flushable always-translatable))
+  (foldable flushable always-translatable))
 (defknown data-vector-ref-with-offset (simple-array fixnum fixnum) t
-  (foldable unsafely-flushable always-translatable))
+  (foldable flushable always-translatable))
 (defknown data-nil-vector-ref (simple-array index) nil
   (always-translatable))
 ;;; The lowest-level vector SET operators should not return a value.
@@ -1987,8 +1990,11 @@
 (defknown %scharset ((modifying simple-string) index character) character ())
 (defknown %set-symbol-value (symbol t) t ())
 (defknown (setf symbol-function) (function symbol) function ())
-(defknown %set-symbol-plist (symbol list) list ()
-  :derive-type #'result-type-last-arg)
+;; Does this really need a type deriver? It's inline, and returns its 1st arg,
+;; i.e. we know exactly what object it returns, which is more precise than
+;; just knowing the type.
+(defknown (setf symbol-plist) (list symbol) list ()
+  :derive-type #'result-type-first-arg)
 (defknown %setnth (unsigned-byte (modifying list) t) t ()
   :derive-type #'result-type-last-arg)
 (defknown %set-fill-pointer ((modifying complex-vector) index) index ()
@@ -1996,7 +2002,7 @@
 
 ;;;; ALIEN and call-out-to-C stuff
 
-(defknown %alien-funcall ((or string system-area-pointer) alien-type &rest *) *)
+(defknown %alien-funcall ((or string system-area-pointer) alien-type &rest t) *)
 
 ;; Used by WITH-PINNED-OBJECTS
 #+(or x86 x86-64)

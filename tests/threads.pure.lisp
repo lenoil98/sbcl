@@ -120,9 +120,10 @@
                       collect
                       (make-thread
                        (lambda ()
-                         (let ((sem semaphore))
-                           (dotimes (s i)
-                             (wait-on-semaphore sem))))
+                         (sb-ext:with-timeout 10
+                           (let ((sem semaphore))
+                             (dotimes (s i)
+                               (wait-on-semaphore sem)))))
                        :name "reader"))
                 (* n i)))
              (make-writers (n readers i)
@@ -134,9 +135,10 @@
                                  collect
                                  (make-thread
                                   (lambda ()
-                                    (let ((sem semaphore))
-                                      (dotimes (s k)
-                                        (signal-semaphore sem))))
+                                    (sb-ext:with-timeout 10
+                                      (let ((sem semaphore))
+                                        (dotimes (s k)
+                                          (signal-semaphore sem)))))
                                   :name "writer"))))
                       (assert (zerop rem))
                       writers)
@@ -153,17 +155,14 @@
                    (values)))))
       (assert
        (eq :ok
-           (handler-case
-               (sb-ext:with-timeout 10
-                 (test 1 1 100)
-                 (test 2 2 10000)
-                 (test 4 2 10000)
-                 (test 4 2 10000)
-                 (test 10 10 10000)
-                 (test 10 1 10000)
-                 :ok)
-             (sb-ext:timeout ()
-               :timeout)))))))
+           (sb-ext:with-timeout 20
+             (test 1 1 100)
+             (test 2 2 10000)
+             (test 4 2 10000)
+             (test 4 2 10000)
+             (test 10 10 10000)
+             (test 10 1 10000)
+             :ok))))))
 
 ;;;; Printing waitqueues
 

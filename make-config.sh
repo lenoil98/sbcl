@@ -437,11 +437,15 @@ then
     esac
 else
     case $sbcl_arch in
-        x86|x86-64|arm64)
+        x86|x86-64)
             case $sbcl_os in
-                linux|darwin)
+                linux|darwin|freebsd)
                     WITH_FEATURES="$WITH_FEATURES :sb-thread"
             esac
+    esac
+    case $sbcl_arch in
+        arm64)
+            WITH_FEATURES="$WITH_FEATURES :sb-thread"
     esac
 fi
 
@@ -563,7 +567,7 @@ case "$sbcl_os" in
             fi
         fi
         if [ $sbcl_arch = "arm64" ]; then
-            printf ' :darwin-jit' >> $ltf
+            printf ' :darwin-jit :gcc-tls' >> $ltf
         fi
         link_or_copy $sbcl_arch-darwin-os.h target-arch-os.h
         link_or_copy bsd-os.h target-os.h

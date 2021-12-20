@@ -112,7 +112,7 @@
   (def value-cell-ref)
   (def %caller-frame ())
   (def %caller-pc ())
-  #+(or x86 x86-64) (def sb-vm::%code-fixups)
+  (def sb-vm::%code-fixups)
   #+x86-64 (def pointerp)
 
   ;; instances
@@ -131,7 +131,6 @@
   (def %funcallable-instance-fun)
   (def (setf %funcallable-instance-fun) (fin new-value))
   (def %funcallable-instance-info (fin i))
-  (def %set-funcallable-instance-info (fin i new-value))
   #+compact-instance-header (progn (def wrapper-of)
                                    (def %instanceoid-layout))
 
@@ -148,19 +147,13 @@
         (%make-simd-pack-single (x y z w))
         (%make-simd-pack-double (low high))
         (%make-simd-pack-ub64 (low high))
-        (%simd-pack-tag)
-        (%simd-pack-low)
-        (%simd-pack-high))
+        (%simd-pack-tag))
   #+sb-simd-pack-256
   (def* (%make-simd-pack-256 (tag p0 p1 p2 p3))
         (%make-simd-pack-256-single (a b c d e f g h))
         (%make-simd-pack-256-double (a b c d))
         (%make-simd-pack-256-ub64 (a b c d))
-        (%simd-pack-256-tag)
-        (%simd-pack-256-0)
-        (%simd-pack-256-1)
-        (%simd-pack-256-2)
-        (%simd-pack-256-3))
+        (%simd-pack-256-tag))
   #+sb-thread (def sb-vm::current-thread-offset-sap)
   (def current-sp ())
   (def current-fp ())
@@ -169,7 +162,10 @@
   (def symbol-hash)
   (def sb-vm::symbol-extra)
   #+sb-thread (def symbol-tls-index)
-  #.(if (fboundp 'symbol-info-vector) (values) '(def symbol-info-vector))
+  (def symbol-%info) ; primitive reader always needs a stub
+  ;; but the "wrapped" reader might not need a stub.
+  ;; If it's already a proper function, then it doesn't.
+  #.(if (fboundp 'symbol-dbinfo) (values) '(def symbol-dbinfo))
   #-(or x86 x86-64) (def lra-code-header)
   (def %make-lisp-obj)
   (def get-lisp-obj-address)
@@ -177,6 +173,24 @@
   (def single-float-copysign (float float2))
   #+x86-64
   (def single-float-sign))
+
+#+sb-simd-pack
+(macrolet ((def (name)
+             `(defun ,name (pack)
+                (sb-vm::simd-pack-dispatch pack
+                  (,name pack)))))
+  (def %simd-pack-low)
+  (def %simd-pack-high))
+
+#+sb-simd-pack-256
+(macrolet ((def (name)
+             `(defun ,name (pack)
+                (sb-vm::simd-pack-256-dispatch pack
+                  (,name pack)))))
+  (def %simd-pack-256-0)
+  (def %simd-pack-256-1)
+  (def %simd-pack-256-2)
+  (def %simd-pack-256-3))
 
 (defun spin-loop-hint ()
   "Hints the processor that the current thread is spin-looping."

@@ -93,7 +93,6 @@ lispobj* search_for_symbol(char *name, lispobj start, lispobj end, boolean ignor
 {
     lispobj* where = (lispobj*)start;
     lispobj* limit = (lispobj*)end;
-    struct symbol *symbol;
     lispobj namelen = make_fixnum(strlen(name));
 
 #ifdef LISP_FEATURE_GENCGC
@@ -108,17 +107,16 @@ lispobj* search_for_symbol(char *name, lispobj start, lispobj end, boolean ignor
 #endif
     while (where < limit) {
         lispobj word = *where;
+        struct vector *string;
         if (header_widetag(word) == SYMBOL_WIDETAG &&
-            lowtag_of((symbol = (struct symbol *)where)->name) == OTHER_POINTER_LOWTAG) {
-            struct vector *symbol_name = VECTOR(symbol->name);
-            if (gc_managed_addr_p((lispobj)symbol_name) &&
-                ((widetag_of(&symbol_name->header) == SIMPLE_BASE_STRING_WIDETAG
-                  && symbol_name->length_ == namelen // KLUDGE: abstraction leakage, but ok
-                  && !(ignore_case ? strcasecmp : strcmp)((char *)symbol_name->data, name))
+            (string = symbol_name((struct symbol*)where)) != 0 &&
+            string->length_ == namelen) {
+            if (gc_managed_addr_p((lispobj)string) &&
+                ((widetag_of(&string->header) == SIMPLE_BASE_STRING_WIDETAG
+                  && !(ignore_case ? strcasecmp : strcmp)((char *)string->data, name))
 #ifdef LISP_FEATURE_SB_UNICODE
-                 || (widetag_of(&symbol_name->header) == SIMPLE_CHARACTER_STRING_WIDETAG
-                     && symbol_name->length_ == namelen
-                     && !strcmp_ucs4_ascii((uint32_t*)symbol_name->data,
+                 || (widetag_of(&string->header) == SIMPLE_CHARACTER_STRING_WIDETAG
+                     && !strcmp_ucs4_ascii((uint32_t*)string->data,
                                            (unsigned char*)name, ignore_case))
 #endif
                  ))
@@ -160,7 +158,7 @@ struct symbol* lisp_symbol_from_tls_index(lispobj tls_index)
 
 static boolean sym_stringeq(lispobj sym, const char *string, int len)
 {
-    struct vector* name = VECTOR(SYMBOL(sym)->name);
+    struct vector* name = symbol_name(SYMBOL(sym));
     return widetag_of(&name->header) == SIMPLE_BASE_STRING_WIDETAG
         && vector_len(name) == len
         && !memcmp(name->data, string, len);
@@ -196,45 +194,6 @@ static lispobj* search_package_symbols(lispobj package, char* symbol_name,
             index = (index + 1) % cells_length;
         } while (index != initial_index);
         table_selector = table_selector ^ 1;
-    }
-    return 0;
-}
-
-lispobj sb_kernel_package() {
-    return SYMBOL(FDEFN(SUB_GC_FDEFN)->name)->package;
-}
-
-lispobj find_package(char* package_name)
-{
-    // Use SB-KERNEL::SUB-GC to get a hold of the SB-KERNEL package,
-    // which contains the symbol *PACKAGE-NAMES*.
-    static unsigned int kernelpkg_hint;
-    lispobj* package_names = search_package_symbols(sb_kernel_package(),
-                                                    "*PACKAGE-NAMES*",
-                                                    &kernelpkg_hint);
-    if (!package_names)
-        return 0;
-    sword_t namelen = strlen(package_name);
-    struct instance* names = (struct instance*)
-        native_pointer(((struct symbol*)package_names)->value);
-    struct vector* cells = (struct vector*)
-        native_pointer(names->slots[INSTANCE_DATA_START]);
-#define LFHASH_KEY_OFFSET 3 /* KLUDGE */
-    int n = (vector_len(cells) - LFHASH_KEY_OFFSET) >> 1;
-    gc_assert(make_fixnum(n) == cells->data[0]);
-    int i;
-    // Search *PACKAGE-NAMES* for the package
-    for (i=0; i<n; ++i) {
-        lispobj element = cells->data[LFHASH_KEY_OFFSET+i];
-        if (is_lisp_pointer(element)) {
-            struct vector* string = (struct vector*)native_pointer(element);
-            if (widetag_of(&string->header) == SIMPLE_BASE_STRING_WIDETAG
-                && vector_len(string) == namelen
-                && !memcmp(string->data, package_name, namelen)) {
-                element = cells->data[LFHASH_KEY_OFFSET+n+i];
-                return listp(element) ? CONS(element)->car : element;
-            }
-        }
     }
     return 0;
 }

@@ -29,10 +29,6 @@
   (:results)
   (:generator 1
     (storew value object offset lowtag)))
-
-(define-vop (init-slot set-slot)
-  (:info name dx-p offset lowtag)
-  (:ignore name dx-p))
 
 ;;;; Symbol hacking VOPs:
 
@@ -63,14 +59,12 @@
 
 ;;; Like CHECKED-CELL-REF, only we are a predicate to see if the cell
 ;;; is bound.
-(define-vop (boundp-frob)
+(define-vop (boundp)
   (:args (object :scs (descriptor-reg)))
   (:conditional)
   (:info target not-p)
   (:policy :fast-safe)
-  (:temporary (:scs (descriptor-reg)) value))
-
-(define-vop (boundp boundp-frob)
+  (:temporary (:scs (descriptor-reg)) value)
   (:translate boundp)
   (:generator 9
     (loadw value object symbol-value-slot other-pointer-lowtag)
@@ -149,15 +143,12 @@
 (define-vop (fdefn-makunbound)
   (:policy :fast-safe)
   (:translate fdefn-makunbound)
-  (:args (fdefn :scs (descriptor-reg) :target result))
+  (:args (fdefn :scs (descriptor-reg)))
   (:temporary (:scs (non-descriptor-reg)) temp)
-  (:results (result :scs (descriptor-reg)))
   (:generator 38
     (storew null-tn fdefn fdefn-fun-slot other-pointer-lowtag)
     (inst li temp (make-fixup 'undefined-tramp :assembly-routine))
-    (storew temp fdefn fdefn-raw-addr-slot other-pointer-lowtag)
-    (move result fdefn)))
-
+    (storew temp fdefn fdefn-raw-addr-slot other-pointer-lowtag)))
 
 
 ;;;; Binding and Unbinding.
@@ -225,13 +216,13 @@
   (:variant closure-info-offset fun-pointer-lowtag)
   (:translate %closure-index-ref))
 
+(define-vop (%closure-index-set word-index-set)
+  (:variant closure-info-offset fun-pointer-lowtag)
+  (:translate %closure-index-set))
+
 (define-vop (funcallable-instance-info word-index-ref)
   (:variant funcallable-instance-info-offset fun-pointer-lowtag)
   (:translate %funcallable-instance-info))
-
-(define-vop (set-funcallable-instance-info word-index-set-nr)
-  (:variant funcallable-instance-info-offset fun-pointer-lowtag)
-  (:translate %set-funcallable-instance-info))
 
 (define-vop (closure-ref)
   (:args (object :scs (descriptor-reg)))
@@ -279,7 +270,7 @@
   (:variant instance-slots-offset instance-pointer-lowtag)
   (:arg-types * positive-fixnum))
 
-(define-vop (instance-index-set word-index-set-nr)
+(define-vop (instance-index-set word-index-set)
   (:policy :fast-safe)
   (:translate %instance-set)
   (:variant instance-slots-offset instance-pointer-lowtag)
@@ -292,12 +283,37 @@
   (:policy :fast-safe)
   (:variant 0 other-pointer-lowtag))
 
-(define-vop (code-header-set word-index-set)
+(define-vop (code-header-set)
   (:translate code-header-set)
   (:policy :fast-safe)
-  (:variant 0 other-pointer-lowtag))
-
-
+  (:args (object :scs (descriptor-reg))
+         (index :scs (any-reg))
+         (value :scs (any-reg descriptor-reg)))
+  (:arg-types * tagged-num *)
+  (:temporary (:scs (non-descriptor-reg)) temp card)
+  (:generator 10
+    ;; Load the card mask
+    (inst li temp (make-fixup "gc_card_table_mask" :foreign-dataref)) ; linkage entry
+    (inst ld temp temp) ; address of gc_card_table_mask
+    (inst ld temp temp) ; value of gc_card_table_mask
+    (pseudo-atomic ()
+      ;; Compute card mark index
+      (inst srl card object gencgc-card-shift)
+      (inst and card card temp)
+      ;; Load mark table base
+      (inst li temp (make-fixup "gc_card_mark" :foreign-dataref)) ; linkage entry
+      (inst ld temp temp) ; address of gc_card_mark
+      (inst ld temp temp) ; value of gc_card_mark
+      ;; Touch the card mark byte.
+      (inst stb zero-tn temp card)
+      ;; set 'written' flag in the code header
+      ;; If two threads get here at the same time, they'll write the same byte.
+      (let ((byte #+big-endian (- other-pointer-lowtag) #+little-endian (bug "Wat")))
+        (inst ldub temp object byte)
+        (inst or temp temp #x40)
+        (inst stb temp object byte))
+      (inst add temp index (- other-pointer-lowtag))
+      (inst st value object temp))))
 
 ;;;; raw instance slot accessors
 

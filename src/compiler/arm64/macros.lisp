@@ -207,15 +207,15 @@
         (progn
           ;; load-pair can't base off null-tn because the displacement
           ;; has to be a multiple of 8
-          (load-immediate-word flag-tn boxed-region)
+          (load-immediate-word flag-tn mixed-region)
           (inst ldp result-tn flag-tn (@ flag-tn 0)))
         #+sb-thread
-        (inst ldp tmp-tn flag-tn (@ thread-tn (* n-word-bytes thread-boxed-tlab-slot)))
+        (inst ldp tmp-tn flag-tn (@ thread-tn (* n-word-bytes thread-mixed-tlab-slot)))
         (inst add result-tn tmp-tn (add-sub-immediate size result-tn))
         (inst cmp result-tn flag-tn)
         (inst b :hi ALLOC)
-        #-sb-thread (inst str result-tn (@ null-tn (load-store-offset (- boxed-region nil-value))))
-        #+sb-thread (storew result-tn thread-tn thread-boxed-tlab-slot)
+        #-sb-thread (inst str result-tn (@ null-tn (load-store-offset (- mixed-region nil-value))))
+        #+sb-thread (storew result-tn thread-tn thread-mixed-tlab-slot)
 
         (emit-label BACK-FROM-ALLOC)
         (inst add result-tn tmp-tn lowtag)
@@ -243,15 +243,14 @@
               (stack-allocate-p stack-allocate-p)
               (lip lip))
     `(pseudo-atomic (,flag-tn :sync ,type-code
-                     :elide ,stack-allocate-p)
+                     :elide-if ,stack-allocate-p)
        (allocation nil (pad-data-block ,size) ,lowtag ,result-tn
                    :flag-tn ,flag-tn
                    :stack-allocate-p ,stack-allocate-p
                    :lip ,lip)
-       (when ,type-code
-         (load-immediate-word ,flag-tn (compute-object-header ,size ,type-code))
-         ,@(and store-type-code
-                `((storew ,flag-tn ,result-tn 0 ,lowtag))))
+       (load-immediate-word ,flag-tn (compute-object-header ,size ,type-code))
+       ,@(and store-type-code
+              `((storew ,flag-tn ,result-tn 0 ,lowtag)))
        ,@body)))
 
 ;;;; Error Code
@@ -311,13 +310,13 @@
                            other-pointer-lowtag)))))
 
 ;;; handy macro for making sequences look atomic
-(defmacro pseudo-atomic ((flag-tn &key elide (sync t)) &body forms)
+(defmacro pseudo-atomic ((flag-tn &key elide-if (sync t)) &body forms)
   (declare (ignorable sync))
   #+sb-safepoint
   `(progn ,@forms (emit-safepoint))
   #-sb-safepoint
   `(progn
-     (unless ,elide
+     (unless ,elide-if
        (without-scheduling ()
          #-sb-thread
          (store-symbol-value csp-tn *pseudo-atomic-atomic*)
@@ -327,7 +326,7 @@
                   (* n-word-bytes thread-pseudo-atomic-bits-slot)))))
      (assemble ()
        ,@forms)
-     (unless ,elide
+     (unless ,elide-if
        (without-scheduling ()
          #-sb-thread
          (progn
@@ -380,14 +379,10 @@
      (:policy :fast-safe)
      (:args (object :scs (descriptor-reg))
             (index :scs (any-reg immediate))
-            (value :scs ,scs
-                   :load-if (not (and (sc-is value immediate)
-                                      (eql (tn-value value) 0)))))
+            (value :scs (,@scs zero)))
      (:arg-types ,type tagged-num ,el-type)
      (:temporary (:scs (interior-reg)) lip)
      (:generator 2
-       (when (sc-is value immediate)
-         (setf value zr-tn))
        (sc-case index
          (immediate
           (inst str value (@ object (load-store-offset

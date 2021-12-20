@@ -30,10 +30,6 @@
   (:results)
   (:generator 1
     (storew value object offset lowtag)))
-
-(define-vop (init-slot set-slot)
-  (:info name dx-p offset lowtag)
-  (:ignore name dx-p))
 
 ;;;; Symbol hacking VOPs:
 
@@ -65,14 +61,12 @@
       (inst b :eq err-lab))))
 
 ;;; Like CHECKED-CELL-REF, only we are a predicate to see if the cell is bound.
-(define-vop (boundp-frob)
+(define-vop (boundp)
   (:args (object :scs (descriptor-reg)))
   (:conditional)
   (:info target not-p)
   (:policy :fast-safe)
-  (:temporary (:scs (descriptor-reg)) value))
-
-(define-vop (boundp boundp-frob)
+  (:temporary (:scs (descriptor-reg)) value)
   (:translate boundp)
   (:generator 9
     (loadw value object symbol-value-slot other-pointer-lowtag)
@@ -150,10 +144,9 @@
 (define-vop (fdefn-makunbound)
   (:policy :fast-safe)
   (:translate fdefn-makunbound)
-  (:args (fdefn :scs (descriptor-reg) :target result))
+  (:args (fdefn :scs (descriptor-reg)))
   (:temporary (:scs (non-descriptor-reg)) temp)
   (:temporary (:scs (interior-reg)) lip)
-  (:results (result :scs (descriptor-reg)))
   (:generator 38
     (let ((undefined-tramp-fixup (gen-label)))
       (assemble (:elsewhere)
@@ -161,9 +154,7 @@
         (inst word (make-fixup 'undefined-tramp :assembly-routine)))
       (storew null-tn fdefn fdefn-fun-slot other-pointer-lowtag)
       (inst load-from-label temp lip undefined-tramp-fixup)
-      (storew temp fdefn fdefn-raw-addr-slot other-pointer-lowtag)
-      (move result fdefn))))
-
+      (storew temp fdefn fdefn-raw-addr-slot other-pointer-lowtag))))
 
 
 ;;;; Binding and Unbinding.
@@ -234,9 +225,9 @@
   closure-info-offset fun-pointer-lowtag
   (descriptor-reg any-reg) * %closure-index-ref)
 
-(define-full-setter set-funcallable-instance-info *
-  funcallable-instance-info-offset fun-pointer-lowtag
-  (descriptor-reg any-reg null) * %set-funcallable-instance-info)
+(define-full-setter %closure-index-set *
+  closure-info-offset fun-pointer-lowtag
+  (descriptor-reg any-reg null) * %closure-index-set)
 
 (define-full-reffer funcallable-instance-info *
   funcallable-instance-info-offset fun-pointer-lowtag
@@ -293,8 +284,46 @@
 (define-full-reffer code-header-ref * 0 other-pointer-lowtag
   (descriptor-reg any-reg) * code-header-ref)
 
-(define-full-setter code-header-set * 0 other-pointer-lowtag
-  (descriptor-reg any-reg null) * code-header-set)
+(define-vop (code-header-set)
+  (:translate code-header-set)
+  (:policy :fast-safe)
+  (:args (object :scs (descriptor-reg))
+         (index :scs (any-reg))
+         (value :scs (any-reg descriptor-reg)))
+  (:arg-types * tagged-num *)
+  (:temporary (:scs (non-descriptor-reg)) temp card)
+  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:sc non-descriptor-reg) pa-flag)
+  (:generator 10
+    (let ((mask-fixup-label (gen-label))
+          (table-fixup-label (gen-label)))
+      (inst load-from-label temp lip mask-fixup-label)
+      (inst ldr temp (@ temp))
+      (inst ldr temp (@ temp))
+      (pseudo-atomic (pa-flag)
+        ;; Compute card mark index
+        (inst mov card (lsr object gencgc-card-shift))
+        (inst and card card temp)
+        ;; Load mark table base
+        (inst load-from-label temp lip table-fixup-label)
+        (inst ldr temp (@ temp))
+        (inst ldr temp (@ temp))
+        ;; Touch the card mark byte.
+        (inst mov lip 0)
+        (inst strb lip (@ temp card))
+        ;; set 'written' flag in the code header
+        ;; If two threads get here at the same time, they'll write the same byte.
+        (let ((byte (- #+little-endian 3 other-pointer-lowtag)))
+          (inst ldrb temp (@ object byte))
+          (inst orr temp temp #x40)
+          (inst strb temp (@ object byte)))
+        (inst sub temp index other-pointer-lowtag)
+        (inst str value (@ object temp)))
+      (assemble (:elsewhere)
+        (emit-label mask-fixup-label)
+        (inst word (make-fixup "gc_card_table_mask" :foreign-dataref))
+        (emit-label table-fixup-label)
+        (inst word (make-fixup "gc_card_mark" :foreign-dataref))))))
 
 ;;;; raw instance slot accessors
 

@@ -12,75 +12,90 @@
 (in-package "SB-VM")
 
 (defun load-immediate-word (y val)
-  (cond ((typep val '(unsigned-byte 16))
-         (inst movz y val))
-        ((typep val '(and (signed-byte 16) (integer * -1)))
-         (inst movn y (lognot val)))
-        ((typep (ldb (byte 64 0) (lognot val)) '(unsigned-byte 16))
-         (inst movn y (ldb (byte 64 0) (lognot val))))
-        ((encode-logical-immediate val)
-         (inst orr y zr-tn val))
-        ((let ((descriptorp (memq (tn-offset y) descriptor-regs)))
-           (flet ((try (i part fill)
-                    (let ((filled (dpb fill (byte 16 i) val)))
-                      (cond ((and (encode-logical-immediate filled)
-                                  (not (and descriptorp
-                                            (logtest filled fixnum-tag-mask))))
-                             (inst orr y zr-tn filled)
-                             (inst movk y part i)
-                             t)))))
-             (loop for i below 64 by 16
+  (let (single-mov)
+    (flet ((single-mov ()
+             (setf single-mov
+                   (or (= (loop for i below 64 by 16
+                                for part = (ldb (byte 16 i) val)
+                                unless (= part #xFFFF)
+                                count t)
+                          1)
+                       (= (loop for i below 64 by 16
+                                for part = (ldb (byte 16 i) val)
+                                count (plusp part))
+                          1)))))
+      (cond ((typep val '(unsigned-byte 16))
+             (inst movz y val))
+            ((typep val '(and (signed-byte 16) (integer * -1)))
+             (inst movn y (lognot val)))
+            ((typep (ldb (byte 64 0) (lognot val)) '(unsigned-byte 16))
+             (inst movn y (ldb (byte 64 0) (lognot val))))
+            ((encode-logical-immediate val)
+             (inst orr y zr-tn val))
+            ((and
+              (not (single-mov))
+              (let ((descriptorp (memq (tn-offset y) descriptor-regs)))
+                (flet ((try (i part fill)
+                         (let ((filled (dpb fill (byte 16 i) val)))
+                           (cond ((and (encode-logical-immediate filled)
+                                       (not (and descriptorp
+                                                 (logtest filled fixnum-tag-mask))))
+                                  (inst orr y zr-tn filled)
+                                  (inst movk y part i)
+                                  t)))))
+                  (loop for i below 64 by 16
+                        for part = (ldb (byte 16 i) val)
+                        thereis (or (try i part #xFFFF)
+                                    (try i part 0)
+                                    (try i part
+                                         (ldb (byte 16 (mod (+ i 16) 64))
+                                              val))))))))
+            ((and (not single-mov)
+                  (let ((a (ldb (byte 16 0) val))
+                        (b (ldb (byte 16 16) val))
+                        (c (ldb (byte 16 32) val))
+                        (d (ldb (byte 16 48) val)))
+                    (let ((descriptorp (memq (tn-offset y) descriptor-regs)))
+                      (flet ((try (part val1 hole1 val2 hole2)
+                               (let* ((whole (dpb part (byte 16 16) part))
+                                      (whole (dpb whole (byte 32 32) whole)))
+                                 (when (and (encode-logical-immediate whole)
+                                            (not (and descriptorp
+                                                      (logtest whole fixnum-tag-mask))))
+                                   (inst orr y zr-tn whole)
+                                   (inst movk y val1 hole1)
+                                   (inst movk y val2 hole2)
+                                   t))))
+                        (cond ((= a b)
+                               (try a c 32 d 48))
+                              ((= a c)
+                               (try a b 16 d 48))
+                              ((= a d)
+                               (try a b 16 c 32))
+                              ((= b c)
+                               (try b a 0 d 48))
+                              ((= b d)
+                               (try b a 0 c 32))
+                              ((= c d)
+                               (try c a 0 b 16))))))))
+            ((minusp val)
+             (loop with first = t
+                   for i below 64 by 16
                    for part = (ldb (byte 16 i) val)
-                   thereis (or (try i part #xFFFF)
-                               (try i part 0)
-                               (try i part
-                                    (ldb (byte 16 (mod (+ i 16) 64))
-                                         val)))))))
-        ((let ((a (ldb (byte 16 0) val))
-               (b (ldb (byte 16 16) val))
-               (c (ldb (byte 16 32) val))
-               (d (ldb (byte 16 48) val)))
-           (let ((descriptorp (memq (tn-offset y) descriptor-regs)))
-             (flet ((try (part val1 hole1 val2 hole2)
-                      (let* ((whole (dpb part (byte 16 16) part))
-                             (whole (dpb whole (byte 32 32) whole)))
-                        (when (and (encode-logical-immediate whole)
-                                   (not (and descriptorp
-                                             (logtest whole fixnum-tag-mask))))
-                          (inst orr y zr-tn whole)
-                          (inst movk y val1 hole1)
-                          (inst movk y val2 hole2)
-                          t))))
-               (cond ((= a b)
-                      (try a c 32 d 48))
-                     ((= a c)
-                      (try a b 16 d 48))
-                     ((= a d)
-                      (try a b 16 c 32))
-                     ((= b c)
-                      (try b a 0 d 48))
-                     ((= b d)
-                      (try b a 0 c 32))
-                     ((= c d)
-                      (try c a 0 b 16)))))))
-        ((minusp val)
-         (loop with first = t
-               for i below 64 by 16
-               for part = (ldb (byte 16 i) val)
-               unless (= part #xFFFF)
-               do
-               (if (shiftf first nil)
-                   (inst movn y (ldb (byte 16 0) (lognot part)) i)
-                   (inst movk y part i))))
-        (t
-         (loop with first = t
-               for i below 64 by 16
-               for part = (ldb (byte 16 i) val)
-               when (plusp part)
-               do
-               (if (shiftf first nil)
-                   (inst movz y part i)
-                   (inst movk y part i)))))
+                   unless (= part #xFFFF)
+                   do
+                   (if (shiftf first nil)
+                       (inst movn y (ldb (byte 16 0) (lognot part)) i)
+                       (inst movk y part i))))
+            (t
+             (loop with first = t
+                   for i below 64 by 16
+                   for part = (ldb (byte 16 i) val)
+                   when (plusp part)
+                   do
+                   (if (shiftf first nil)
+                       (inst movz y part i)
+                       (inst movk y part i)))))))
   y)
 
 (defun add-sub-immediate (x &optional (temp tmp-tn))
@@ -157,6 +172,7 @@
             :scs (any-reg descriptor-reg)
             :load-if (not (or (location= x y)
                               (and (sc-is x immediate)
+                                   (sc-is y control-stack)
                                    (eql (tn-value x) 0))))))
   (:results (y :scs (any-reg descriptor-reg control-stack)
                :load-if (not (location= x y))))
@@ -179,7 +195,10 @@
 ;;; frame for argument or known value passing.
 (define-vop (move-arg)
   (:args (x :target y
-            :scs (any-reg descriptor-reg))
+            :scs (any-reg descriptor-reg)
+            :load-if (not (and (sc-is x immediate)
+                               (sc-is y control-stack)
+                               (eql (tn-value x) 0))))
          (fp :scs (any-reg)
              :load-if (not (sc-is y any-reg descriptor-reg))))
   (:results (y))
@@ -188,7 +207,11 @@
       ((any-reg descriptor-reg)
        (move y x))
       (control-stack
-       (store-stack-offset x fp y)))))
+       (store-stack-offset (if (and (sc-is x immediate)
+                                    (eql (tn-value x) 0))
+                               zr-tn
+                               x)
+                           fp y)))))
 ;;;
 (define-move-vop move-arg :move-arg
   (any-reg descriptor-reg)
@@ -205,11 +228,11 @@
                (and (tn-p tn)
                     (sc-is tn control-stack)))
              (source (vop)
-               (tn-ref-tn (sb-c::vop-args  vop)))
+               (tn-ref-tn (vop-args  vop)))
              (dest (vop)
-               (tn-ref-tn (sb-c::vop-results vop)))
+               (tn-ref-tn (vop-results vop)))
              (load-tn (vop)
-               (tn-ref-load-tn (sb-c::vop-args vop)))
+               (tn-ref-load-tn (vop-args vop)))
              (suitable-offsets-p (tn1 tn2)
                (and (= (abs (- (tn-offset tn1)
                                (tn-offset tn2)))
@@ -317,8 +340,8 @@
                            '(load-stack store-stack)))
                 (do-moves (source vop1) (source vop2) (dest vop1) (dest vop2)))))
         (move-arg
-         (let ((fp1 (tn-ref-tn (tn-ref-across (sb-c::vop-args vop1))))
-               (fp2 (tn-ref-tn (tn-ref-across (sb-c::vop-args vop2))))
+         (let ((fp1 (tn-ref-tn (tn-ref-across (vop-args vop1))))
+               (fp2 (tn-ref-tn (tn-ref-across (vop-args vop2))))
                (dest1 (dest vop1))
                (dest2 (dest vop2)))
            (when (eq fp1 fp2)
@@ -327,7 +350,7 @@
                         (stack-p dest2))
                    fp1
                    cfp-tn)
-               (tn-ref-load-tn (tn-ref-across (sb-c::vop-args vop1)))))))))))
+               (tn-ref-load-tn (tn-ref-across (vop-args vop1)))))))))))
 
 
 ;;;; ILLEGAL-MOVE

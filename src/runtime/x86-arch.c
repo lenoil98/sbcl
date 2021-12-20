@@ -27,6 +27,7 @@
 #include "forwarding-ptr.h"
 #include "var-io.h"
 #include "code.h"
+#include "unaligned.h"
 
 #include "genesis/static-symbols.h"
 #include "genesis/symbol.h"
@@ -385,7 +386,8 @@ gencgc_apply_code_fixups(struct code *old_code, struct code *new_code)
 void
 arch_write_linkage_table_entry(int index, void *target_addr, int datap)
 {
-    char *reloc_addr = (char*)LINKAGE_TABLE_SPACE_START + index * LINKAGE_TABLE_ENTRY_SIZE;
+    // 'volatile' works around a spurious GCC warning
+    volatile char *reloc_addr = (char*)LINKAGE_TABLE_SPACE_START + index * LINKAGE_TABLE_ENTRY_SIZE;
     if (datap) {
         *(unsigned long *)reloc_addr = (unsigned long)target_addr;
         return;
@@ -405,3 +407,5 @@ arch_write_linkage_table_entry(int index, void *target_addr, int datap)
     /* write a nop for good measure. */
     *reloc_addr = 0x90;
 }
+
+#include "x86-arch-shared.inc"

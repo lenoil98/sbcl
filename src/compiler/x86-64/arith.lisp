@@ -27,6 +27,7 @@
 (define-vop (fixnum-unop fast-safe-arith-op)
   (:args (x :scs (any-reg control-stack) :target res :load-if nil))
   (:results (res :scs (any-reg control-stack) :load-if nil))
+  (:temporary (:sc unsigned-reg) temp)
   (:note "inline fixnum arithmetic")
   (:arg-types tagged-num)
   (:result-types tagged-num))
@@ -34,22 +35,23 @@
 (define-vop (signed-unop fast-safe-arith-op)
   (:args (x :scs (signed-reg signed-stack) :target res :load-if nil))
   (:results (res :scs (signed-reg signed-stack) :load-if nil))
+  (:temporary (:sc unsigned-reg) temp)
   (:note "inline (signed-byte 64) arithmetic")
   (:arg-types signed-num)
   (:result-types signed-num))
 
 ;;; logical or arithmetic negation
-(defun emit-inline-neg (op arg result vop &optional fixnump)
+(defun emit-inline-neg (op arg result temp vop &optional fixnump)
   (declare (ignore vop))
   ;; If ARG and RESULT are the same location, then the initial and final MOVEs
   ;; are both no-ops. If different locations and not both memory,
   ;; then the initial move is a physical move and the final is a no-op.
-  ;; If both are stack locations, then compute the answer in temp-reg-tn.
+  ;; If both are stack locations, then compute the answer in temp.
   ;; (REG might be a stack location, not necessarily a GPR in this emitter.
   ;; It's just a naming convention that is consistent with other emitters)
   (let ((reg (if (or (alias-p arg result) (gpr-tn-p arg) (gpr-tn-p result))
                  result
-                 temp-reg-tn)))
+                 temp)))
     (move reg arg)
     (case op
       (not (if fixnump (inst xor reg (fixnumize -1)) (inst not reg)))
@@ -59,36 +61,36 @@
 (define-vop (fast-negate/fixnum fixnum-unop)
   (:translate %negate)
   (:vop-var vop)
-  (:generator 1 (emit-inline-neg 'neg x res vop)))
+  (:generator 1 (emit-inline-neg 'neg x res temp vop)))
 
 (define-vop (fast-negate/signed signed-unop)
   (:translate %negate)
   (:vop-var vop)
-  (:generator 2 (emit-inline-neg 'neg x res vop)))
+  (:generator 2 (emit-inline-neg 'neg x res temp vop)))
 
 (define-vop (fast-negate/unsigned signed-unop)
   (:args (x :scs (unsigned-reg unsigned-stack) :target res :load-if nil))
   (:arg-types unsigned-num)
   (:translate %negate)
   (:vop-var vop)
-  (:generator 3 (emit-inline-neg 'neg x res vop)))
+  (:generator 3 (emit-inline-neg 'neg x res temp vop)))
 
 (define-vop (fast-negate/signed-unsigned signed-unop)
   (:results (res :scs (unsigned-reg unsigned-stack) :load-if nil))
   (:result-types unsigned-num)
   (:translate %negate)
   (:vop-var vop)
-  (:generator 3 (emit-inline-neg 'neg x res vop)))
+  (:generator 3 (emit-inline-neg 'neg x res temp vop)))
 
 (define-vop (fast-lognot/fixnum fixnum-unop)
   (:translate lognot)
   (:vop-var vop)
-  (:generator 1 (emit-inline-neg 'not x res vop t)))
+  (:generator 1 (emit-inline-neg 'not x res temp vop t)))
 
 (define-vop (fast-lognot/signed signed-unop)
   (:translate lognot)
   (:vop-var vop)
-  (:generator 2 (emit-inline-neg 'not x res vop nil)))
+  (:generator 2 (emit-inline-neg 'not x res temp vop nil)))
 
 ;;;; binary fixnum operations
 
@@ -283,13 +285,13 @@
 
 (defun prepare-alu-operands (op x y vop const-tn-xform commutative)
   (declare (ignore op))
-  (let ((arg (sb-c::vop-args vop)))
+  (let ((arg (vop-args vop)))
     (when (tn-ref-load-tn arg)
       (bug "Shouldn't have a load TN for arg0"))
     (let ((arg (tn-ref-across arg)))
       (when (and arg (tn-ref-load-tn arg))
         (bug "Shouldn't have a load TN for arg1"))))
-  (let ((res (sb-c::vop-results vop)))
+  (let ((res (vop-results vop)))
     (when (tn-ref-load-tn res) (bug "Shouldn't have a load TN for result")))
   ;; Immediates won't be loaded since the :LOAD-IF expression is NIL.
   ;; Such value should always be placed into Y if the operation is +.
@@ -303,14 +305,14 @@
     (rotatef x y)) ; weird! why did IR1 not flip the args?
   (values x y))
 
-(defun emit-inline-smul (op x y result vop dummy taggedp) ; signed multiply
+(defun emit-inline-smul (op x y result temp vop dummy taggedp) ; signed multiply
   (declare (ignore op dummy))
   (multiple-value-setq (x y) (prepare-alu-operands 'mul x y vop 'identity t))
   (aver (not (integerp x)))
   (let ((constant-y (integerp y))) ; don't need to unscale Y if true
     (when (and constant-y (not (typep y '(signed-byte 32))))
       (setq y (register-inline-constant :qword y)))
-    (let ((reg (if (gpr-tn-p result) result temp-reg-tn)))
+    (let ((reg (if (gpr-tn-p result) result temp)))
       (cond ((integerp y)
              (inst imul reg x y))
             ((alias-p reg y)
@@ -336,7 +338,7 @@
 ;;; is going.
 ;;; Non-commutative operations (notably SUB) need a little extra care.
 ;;; MUL is also a bit different due to asymmetry of the instruction.
-(defun emit-inline-add-sub (op x y result vop const-tn-xform)
+(defun emit-inline-add-sub (op x y result temp vop const-tn-xform)
   (declare (type (member add sub) op))
   (multiple-value-setq (x y)
     (prepare-alu-operands op x y vop const-tn-xform (eq op 'add)))
@@ -359,8 +361,8 @@
                ;; At most one memory operand. Result could be memory or register.
                (inst* op x y))
               (t ; two memory operands: X is not a GPR, Y is neither GPR nor immm
-               (inst mov temp-reg-tn y)
-               (inst* op x temp-reg-tn)))
+               (inst mov temp y)
+               (inst* op x temp)))
         (return-from emit-inline-add-sub))
       (when (and (alias-p result y) commutative)
         ;; Result in the same location as Y can happen because we no longer specify
@@ -368,22 +370,22 @@
         (cond ((or (gpr-tn-p x) (gpr-tn-p y))
                (inst* op y x))
               (t
-               (inst mov temp-reg-tn x)
-               (inst* op y temp-reg-tn)))
+               (inst mov temp x)
+               (inst* op y temp)))
         (return-from emit-inline-add-sub))
       (let ((reg (if (and (gpr-tn-p result)
                           ;; If Y aliases RESULT in SUB, then an initial (move reg x)
                           ;; could clobber Y.
                           (or commutative (not (alias-p result y))))
                      result
-                     temp-reg-tn)))
+                     temp)))
         (cond ((and (eq op 'add) ; LEA can't do subtraction
                     (gpr-tn-p x) y-is-reg-or-imm32) ; register + (register | imm32)
                (inst lea reg (if (fixnump y) (ea y x) (ea x y))))
               (t
                ;; If commutative, then neither X nor Y is an alias of RESULT.
                ;; If non-commutative, then RESULT could be Y, in which case REG is
-               ;; TEMP-REG-TN so that we don't trash Y by moving X into it.
+               ;; TEMP so that we don't trash Y by moving X into it.
                (inst mov reg x)
                (inst* op reg y)))
         (move result reg))))
@@ -409,10 +411,11 @@
                   (:arg-types ,primtype ,primtype)
                   (:results (r :scs ,scs :load-if nil))
                   (:result-types ,primtype)
+                  (:temporary (:sc unsigned-reg) temp)
                   (:vop-var vop) ;; (:node-var node)
                   (:note ,note)
                   (:generator ,(1+ cost)
-                   (,emit ',op x y r vop ',val-xform ,@extra)))
+                   (,emit ',op x y r temp vop ',val-xform ,@extra)))
                 (define-vop (,name/c fast-safe-arith-op)
                   (:translate ,fun-name)
                   (:args (x :scs ,scs :target r :load-if nil))
@@ -420,10 +423,11 @@
                   (:arg-types ,primtype (:constant ,type))
                   (:results (r :scs ,scs :load-if nil))
                   (:result-types ,primtype)
+                  (:temporary (:sc unsigned-reg) temp)
                   (:vop-var vop) ;; (:node-var node)
                   (:note ,note)
                   (:generator ,cost
-                   (,emit ',op x (,val-xform y) r vop ',val-xform ,@extra))))))
+                   (,emit ',op x (,val-xform y) r temp vop ',val-xform ,@extra))))))
   (def + fast-+/fixnum=>fixnum fast-+-c/fixnum=>fixnum
        (any-reg control-stack) tagged-num fixnum 1 fixnumize)
   (def + fast-+/signed=>signed fast-+-c/signed=>signed
@@ -703,9 +707,10 @@
              `(multiple-value-bind (save result)
                   (if (or (location= number result) (gpr-tn-p number) (gpr-tn-p result))
                       (values nil result)
-                      (values result temp-reg-tn))
+                      (values result temp))
                 (move result number)
-                ,@body
+                (assemble ()
+                 ,@body)
                 (when save (inst mov save result)))))
 
 (define-vop (fast-ash-c/fixnum=>fixnum)
@@ -719,6 +724,7 @@
   (:note "inline ASH")
   (:variant nil)
   (:variant-vars modularp)
+  (:temporary (:sc unsigned-reg) temp)
   (:generator 2
     (cond ((= amount 0) (bug "shifting by 0"))
           ((>= amount 64) ; shifting left (zero fill)
@@ -751,23 +757,12 @@
   (:result-types tagged-num)
   (:policy :fast-safe)
   (:note "inline ASH")
+  (:temporary (:sc unsigned-reg) temp)
   (:generator 3
     (with-shift-operands
-     (move ecx amount)
-     ;; The result-type ensures us that this shift will not overflow.
-     (inst shl result :cl))))
-
-(define-vop (fast-ash-left/fixnum-unbounded=>fixnum
-             fast-ash-left/fixnum=>fixnum)
-  (:translate)
-  (:generator 3
-    (move result number)
-    (move ecx amount)
-    (inst cmp amount 63)
-    (inst jmp :be OKAY)
-    (zeroize result)
-    OKAY
-    (inst shl result :cl)))
+      (move ecx amount)
+      ;; The result-type ensures us that this shift will not overflow.
+      (inst shl result :cl))))
 
 (define-vop (fast-ash-c/signed=>signed)
   (:translate ash)
@@ -778,6 +773,7 @@
   (:results (result :scs (signed-reg signed-stack)))
   (:result-types signed-num)
   (:note "inline ASH")
+  (:temporary (:sc unsigned-reg) temp)
   (:generator 3
     (cond ((encodable-as-lea) (generate-lea))
           (t
@@ -794,15 +790,16 @@
   (:results (result :scs (unsigned-reg unsigned-stack)))
   (:result-types unsigned-num)
   (:note "inline ASH")
+  (:temporary (:sc unsigned-reg) temp)
   (:generator 3
     (cond ((= amount 0) (bug "shifting by 0"))
           ((not (< -64 amount 64)) (zeroize result))
           ((encodable-as-lea) (generate-lea))
           (t
            (with-shift-operands
-                  (if (plusp amount)
-                      (inst shl result amount)
-                      (inst shr result (- amount))))))))
+             (if (plusp amount)
+                 (inst shl result amount)
+                 (inst shr result (- amount))))))))
 
 (define-vop (fast-ash-left/signed=>signed)
   (:translate ash)
@@ -814,10 +811,11 @@
   (:result-types signed-num)
   (:policy :fast-safe)
   (:note "inline ASH")
+  (:temporary (:sc unsigned-reg) temp)
   (:generator 4
     (with-shift-operands
-     (move ecx amount)
-     (inst shl result :cl))))
+      (move ecx amount)
+      (inst shl result :cl))))
 
 (define-vop (fast-ash-left/unsigned=>unsigned)
   (:translate ash)
@@ -829,81 +827,88 @@
   (:result-types unsigned-num)
   (:policy :fast-safe)
   (:note "inline ASH")
+  (:temporary (:sc unsigned-reg) temp)
   (:generator 4
     (with-shift-operands
-     (move ecx amount)
-     (inst shl result :cl))))
-
-(define-vop (fast-ash-left/unsigned-unbounded=>unsigned
-             fast-ash-left/unsigned=>unsigned)
-  (:translate)
+      (move ecx amount)
+      (inst shl result :cl))))
+(define-vop (fast-ash-left/fixnum-modfx=>fixnum
+             fast-ash-left/fixnum=>fixnum)
+  (:translate ash-left-modfx)
+  (:args-var args)
   (:generator 3
-    (move result number)
-    (move ecx amount)
-    (inst cmp amount 63)
-    (inst jmp :be OKAY)
-    (zeroize result)
-    OKAY
-    (inst shl result :cl)))
+    (with-shift-operands
+      (move ecx amount)
+      (unless (csubtypep (tn-ref-type (tn-ref-across args)) ;; amount
+                         (specifier-type '(mod 63)))
+        (inst cmp amount 63)
+        (inst jmp :be OKAY)
+        (zeroize result))
+      OKAY
+      (inst shl result :cl))))
 
-(define-vop (fast-ash/signed=>signed)
-  (:translate ash)
-  (:policy :fast-safe)
-  (:args (number :scs (signed-reg) :target result)
-         (amount :scs (signed-reg) :target ecx))
-  (:arg-types signed-num signed-num)
-  (:results (result :scs (signed-reg) :from (:argument 0)))
-  (:result-types signed-num)
-  (:temporary (:sc signed-reg :offset rcx-offset :from (:argument 1)) ecx)
-  (:note "inline ASH")
-  (:generator 5
-    (move result number)
-    (move ecx amount)
-    (inst test ecx ecx)
-    (inst jmp :ns POSITIVE)
-    (inst neg ecx)
-    (inst cmp ecx 63)
-    (inst jmp :be OKAY)
-    (inst mov ecx 63)
-    OKAY
-    (inst sar result :cl)
-    (inst jmp DONE)
+(define-vop (fast-ash-left-mod64-c/unsigned=>unsigned
+             fast-ash-c/unsigned=>unsigned)
+  (:translate ash-left-mod64))
 
-    POSITIVE
-    ;; The result-type ensures us that this shift will not overflow.
-    (inst shl result :cl)
+(define-vop (fast-ash-left-modfx-c/fixnum=>fixnum
+             fast-ash-c/fixnum=>fixnum)
+  (:variant :modular)
+  (:translate ash-left-modfx))
 
-    DONE))
+(define-vop (fast-ash-left/unsigned-mod64=>unsigned
+             fast-ash-left/unsigned=>unsigned)
+  (:translate ash-left-mod64)
+  (:args-var args)
+  (:generator 3
+    (with-shift-operands
+      (move ecx amount)
+      (unless (csubtypep (tn-ref-type (tn-ref-across args)) ;; amount
+                         (specifier-type '(mod 63)))
+        (inst cmp amount 63)
+        (inst jmp :be OKAY)
+        (zeroize result))
+      OKAY
+      (inst shl result :cl))))
 
-(define-vop (fast-ash/unsigned=>unsigned)
-  (:translate ash)
-  (:policy :fast-safe)
-  (:args (number :scs (unsigned-reg) :target result)
-         (amount :scs (signed-reg) :target ecx))
-  (:arg-types unsigned-num signed-num)
-  (:results (result :scs (unsigned-reg) :from (:argument 0)))
-  (:result-types unsigned-num)
-  (:temporary (:sc signed-reg :offset rcx-offset :from (:argument 1)) ecx)
-  (:note "inline ASH")
-  (:generator 5
-    (move result number)
-    (move ecx amount)
-    (inst test ecx ecx)
-    (inst jmp :ns POSITIVE)
-    (inst neg ecx)
-    (inst cmp ecx 63)
-    (inst jmp :be OKAY)
-    (zeroize result)
-    (inst jmp DONE)
-    OKAY
-    (inst shr result :cl)
-    (inst jmp DONE)
+(define-vop (fast-ash-left/fixnum-modfx=>fixnum
+             fast-ash-left/fixnum=>fixnum)
+  (:translate ash-left-modfx)
+  (:args-var args)
+  (:generator 3
+    (with-shift-operands
+      (move ecx amount)
+      (unless (csubtypep (tn-ref-type (tn-ref-across args)) ;; amount
+                         (specifier-type '(mod 63)))
+        (inst cmp amount 63)
+        (inst jmp :be OKAY)
+        (zeroize result))
+      OKAY
+      (inst shl result :cl))))
 
-    POSITIVE
-    ;; The result-type ensures us that this shift will not overflow.
-    (inst shl result :cl)
+(define-vop (fast-ash-left-mod64-c/unsigned=>unsigned
+             fast-ash-c/unsigned=>unsigned)
+  (:translate ash-left-mod64))
 
-    DONE))
+(define-vop (fast-ash-left-modfx-c/fixnum=>fixnum
+             fast-ash-c/fixnum=>fixnum)
+  (:variant :modular)
+  (:translate ash-left-modfx))
+
+(define-vop (fast-ash-left/unsigned-mod64=>unsigned
+             fast-ash-left/unsigned=>unsigned)
+  (:translate ash-left-mod64)
+  (:args-var args)
+  (:generator 3
+    (with-shift-operands
+      (move ecx amount)
+      (unless (csubtypep (tn-ref-type (tn-ref-across args)) ;; amount
+                         (specifier-type '(mod 63)))
+        (inst cmp amount 63)
+        (inst jmp :be OKAY)
+        (zeroize result))
+      OKAY
+      (inst shl result :cl))))
 
 (define-vop (fast-%ash/right/unsigned)
   (:translate %ash/right)
@@ -914,10 +919,11 @@
   (:results (result :scs (unsigned-reg unsigned-stack) :from (:argument 0)))
   (:result-types unsigned-num)
   (:temporary (:sc signed-reg :offset rcx-offset :from (:argument 1)) rcx)
+  (:temporary (:sc unsigned-reg) temp)
   (:generator 4
     (with-shift-operands
-     (move rcx amount)
-     (inst shr result :cl))))
+      (move rcx amount)
+      (inst shr result :cl))))
 
 (define-vop (fast-%ash/right/signed)
   (:translate %ash/right)
@@ -928,10 +934,11 @@
   (:results (result :scs (signed-reg signed-stack) :from (:argument 0)))
   (:result-types signed-num)
   (:temporary (:sc signed-reg :offset rcx-offset :from (:argument 1)) rcx)
+  (:temporary (:sc unsigned-reg) temp)
   (:generator 4
     (with-shift-operands
-     (move rcx amount)
-     (inst sar result :cl))))
+      (move rcx amount)
+      (inst sar result :cl))))
 
 (define-vop (fast-%ash/right/fixnum)
   (:translate %ash/right)
@@ -942,12 +949,128 @@
   (:results (result :scs (any-reg control-stack) :from (:argument 0)))
   (:result-types tagged-num)
   (:temporary (:sc signed-reg :offset rcx-offset :from (:argument 1)) rcx)
+  (:temporary (:sc unsigned-reg) temp)
   (:generator 3
     (with-shift-operands
-     (move rcx amount)
-     (inst sar result :cl)
-     (inst and result (lognot fixnum-tag-mask)))))
+      (move rcx amount)
+      (inst sar result :cl)
+      (inst and result (lognot fixnum-tag-mask)))))
 ) ; end MACROLET
+
+(define-vop (fast-ash/unsigned=>unsigned)
+  (:translate ash)
+  (:policy :fast-safe)
+  (:args (number :scs (unsigned-reg) :target result)
+         (amount :scs (signed-reg) :target ecx))
+  (:arg-types unsigned-num signed-num)
+  (:results (result :scs (unsigned-reg) :from (:argument 0)))
+  (:result-types unsigned-num)
+  (:temporary (:sc signed-reg :offset rcx-offset :from (:argument 1)) ecx)
+  (:args-var args)
+  (:variant-vars check-amount signed)
+  (:note "inline ASH")
+  (:generator 5
+    (move result number)
+    (move ecx amount)
+    (inst test ecx ecx)
+    (inst jmp :ns POSITIVE)
+    (inst neg ecx)
+    (unless (csubtypep (tn-ref-type (tn-ref-across args))
+                       (specifier-type `(integer -63 *)))
+      (inst cmp ecx 63)
+      (inst jmp :be OKAY)
+      (cond (signed
+             (inst or ecx 63))
+            (t
+             (zeroize result))))
+    OKAY
+    (if signed
+        (inst sar result :cl)
+        (inst shr result :cl))
+    (inst jmp DONE)
+
+    POSITIVE
+    (unless (or (not check-amount) ;; The result-type ensures us that this shift will not overflow.
+                (csubtypep (tn-ref-type (tn-ref-across args))
+                           (specifier-type `(integer * 63))))
+      (inst cmp ecx 63)
+      (inst jmp :be STILL-OKAY)
+      (zeroize result))
+    STILL-OKAY
+    (inst shl result :cl)
+
+    DONE))
+
+(define-vop (fast-ash/signed=>signed
+             fast-ash/unsigned=>unsigned)
+  (:args (number :scs (signed-reg) :target result)
+         (amount :scs (signed-reg) :target ecx))
+  (:arg-types signed-num signed-num)
+  (:results (result :scs (signed-reg) :from (:argument 0)))
+  (:result-types signed-num)
+  (:variant nil t))
+
+(define-vop (fast-ash-modfx/signed/unsigned=>fixnum)
+  (:translate ash-modfx)
+  (:policy :fast-safe)
+  (:args (number :scs (signed-reg unsigned-reg) :to :save)
+         (amount :scs (signed-reg) :target ecx))
+  (:arg-types (:or signed-num unsigned-num) signed-num)
+  (:results (result :scs (any-reg) :from (:argument 0)))
+  (:args-var args)
+  (:result-types tagged-num)
+  (:temporary (:sc signed-reg :offset rcx-offset :from (:argument 1)) ecx)
+  (:note "inline ASH")
+  (:generator 3
+    (move result number)
+    (move ecx amount)
+    (inst test ecx ecx)
+    (inst jmp :ns POSITIVE)
+    (inst neg ecx)
+    (unless (csubtypep (tn-ref-type (tn-ref-across args))
+                       (specifier-type `(integer -63 *)))
+      (inst cmp ecx 63)
+      (inst jmp :be OKAY)
+      (sc-case number
+        (signed-reg
+         (inst or ecx 63))
+        (unsigned-reg
+         (zeroize result))))
+    OKAY
+    (sc-case number
+      (signed-reg
+       (inst sar result :cl))
+      (unsigned-reg
+       (inst shr result :cl)))
+    (inst jmp DONE)
+
+    POSITIVE
+    (unless (csubtypep (tn-ref-type (tn-ref-across args))
+                       (specifier-type `(integer * 63)))
+      (inst cmp ecx 63)
+      (inst jmp :be STILL-OKAY)
+      (zeroize result))
+    STILL-OKAY
+    (inst shl result :cl)
+    DONE
+    (inst shl result n-fixnum-tag-bits)))
+
+(define-vop (fast-ash-modfx/signed=>signed
+             fast-ash/signed=>signed)
+  (:variant t t)
+  (:translate ash-modfx))
+
+(define-vop (fast-ash-mod64/unsigned=>unsigned
+             fast-ash/unsigned=>unsigned)
+  (:variant t nil)
+  (:translate ash-mod64))
+
+(define-vop (fast-ash-mod64/signed=>unsigned
+             fast-ash/signed=>signed)
+  (:results (result :scs (unsigned-reg)))
+  (:result-types unsigned-num)
+  (:variant t t)
+  (:translate ash-mod64))
 
 (in-package "SB-C")
 
@@ -1141,6 +1264,7 @@
 (define-vop (fast-conditional)
   (:conditional :e)
   (:info)
+  (:temporary (:sc unsigned-reg) temp)
   (:policy :fast-safe))
 
 (define-vop (fast-conditional/fixnum fast-conditional)
@@ -1176,10 +1300,10 @@
   (:arg-types unsigned-num (:constant (unsigned-byte 64)))
   (:info y))
 
-(defun ensure-not-mem+mem (x y)
+(defun ensure-not-mem+mem (x y temp)
   (cond ((sc-is x immediate)
-         (inst mov temp-reg-tn (tn-value x))
-         (ensure-not-mem+mem temp-reg-tn y))
+         (inst mov temp (tn-value x))
+         (ensure-not-mem+mem temp y nil))
         (t
          (when (and (tn-p y)
                     (sc-is y immediate))
@@ -1189,14 +1313,14 @@
                    (return-from ensure-not-mem+mem (values x it)))
                   ((typep y '(unsigned-byte 32))
                    ;; Rather than a RIP-relative constant, load a dword (w/o sign-extend)
-                   (inst mov :dword temp-reg-tn y)
-                   (return-from ensure-not-mem+mem (values x temp-reg-tn))))
+                   (inst mov :dword temp y)
+                   (return-from ensure-not-mem+mem (values x temp))))
            (setq y (register-inline-constant :qword y)))
          (cond ((or (gpr-tn-p x) (gpr-tn-p y))
                 (values x y))
                (t
-                (inst mov temp-reg-tn x)
-                (values temp-reg-tn y))))))
+                (inst mov temp x)
+                (values temp y))))))
 
 (defun immediate-operand-smallest-nbits (x)
   (declare (type word x))
@@ -1223,7 +1347,7 @@
 ;;; if doing so could affect whether the sign flag comes out the same.
 ;;; e.g. if EDX is #xff, "TEST EDX, #x80" indicates a non-negative result
 ;;; whereas "TEST DL, #x80" indicates a negative result.
-(defun emit-optimized-test-inst (x y sign-bit-matters)
+(defun emit-optimized-test-inst (x y temp sign-bit-matters)
   (let* ((bits (if (or (not (integerp y)) (minusp y))
                    64
                    (immediate-operand-smallest-nbits y)))
@@ -1239,8 +1363,8 @@
           (and (eq size :word) (not (logtest #xFF y)))))
     (cond ((not size)
            ;; Ensure that both operands are acceptable
-           ;; by possibly loading one into TEMP-REG-TN
-           (multiple-value-setq (x y) (ensure-not-mem+mem x y))
+           ;; by possibly loading one into TEMP
+           (multiple-value-setq (x y) (ensure-not-mem+mem x y temp))
            (inst test :qword x y))
           ((sc-is x control-stack unsigned-stack signed-stack)
            ;; Otherwise, when using an immediate operand smaller
@@ -1270,7 +1394,7 @@
                          (:generator ,cost
                           (emit-optimized-test-inst x
                            ,(if (eq suffix '-c/fixnum) `(fixnumize y) 'y)
-                           nil)))))))
+                           temp nil)))))))
   (define-logtest-vops))
 
 ;;; This works for tagged or untagged values, but the vop optimizer
@@ -1300,14 +1424,14 @@
        (cond ((integerp y)
               (inst test :qword val y))
              (t
-              (inst mov temp-reg-tn val)
-              (inst test :qword temp-reg-tn y)))))))
+              (inst mov temp val)
+              (inst test :qword temp y)))))))
 
 ;;; Try to absorb a memory load into LOGTEST.
 ;;; This removes one instruction and possibly shortens the TEST by eliding
 ;;; a REX prefix.
 (defoptimizer (sb-c::vop-optimize fast-logtest-c/fixnum) (vop)
-  (unless (tn-ref-memory-access (sb-c::vop-args vop))
+  (unless (tn-ref-memory-access (vop-args vop))
     (let ((prev (sb-c::previous-vop-is
                  ;; TODO: missing data-vector-ref/simple-vector-c
                  vop '(%raw-instance-ref/signed-word
@@ -1325,22 +1449,22 @@
                        ;; because VECTOR-LENGTH is not in a slot.
                        ;; Obviously a GENERATE-CODE bug is the mother of all bugs.
                        #-ubsan slot))))
-      (aver (not (sb-c::vop-results vop))) ; is a :CONDITIONAL vop
+      (aver (not (vop-results vop))) ; is a :CONDITIONAL vop
       (when (and prev (eq (vop-block prev) (vop-block vop)))
         ;; If the memory ref produces a fixnum, the constant should be a fixnum
         ;; so that we don't see cases such as in lp#1939897.
         ;; In the absence of vop combining, MOVE-TO-WORD would be inserted
         ;; between INSTANCE-INDEX-REF and LOGTEST, but it did not happen yet.
-        (let* ((arg (sb-c::vop-args vop))
+        (let* ((arg (vop-args vop))
                (info-arg (car (vop-codegen-info vop)))
                (constant (if (member (vop-name prev) '(instance-index-ref-c slot))
                              (ash info-arg n-fixnum-tag-bits)
                              info-arg)))
-          (when (and (eq (tn-ref-tn (sb-c::vop-results prev)) (tn-ref-tn arg))
+          (when (and (eq (tn-ref-tn (vop-results prev)) (tn-ref-tn arg))
                      (sb-c::very-temporary-p (tn-ref-tn arg))
                      (typep constant '(or word signed-word)))
             (binding* ((disp (valid-memref-byte-disp prev) :exit-if-null)
-                       (arg-ref (sb-c::reference-tn (tn-ref-tn (sb-c::vop-args prev)) nil))
+                       (arg-ref (sb-c:reference-tn (tn-ref-tn (vop-args prev)) nil))
                        (new (sb-c::emit-and-insert-vop
                              (sb-c::vop-node vop) (vop-block vop)
                              (template-or-lose 'logtest-memref)
@@ -1389,15 +1513,16 @@
          (int :scs (constant signed-reg signed-stack unsigned-reg unsigned-stack)
               :load-if nil))
   (:arg-types untagged-num untagged-num)
+  (:temporary (:sc unsigned-reg) temp)
   (:generator 4
     (when (sc-is int constant immediate) (setq int (tn-value int)))
     ;; Force INT to be a RIP-relative operand if it is a constant.
     (let ((word (if (integerp int) (register-inline-constant :qword int) int))
           (bit (cond ((sc-is bit signed-reg unsigned-reg) bit)
-                     (t (inst mov :dword temp-reg-tn bit)
+                     (t (inst mov :dword temp bit)
                         (when (sc-is bit any-reg control-stack)
-                          (inst shr :dword temp-reg-tn n-fixnum-tag-bits))
-                        temp-reg-tn))))
+                          (inst shr :dword temp n-fixnum-tag-bits))
+                        temp))))
       (inst bt word bit))))
 
 (defun change-tested-flag (vop from-flag to-flag)
@@ -1455,6 +1580,7 @@
   (:args-var arg-ref)
   (:vop-var vop)
   (:conditional :ne)
+  (:ignore temp)
   (:generator 1
     ;; This resembles the above case for TN being not in a GPR
     (binding* ((slot-disp (cdr (tn-ref-memory-access arg-ref)))
@@ -1462,16 +1588,16 @@
       (inst test :byte (ea (+ slot-disp extra-disp) x) (ash 1 bit-shift)))))
 
 (defoptimizer (sb-c::vop-optimize %logbitp/c) (vop)
-  (unless (tn-ref-memory-access (sb-c::vop-args vop))
+  (unless (tn-ref-memory-access (vop-args vop))
     (let ((prev (sb-c::previous-vop-is
                  ;; TODO: missing data-vector-ref/simple-vector-c and SLOT
                  vop '(%raw-instance-ref/signed-word
                        %raw-instance-ref/word
                        instance-index-ref-c))))
-      (aver (not (sb-c::vop-results vop))) ; is a :CONDITIONAL vop
+      (aver (not (vop-results vop))) ; is a :CONDITIONAL vop
       (when (and prev (eq (vop-block prev) (vop-block vop)))
-        (let ((arg (sb-c::vop-args vop)))
-          (when (and (eq (tn-ref-tn (sb-c::vop-results prev)) (tn-ref-tn arg))
+        (let ((arg (vop-args vop)))
+          (when (and (eq (tn-ref-tn (vop-results prev)) (tn-ref-tn arg))
                      (sb-c::very-temporary-p (tn-ref-tn arg))
                      (vop-next vop)
                      ;; Ensure we can change the tested flag from CF to ZF
@@ -1479,7 +1605,7 @@
                              '(branch-if compute-from-flags)))
             (binding* ((disp (valid-memref-byte-disp prev) :exit-if-null)
                        (arg-ref
-                        (sb-c::reference-tn (tn-ref-tn (sb-c::vop-args prev)) nil))
+                        (sb-c:reference-tn (tn-ref-tn (vop-args prev)) nil))
                        (bit (car (vop-codegen-info vop)))
                        (info
                         (if (sb-c::previous-vop-is vop 'instance-index-ref-c) ; tagged slot
@@ -1496,17 +1622,64 @@
               (sb-c::delete-vop vop)
               new)))))))
 
-(defun emit-optimized-cmp (x y)
-  (if (and (gpr-tn-p x) (eql y 0))
+;;; We can delete some MOVEs that seem often to get inserted with iteration constructs
+;;; such as (setq i (1+ i)) where the result of 1+ creates a new TN which is moved
+;;; to the same TN that is the input to 1+, but PACK chooses different physical registers
+;;; for the arg and result of FAST-+-C/FIXNUM=>FIXNUM. So we "cleverly" can use the LEA
+;;; instruction as a 3-operand ADD, only to move the destination of LEA back to the
+;;; same register that was one of the input operands. Yet the TN which was the result
+;;; had otherwise no use. Why does this happen? I don't know.
+;;;
+;;; So let's try to prevent it by removing the MOVE, which reduces to just the ADD
+;;; instruction instead of LEA + MOV. If a vop can only take one physical representation
+;;; (such as tagged fixnum) for input, and can only produce that same representation,
+;;; and the TN flows back to that vop, then the move is not needed. But if a vop can take
+;;; several physical representations, such as accepting either tagged or untagged,
+;;; and the SC has not been chosen yet (which happens), then we can't remove.
+;;;
+;;; For some reason, it seems to come up a trememdous amount with FAST-+-C/FIXNUM=>FIXNUM.
+;;; Maybe it comes up with others, I don't know. No harm in trying, I suppose.
+;;; To do this for other vops, you have to be certain that the move isn't a coercion.
+;;;
+;;; [And it would be nice if every backend named their vops consistently
+;;; so that this optimizer could be made architecture-independent]
+;;; The SB-C::DELETE- function isn't defined yet in the build order, so wrap it in a lambda.
+(flet ((optimizer (vop) (sb-c::delete-unnecessary-move vop)))
+  (dolist (name '(sb-vm::fast-+-c/fixnum=>fixnum
+                  sb-vm::fast-+-c/signed=>signed
+                  sb-vm::fast-+-c/unsigned=>unsigned
+                  sb-vm::fast---c/fixnum=>fixnum
+                  sb-vm::fast---c/signed=>signed
+                  sb-vm::fast---c/unsigned=>unsigned
+                  sb-vm::fast-*-c/fixnum=>fixnum
+                  sb-vm::fast-*-c/signed=>signed
+                  sb-vm::fast-*-c/unsigned=>unsigned))
+    (sb-c::set-vop-optimizer (template-or-lose name) #'optimizer)))
+
+(defun emit-optimized-cmp (x y temp &optional x-ctype)
+  ;; Shorten the encoding by eliding a REX prefix where the upper bits
+  ;; can not possibly matter.
+  ;; Be sure to account for N-FIXNUM-TAG-BITS in determining how many bits
+  ;; of precision are in the representation of X.
+  ;; Little-endian addressing makes this valid for stack TNs as well as registers.
+  (let ((operand-size (if (and (numeric-type-p x-ctype)
+                               (typep y '(signed-byte 32))
+                               (csubtypep x-ctype
+                                          (if (sc-is x any-reg descriptor-reg control-stack)
+                                              (specifier-type '(signed-byte 31))
+                                              (specifier-type '(signed-byte 32)))))
+                          :dword
+                          :qword)))
+    (if (and (gpr-tn-p x) (eql y 0))
       ;; Amazingly (to me), use of TEST in lieu of CMP produces all the correct
       ;; flag bits for inequality comparison as well as EQL comparison.
       ;; You'd think that the Jxx instruction should examine _only_ the S flag,
       ;; but in fact the other flags are right too. Nonetheless this is
       ;; quite confusing, and I would prefer that we alter the branch test
       ;; when emitting TEST in place of CMP.
-      (inst test x x) ; smaller instruction
-      (progn (multiple-value-setq (x y) (ensure-not-mem+mem x y))
-             (inst cmp x y))))
+        (inst test operand-size x x) ; smaller instruction
+        (progn (multiple-value-setq (x y) (ensure-not-mem+mem x y temp))
+               (inst cmp operand-size x y)))))
 
 (macrolet ((define-conditional-vop (tran cond unsigned not-cond not-unsigned)
              (declare (ignore not-cond not-unsigned))
@@ -1517,9 +1690,11 @@
                                    ,(symbolicate "FAST-CONDITIONAL"  suffix))
                         (:translate ,tran)
                         (:conditional ,(if signed cond unsigned))
+                        (:args-var x-tn-ref)
                         (:generator ,cost
                           (emit-optimized-cmp
-                           x ,(if (eq suffix '-c/fixnum) `(fixnumize y) 'y)))))
+                           x ,(if (eq suffix '-c/fixnum) `(fixnumize y) 'y)
+                           temp (tn-ref-type x-tn-ref)))))
                    '(/fixnum -c/fixnum /signed -c/signed /unsigned -c/unsigned)
                    '(4 3 6 5 6 5)
                    '(t t t t nil nil)))))
@@ -1529,8 +1704,8 @@
 
 (declaim (inline load-bignum-length))
 (defun load-bignum-length (input output)
-  (loadw output input 0 other-pointer-lowtag)
-  (inst shr output n-widetag-bits))
+  ;; Unaligned load
+  (inst mov :dword output (ea (- 1 other-pointer-lowtag) input)))
 
 (define-vop (fast-if->-zero)
   (:args (x :scs (descriptor-reg)))
@@ -1594,19 +1769,19 @@
 
 (define-vop (fast-if-eql/signed fast-conditional/signed)
   (:translate eql %eql/integer)
-  (:generator 6 (emit-optimized-cmp x y)))
+  (:generator 6 (emit-optimized-cmp x y temp)))
 
 (define-vop (fast-if-eql-c/signed fast-conditional-c/signed)
   (:translate eql %eql/integer)
-  (:generator 5 (emit-optimized-cmp x y)))
+  (:generator 5 (emit-optimized-cmp x y temp)))
 
 (define-vop (fast-if-eql/unsigned fast-conditional/unsigned)
   (:translate eql %eql/integer)
-  (:generator 6 (emit-optimized-cmp x y)))
+  (:generator 6 (emit-optimized-cmp x y temp)))
 
 (define-vop (fast-if-eql-c/unsigned fast-conditional-c/unsigned)
   (:translate eql %eql/integer)
-  (:generator 5 (emit-optimized-cmp x y)))
+  (:generator 5 (emit-optimized-cmp x y temp)))
 
 ;;; EQL/FIXNUM is funny because the first arg can be of any type, not just a
 ;;; known fixnum.
@@ -1623,7 +1798,7 @@
   (:arg-types tagged-num tagged-num)
   (:note "inline fixnum comparison")
   (:translate eql %eql/integer)
-  (:generator 4 (emit-optimized-cmp x y)))
+  (:generator 4 (emit-optimized-cmp x y temp)))
 
 (define-vop (generic-eql/fixnum fast-eql/fixnum)
   (:args (x :scs (any-reg descriptor-reg control-stack))
@@ -1638,7 +1813,8 @@
   (:conditional :e)
   (:policy :fast-safe)
   (:translate eql %eql/integer)
-  (:generator 2 (emit-optimized-cmp x (fixnumize y))))
+  (:args-var x-tn-ref)
+  (:generator 2 (emit-optimized-cmp x (fixnumize y) temp (tn-ref-type x-tn-ref))))
 
 ;;; FIXME: this seems never to be invoked any more. What did we either break or improve?
 (define-vop (generic-eql-c/fixnum fast-eql-c/fixnum)
@@ -1739,8 +1915,7 @@
                (declare (ignore vop64cf)) ; maybe someone will want it some day
                `(progn
                   (define-modular-fun ,fun64 (x y) ,name :untagged nil 64)
-                  (define-modular-fun ,funfx (x y) ,name :tagged t
-                                      #.(- n-word-bits n-fixnum-tag-bits))
+                  (define-modular-fun ,funfx (x y) ,name :tagged t #.n-fixnum-bits)
                   (define-mod-binop (,vop64u ,vopu) ,fun64)
                   ;; This seems a bit lame. Could we not just have one vop
                   ;; which which takes any combination of signed/unsigned reg
@@ -1766,40 +1941,9 @@
     (move r x)
     (inst neg r)))
 
-(define-modular-fun %negate-modfx (x) %negate :tagged t #.(- n-word-bits
-                                                             n-fixnum-tag-bits))
+(define-modular-fun %negate-modfx (x) %negate :tagged t #.n-fixnum-bits)
 (define-vop (%negate-modfx fast-negate/fixnum)
   (:translate %negate-modfx))
-
-(define-vop (fast-ash-left-mod64-c/unsigned=>unsigned
-             fast-ash-c/unsigned=>unsigned)
-  (:translate ash-left-mod64))
-(define-vop (fast-ash-left-mod64/unsigned=>unsigned
-             fast-ash-left/unsigned=>unsigned))
-(define-vop (fast-ash-left-mod64/unsigned-unbounded=>unsigned
-             fast-ash-left/unsigned-unbounded=>unsigned)
-  (:translate ash-left-mod64))
-(deftransform ash-left-mod64 ((integer count)
-                              ((unsigned-byte 64) (unsigned-byte 6)))
-  (when (sb-c::constant-lvar-p count)
-    (sb-c::give-up-ir1-transform))
-  '(%primitive fast-ash-left-mod64/unsigned=>unsigned integer count))
-
-(define-vop (fast-ash-left-modfx-c/fixnum=>fixnum
-             fast-ash-c/fixnum=>fixnum)
-  (:variant :modular)
-  (:translate ash-left-modfx))
-(define-vop (fast-ash-left-modfx/fixnum-unbounded=>fixnum
-             fast-ash-left/fixnum-unbounded=>fixnum)
-  (:translate ash-left-modfx))
-(define-vop (fast-ash-left-modfx/fixnum=>fixnum
-             fast-ash-left/fixnum=>fixnum))
-(deftransform ash-left-modfx ((integer count)
-                              (fixnum (unsigned-byte 6)))
-  (when (sb-c::constant-lvar-p count)
-    (sb-c::give-up-ir1-transform))
-  '(%primitive fast-ash-left-modfx/fixnum=>fixnum integer count))
-
 (in-package "SB-C")
 
 (defknown sb-vm::%lea-mod64 (integer integer (member 1 2 4 8) (signed-byte 64))
@@ -1817,7 +1961,7 @@
     (cut-to-width index :untagged width nil)
     'sb-vm::%lea-mod64))
 (define-modular-fun-optimizer %lea ((base index scale disp) :tagged t :width width)
-  (when (and (<= width (- sb-vm:n-word-bits sb-vm:n-fixnum-tag-bits))
+  (when (and (<= width sb-vm:n-fixnum-bits)
              (constant-lvar-p scale)
              (constant-lvar-p disp))
     (cut-to-width base :tagged width t)
@@ -1829,7 +1973,7 @@
   (defun sb-vm::%lea-mod64 (base index scale disp)
     (ldb (byte 64 0) (%lea base index scale disp)))
   (defun sb-vm::%lea-modfx (base index scale disp)
-    (mask-signed-field (- sb-vm:n-word-bits sb-vm:n-fixnum-tag-bits)
+    (mask-signed-field sb-vm:n-fixnum-bits
                        (%lea base index scale disp))))
 #-sb-xc-host
 (progn
@@ -1840,7 +1984,7 @@
       ;; constant SCALE and DISP.
       (ldb (byte 64 0) (+ base (* index scale) disp))))
   (defun sb-vm::%lea-modfx (base index scale disp)
-    (let* ((fixnum-width (- sb-vm:n-word-bits sb-vm:n-fixnum-tag-bits))
+    (let* ((fixnum-width sb-vm:n-fixnum-bits)
            (base (mask-signed-field fixnum-width base))
            (index (mask-signed-field fixnum-width index)))
       ;; can't use modular version of %LEA, as we only have VOPs for

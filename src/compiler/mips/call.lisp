@@ -39,7 +39,7 @@
 ;;; them at a known location.
 (defun make-old-fp-save-location (env)
   (specify-save-tn
-   (physenv-debug-live-tn (make-normal-tn *fixnum-primitive-type*) env)
+   (environment-debug-live-tn (make-normal-tn *fixnum-primitive-type*) env)
    (make-wired-tn *fixnum-primitive-type*
                   control-stack-arg-scn
                   ocfp-save-offset)))
@@ -47,7 +47,7 @@
 (defun make-return-pc-save-location (env)
   (let ((ptype *backend-t-primitive-type*))
     (specify-save-tn
-     (physenv-debug-live-tn (make-normal-tn ptype) env)
+     (environment-debug-live-tn (make-normal-tn ptype) env)
      (make-wired-tn ptype control-stack-arg-scn lra-save-offset))))
 
 ;;; Make a TN for the standard argument count passing location.  We only
@@ -148,7 +148,7 @@
     (move res csp-tn)
     (inst addu csp-tn csp-tn
           (* n-word-bytes (sb-allocated-size 'control-stack)))
-    (when (ir2-physenv-number-stack-p callee)
+    (when (ir2-environment-number-stack-p callee)
       (inst addu nsp-tn nsp-tn
             (- (bytes-needed-for-non-descriptor-stack-frame)))
       (move nfp nsp-tn))))
@@ -374,8 +374,7 @@ default-value-8
               values-start)
   (:temporary (:sc any-reg :offset nargs-offset
                :from :eval :to (:result 1))
-              nvals)
-  (:temporary (:scs (non-descriptor-reg)) temp))
+              nvals))
 
 
 ;;; This hook in the codegen pass lets us insert code before fall-thru entry
@@ -1127,6 +1126,23 @@ default-value-8
   (:generator 4
     (loadw value context index)))
 
+(define-vop (more-arg-or-nil)
+  (:policy :fast-safe)
+  (:args (object :scs (descriptor-reg) :to (:result 1))
+         (count :scs (any-reg) :to (:result 1)))
+  (:temporary (:scs (any-reg)) temp)
+  (:info index)
+  (:results (value :scs (descriptor-reg any-reg)))
+  (:result-types *)
+  (:generator 3
+    (cond ((zerop index)
+           (inst beq count done))
+          (t
+           (inst subu temp (fixnumize index) count)
+           (inst bgez temp done)))
+    (move value null-tn)
+    (loadw value object index)
+    done))
 
 ;;; Turn more arg (context, count) into a list.
 (define-vop ()

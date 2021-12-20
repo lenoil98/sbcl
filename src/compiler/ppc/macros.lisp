@@ -187,9 +187,9 @@
   #+gencgc
   (binding*  ((imm-size (typep size '(unsigned-byte 15)))
               ((region-base-tn field-offset)
-               #-sb-thread (values null-tn (- boxed-region nil-value))
+               #-sb-thread (values null-tn (- mixed-region nil-value))
                #+sb-thread (values thread-base-tn
-                                   (* thread-boxed-tlab-slot n-word-bytes))))
+                                   (* thread-mixed-tlab-slot n-word-bytes))))
 
     (unless imm-size ; Make temp-tn be the size
       (if (numberp size)
@@ -261,9 +261,8 @@
                      ,lowtag ,result-tn
                      :temp-tn ,temp-tn
                      :flag-tn ,flag-tn))
-       (when ,type-code
-         (inst lr ,temp-tn (compute-object-header ,size ,type-code))
-         (storew ,temp-tn ,result-tn 0 ,lowtag))
+       (inst lr ,temp-tn (compute-object-header ,size ,type-code))
+       (storew ,temp-tn ,result-tn 0 ,lowtag)
        ,@body)))
 
 (defun align-csp (temp)

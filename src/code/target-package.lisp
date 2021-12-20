@@ -157,7 +157,7 @@
                 ;; index. The returned value is a physical index.
                 (named-let recurse ((start 0) (end (ash (length v) -1)))
                   (declare (type (unsigned-byte 9) start end)
-                           (optimize (sb-c::insert-array-bounds-checks 0)))
+                           (optimize (sb-c:insert-array-bounds-checks 0)))
                   (when (< start end)
                     (let* ((i (ash (+ start end) -1))
                            (elt (keyfn (aref v (ash i 1)))))
@@ -1001,6 +1001,8 @@ The default value of USE is implementation-dependent, and in this
 implementation it is ~S." *!default-package-use-list*)
   (prog ((name (stringify-string-designator name))
          (nicks (stringify-string-designators nicknames))
+         (package (%make-package (make-package-hashtable internal-symbols)
+                                 (make-package-hashtable external-symbols)))
          clobber)
    :restart
      (when (find-package name)
@@ -1017,19 +1019,13 @@ implementation it is ~S." *!default-package-use-list*)
        points. Consider moving the package creation form outside the ~
        scope of a block compilation."))
      (with-package-graph ()
-       ;; Check for race, signal the error outside the lock.
-       (when (and (not clobber) (find-package name))
-         (go :restart))
-       (let ((package
-               (%make-package
-                name
-                (make-package-hashtable internal-symbols)
-                (make-package-hashtable external-symbols))))
-
+         ;; Check for race, signal the error outside the lock.
+         (when (and (not clobber) (find-package name))
+           (go :restart))
+         (setf (package-%name package) name)
          ;; Do a USE-PACKAGE for each thing in the USE list so that checking for
          ;; conflicting exports among used packages is done.
          (use-package use package)
-
          ;; FIXME: ENTER-NEW-NICKNAMES can fail (ERROR) if nicknames are illegal,
          ;; which would leave us with possibly-bad side effects from the earlier
          ;; USE-PACKAGE (e.g. this package on the used-by lists of other packages,
@@ -1044,9 +1040,26 @@ implementation it is ~S." *!default-package-use-list*)
          ;; other MAKE-PACKAGE operations, but we need the additional lock
          ;; so that it synchronizes with RENAME-PACKAGE.
          (with-package-names (table)
+           (let* ((vector *id->package*)
+                  ;; 30 is an arbitrary constant exceeding the number of builtin packages
+                  (new-id (position nil vector :start 30)))
+             (when (and (null new-id) (< (length vector) +package-id-overflow+))
+               (let* ((current-length (length vector))
+                      (new-length (min (+ current-length 10) +package-id-overflow+))
+                      (new-vector (make-array new-length :initial-element nil)))
+                 (replace new-vector vector)
+                 (with-pinned-objects (vector)
+                   (setf (extern-alien "lisp_package_vector" unsigned)
+                         (get-lisp-obj-address vector)))
+                 (setf new-id current-length
+                       vector new-vector
+                       *id->package* vector)))
+             (when new-id
+               (setf (package-id package) new-id
+                     (aref vector new-id) package)))
            (%register-package table name package))
          (atomic-incf *package-names-cookie*)
-         (return package)))
+         (return package))
      (bug "never")))
 
 (flet ((remove-names (package name-table keep-primary-name)
@@ -1174,12 +1187,15 @@ implementation it is ~S." *!default-package-use-list*)
                   (dolist (used (package-use-list package))
                     (unuse-package used package))
                   (setf (package-%local-nicknames package) nil)
-                  ;; FIXME: lacking a way to advise UNINTERN that this package
-                  ;; is pending deletion, a large package conses successively
-                  ;; many smaller tables for no good reason.
-                  (do-symbols (sym package)
-                    (unintern sym package))
+                  (flet ((nullify-home (symbols)
+                           (dovector (x (package-hashtable-cells symbols))
+                             (when (and (symbolp x) (eq (symbol-package x) package))
+                               (%set-symbol-package x nil)))))
+                    (nullify-home (package-internal-symbols package))
+                    (nullify-home (package-external-symbols package)))
                   (with-package-names (table)
+                    (awhen (package-id package)
+                      (setf (aref *id->package* it) nil (package-id package) nil))
                     (remove-names package table nil)
                     (setf (package-%name package) nil
                           ;; Setting PACKAGE-%NAME to NIL is required in order to
@@ -1861,11 +1877,27 @@ PACKAGE."
 ;;;; are delayed until cold-init.
 ;;;; The cold loader (GENESIS) set *!INITIAL-SYMBOLS* to the target
 ;;;; representation of the hosts's *COLD-PACKAGE-SYMBOLS*.
-;;;; The shape of this list is ((package . (externals . internals)) ...)
+;;;; The shape of this list is
+;;;;    (uninterned-symbols . ((package . (externals . internals)) ...)
 (defvar *!initial-symbols*)
 
+(defun rebuild-package-vector ()
+  (let ((max-id 0))
+    (do-packages (pkg)
+      (let ((id (package-id pkg)))
+        (when id (setq max-id (max id max-id)))))
+    (let ((a (make-array (1+ max-id) :initial-element nil)))
+      (setq *id->package* a)
+      (with-pinned-objects (a)
+        (setf (extern-alien "lisp_package_vector" unsigned)
+              (get-lisp-obj-address a)))
+      (do-packages (pkg)
+        (let ((id (package-id pkg)))
+          (when id
+            (setf (aref a id) pkg)))))))
+
 (defun pkg-name= (a b) (and (not (eql a 0)) (string= a b)))
-(defun !package-cold-init ()
+(defun !package-cold-init (&aux (specs (cdr *!initial-symbols*)))
   (setf *package-graph-lock* (sb-thread:make-mutex :name "Package Graph Lock"))
   (setf *package-names* (make-info-hashtable :comparator #'pkg-name=
                                              :hash-function #'sxhash))
@@ -1876,7 +1908,7 @@ PACKAGE."
         (sb-thread:mutex-name (info-env-mutex (car *package-nickname-ids*)))
         "package nicknames")
   (with-package-names (names)
-    (dolist (spec *!initial-symbols*)
+    (dolist (spec specs)
       (let ((pkg (car spec)) (symbols (cdr spec)))
         ;; the symbol MAKE-TABLE wouldn't magically disappear,
         ;; though its only use be to name an FLET in a function
@@ -1896,11 +1928,27 @@ PACKAGE."
         (setf (package-%implementation-packages pkg) nil))))
 
   ;; pass 2 - set the 'tables' slots only after all tables have been made
-  (dolist (spec *!initial-symbols*)
+  (dolist (spec specs)
     (let ((pkg (car spec)))
       (setf (package-tables pkg)
             (map 'vector #'package-external-symbols (package-%use-list pkg)))))
 
+  (rebuild-package-vector)
+  ;; Having made all packages, verify that symbol hashes are good.
+  (flet ((check-hash-slot (symbols) ; a vector
+           ;; type decl is critical here - can't invoke a hairy aref routine yet
+           (dovector (symbol (the simple-vector symbols))
+             (when symbol ; skip NIL because of its magic-ness
+               (let* ((stored-hash (symbol-hash symbol))
+                      (name (symbol-name symbol))
+                      (computed-hash (compute-symbol-hash name (length name))))
+                 (aver (= stored-hash computed-hash)))))))
+    (check-hash-slot (car *!initial-symbols*))
+    (dolist (spec specs)
+      (check-hash-slot (second spec))
+      (check-hash-slot (third spec))))
+
+  ;; The joke's on you. They're pseudo-static, hence not GCable...
   (/show0 "about to MAKUNBOUND *!INITIAL-SYMBOLS*")
   (%makunbound '*!initial-symbols*))      ; (so that it gets GCed)
 
@@ -1982,7 +2030,7 @@ PACKAGE."
                                                (logand start-state 3))))))
                      (when (zerop index)
                        (return (advance start-state))))))
-          (declare (optimize (sb-c::insert-array-bounds-checks 0)))
+          (declare (optimize (sb-c:insert-array-bounds-checks 0)))
           (if (logtest start-state +package-iter-check-shadows+)
               (let ((shadows (package-%shadowing-symbols (this-package))))
                 (scan (not (member sym shadows :test #'string=))))
